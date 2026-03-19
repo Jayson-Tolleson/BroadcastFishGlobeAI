@@ -28,8 +28,19 @@ def parse_erddap_grid(text: str | None, *, preferred_value_columns: tuple[str, .
         return [], ErddapParseDiagnostics(len(rows), 0, 0, 0, 0, preview)
 
     header = [str(c).strip().lower() for c in rows[0]]
-    lat_idx = header.index("latitude") if "latitude" in header else 1
-    lon_idx = header.index("longitude") if "longitude" in header else 2
+    if "latitude" in header:
+        lat_idx = header.index("latitude")
+    elif "lat" in header:
+        lat_idx = header.index("lat")
+    else:
+        lat_idx = 1
+
+    if "longitude" in header:
+        lon_idx = header.index("longitude")
+    elif "lon" in header:
+        lon_idx = header.index("lon")
+    else:
+        lon_idx = 2
 
     value_idx = None
     for col in preferred_value_columns:

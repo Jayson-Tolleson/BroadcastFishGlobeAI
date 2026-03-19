@@ -180,9 +180,12 @@ class CoastwatchProvider:
         raw_parts: list[str | None] = []
         diagnostics: list[ErddapParseDiagnostics] = []
         selected_source = CHL_DATASET_SOURCES[0]
+        selected_source_name = str(selected_source["name"])
+        selected_source_reason = "primary_success"
         source_attempts: list[dict[str, object]] = []
         for source in CHL_DATASET_SOURCES:
             selected_source = source
+            source_name = str(source["name"])
             chlorophyll, lon_convention, lat_descending, effective_stride, extra_dimensions, urls, raw_parts, diagnostics = self._fetch_candidate_parts(
                 viewport,
                 str(source["dataset"]),
@@ -193,20 +196,45 @@ class CoastwatchProvider:
                 stride=stride,
                 valid_time=valid_time,
             )
+            attempt_reason = "subset_ready"
+            if not chlorophyll:
+                if urls and not any(part is not None for part in raw_parts):
+                    attempt_reason = "http_fetch_failed"
+                elif any((diag.parser_rejected_rows > 0 and diag.accepted_rows == 0) for diag in diagnostics):
+                    attempt_reason = "parser_rejected_rows"
+                else:
+                    attempt_reason = "empty_subset"
             source_attempts.append({
-                "source": source["name"],
+                "source": source_name,
                 "dataset": source["dataset"],
+                "var_name": source["var_name"],
                 "urls": urls,
                 "real_subset": bool(chlorophyll),
+                "reason": attempt_reason,
             })
+            log.info(
+                "chlorophyll source attempt source=%s dataset=%s var=%s bbox=%s urls=%s real_subset=%s reason=%s",
+                source_name,
+                source["dataset"],
+                source["var_name"],
+                bbox.as_list(),
+                len(urls),
+                bool(chlorophyll),
+                attempt_reason,
+            )
             if chlorophyll:
+                selected_source_name = source_name
+                selected_source_reason = attempt_reason
                 break
+            selected_source_name = source_name
+            selected_source_reason = attempt_reason
         payload = {
             "chlorophyll": chlorophyll,
             "water_color_index": self._water_color_grid(chlorophyll) if chlorophyll else [],
             "optional_ssh_anomaly": [],
             "source_meta": {
                 "bio_source": "erddap_griddap",
+                "bio_source_label": "nasa_erddap_8day" if selected_source_name == "nasa_8day" else "coastwatch_erddap_fallback",
                 "subset_urls": len(urls),
                 "lon_convention": lon_convention,
                 "real_subset": bool(chlorophyll),
@@ -214,7 +242,9 @@ class CoastwatchProvider:
                 "effective_stride": effective_stride,
                 "extra_dimensions": extra_dimensions,
                 "dataset_url": selected_source["dataset"],
-                "bio_dataset": selected_source["name"],
+                "bio_dataset": selected_source_name,
+                "fallback_reason": None if chlorophyll else selected_source_reason,
+                "selected_source_reason": selected_source_reason,
                 "source_attempts": source_attempts,
             },
         }
@@ -223,7 +253,7 @@ class CoastwatchProvider:
         ny = len(chlorophyll)
         nx = len(chlorophyll[0]) if ny else 0
         log.info(
-            "coastwatch subset fetched bbox=%s viewport=%s erddap_slices=%s stride=%s chlorophyll_shape=%sx%s real_subset=%s lat_descending=%s source=%s",
+            "chlorophyll subset fetched bbox=%s viewport=%s erddap_slices=%s stride=%s chlorophyll_shape=%sx%s real_subset=%s lat_descending=%s source=%s fallback_reason=%s",
             bbox.as_list(),
             {"west": viewport.west, "south": viewport.south, "east": viewport.east, "north": viewport.north},
             [{"lon_start": s.lon_start, "lon_stop": s.lon_stop} for s in slices],
@@ -232,7 +262,8 @@ class CoastwatchProvider:
             nx,
             bool(chlorophyll),
             lat_descending,
-            selected_source["name"],
+            selected_source_name,
+            selected_source_reason,
         )
         if not chlorophyll:
             diag_rows = [d.row_count for d in diagnostics]
@@ -279,7 +310,7 @@ class CoastwatchProvider:
         return {
             "provider": "coastwatch",
             "status": "viewport_subset_only",
-            "upstreams": ["erddap_chlorophyll"],
+            "upstreams": ["nasa_erddap_chlorophyll", "coastwatch_erddap_chlorophyll"],
             "dataset_url": NASA_ERDDAP_CHL_CSV,
             "fallback_dataset_url": COASTWATCH_ERDDAP_CHL_CSV,
             "last_fetch_at": iso_utc(self._last_fetch_at),

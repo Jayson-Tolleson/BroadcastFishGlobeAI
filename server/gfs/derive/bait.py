@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 import math
+import logging
+
+
+log = logging.getLogger("server.gfs.derive.bait")
 
 
 def _safe(v: Any, default: float = float('nan')) -> float:
@@ -222,7 +226,15 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
     source_grid = sst_raw or wind_u_raw or wind_v_raw or chlorophyll_raw
     src_ny = len(source_grid)
     src_nx = len(source_grid[0]) if src_ny else 0
+    has_sst = bool(sst_raw)
+    has_chlorophyll = bool(chlorophyll_raw)
     if src_ny < 1 or src_nx < 1:
+        log.info(
+            "bait advanced stack status=incomplete has_sst=%s has_chlorophyll=%s polygon_count=0 reason=missing_source_grid bbox=%s",
+            has_sst,
+            has_chlorophyll,
+            bbox,
+        )
         return {
             'bait': {
                 'status': 'incomplete',
@@ -373,6 +385,17 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
     core_polygons = _attach_depth(core_polygons)
     fronts = _derive_front_lines_from_sst(sst, bbox) if valid_cells > 0 else []
     overall = round((sum(item['probability'] for item in bait_score) / len(bait_score)), 3) if bait_score else 0.0
+    polygon_count = len(inner_polygons)
+    bait_status = 'ready' if valid_cells > 0 else 'incomplete'
+    log.info(
+        "bait advanced stack status=%s has_sst=%s has_chlorophyll=%s polygon_count=%s valid_cells=%s bbox=%s",
+        bait_status,
+        has_sst,
+        has_chlorophyll,
+        polygon_count,
+        valid_cells,
+        bbox,
+    )
 
     return {
         'bait': {

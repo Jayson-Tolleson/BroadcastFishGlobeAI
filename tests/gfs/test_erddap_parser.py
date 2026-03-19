@@ -15,3 +15,10 @@ def test_parse_erddap_grid_reports_rejected_rows():
     grid, diag = parse_erddap_grid(text, preferred_value_columns=("chlorophyll",))
     assert grid == []
     assert diag.parser_rejected_rows >= 1
+
+
+def test_parse_erddap_grid_accepts_lat_lon_aliases():
+    text = "time,lat,lon,chlor_a\n2024-01-01T00:00:00Z,34,-120,0.7\n"
+    grid, diag = parse_erddap_grid(text, preferred_value_columns=("chlorophyll", "chlor_a"))
+    assert grid == [[0.7]]
+    assert diag.accepted_rows == 1

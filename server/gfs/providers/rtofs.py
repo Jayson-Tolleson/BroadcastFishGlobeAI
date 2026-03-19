@@ -98,6 +98,7 @@ def _build_ncss_query(*, west: float, south: float, east: float, north: float, s
         ('west', f'{west:.6f}'),
         ('east', f'{east:.6f}'),
         ('horizStride', str(max(1, int(stride or 1)))),
+        ('stride', str(max(1, int(stride or 1)))),
         ('time', time_value or 'present'),
         ('addLatLon', 'true'),
         ('accept', _ncss_accept('netcdf4')),
@@ -216,6 +217,16 @@ class RtofsProvider:
         return out
 
     @staticmethod
+    def _shape_of(value: Any) -> list[int]:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            return []
+        try:
+            return [int(v) for v in tuple(shape)]
+        except Exception:
+            return []
+
+    @staticmethod
     def _build_hycom_urls(*, west: float, south: float, east: float, north: float, stride: int, valid_time: datetime | None) -> list[str]:
         lat_min = max(-80.0, min(south, north))
         lat_max = min(90.0, max(south, north))
@@ -290,8 +301,8 @@ class RtofsProvider:
                     "dims": {k: int(v) for k, v in ds.sizes.items()},
                     "vars": list(ds.variables)[:16],
                     "coords": list(ds.coords)[:16],
-                    "lat_shape": list(getattr(getattr(lat_arr, "shape", None), "__iter__", lambda: [])()) if lat_arr is not None and hasattr(lat_arr, "shape") else [],
-                    "lon_shape": list(getattr(getattr(lon_arr, "shape", None), "__iter__", lambda: [])()) if lon_arr is not None and hasattr(lon_arr, "shape") else [],
+                    "lat_shape": self._shape_of(lat_arr),
+                    "lon_shape": self._shape_of(lon_arr),
                     "sst_shape": [len(sst_grid), len(sst_grid[0]) if sst_grid else 0],
                     "ssu_shape": [len(u_grid), len(u_grid[0]) if u_grid else 0],
                     "ssv_shape": [len(v_grid), len(v_grid[0]) if v_grid else 0],
@@ -422,6 +433,14 @@ class RtofsProvider:
             nx,
             bool(sst),
             False,
+        )
+        log.info(
+            "hycom subset status bbox=%s real_subset=%s current_source=%s sst_shape=%sx%s",
+            bbox.as_list(),
+            bool(sst),
+            current_source,
+            ny,
+            nx,
         )
         if not sst:
             log.warning(

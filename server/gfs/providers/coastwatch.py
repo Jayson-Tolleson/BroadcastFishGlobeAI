@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 import urllib.request
 from datetime import datetime
 
@@ -183,6 +184,7 @@ class CoastwatchProvider:
         source_attempts: list[dict[str, object]] = []
         for source in CHL_DATASET_SOURCES:
             selected_source = source
+            started_at = time.time()
             chlorophyll, lon_convention, lat_descending, effective_stride, extra_dimensions, urls, raw_parts, diagnostics = self._fetch_candidate_parts(
                 viewport,
                 str(source["dataset"]),
@@ -198,15 +200,29 @@ class CoastwatchProvider:
                 "dataset": source["dataset"],
                 "urls": urls,
                 "real_subset": bool(chlorophyll),
+                "elapsed_ms": round((time.time() - started_at) * 1000.0, 1),
+                "http_success": all(r is not None for r in raw_parts),
+                "diag_rows": [d.row_count for d in diagnostics],
+                "diag_lat": [d.lat_count for d in diagnostics],
+                "diag_lon": [d.lon_count for d in diagnostics],
+                "fallback_reason": None if chlorophyll else "empty_or_unparseable_subset",
             })
             if chlorophyll:
                 break
+            log.warning(
+                "chlorophyll source failed source=%s bbox=%s viewport=%s fallback_reason=%s urls=%s",
+                source["name"],
+                bbox.as_list(),
+                {"west": viewport.west, "south": viewport.south, "east": viewport.east, "north": viewport.north},
+                "empty_or_unparseable_subset",
+                urls,
+            )
         payload = {
             "chlorophyll": chlorophyll,
             "water_color_index": self._water_color_grid(chlorophyll) if chlorophyll else [],
             "optional_ssh_anomaly": [],
             "source_meta": {
-                "bio_source": "erddap_griddap",
+                "bio_source": selected_source["name"],
                 "subset_urls": len(urls),
                 "lon_convention": lon_convention,
                 "real_subset": bool(chlorophyll),

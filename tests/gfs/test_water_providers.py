@@ -22,7 +22,7 @@ class _Resp:
         return False
 
 
-def test_rtofs_salvages_noaa_currents_and_erddap_sst_patterns(monkeypatch):
+def test_rtofs_uses_hycom_ncss_and_salvages_noaa_currents(monkeypatch):
     seen = []
 
     def _urlopen(req, timeout=0):
@@ -31,8 +31,8 @@ def test_rtofs_salvages_noaa_currents_and_erddap_sst_patterns(monkeypatch):
         if 'datagetter' in url:
             payload = {"current_predictions": [{"Velocity_Major": "1.3", "Direction_Bin": "45"}]}
             return _Resp(json.dumps(payload).encode())
-        if 'erddap' in url:
-            return _Resp(b'time,latitude,longitude,sst\n2024-01-01T00:00:00Z,34,-120,20.5\n')
+        if 'ncss.hycom.org' in url:
+            return _Resp(b'not-a-netcdf')
         return _Resp(b'{}')
 
     monkeypatch.setattr('urllib.request.urlopen', _urlopen)
@@ -41,7 +41,8 @@ def test_rtofs_salvages_noaa_currents_and_erddap_sst_patterns(monkeypatch):
     data, _ = provider._fetch_subset_sync(bbox=BBox(-121, 33, -119, 35), stride=4, valid_time=None)
     assert 'sst' in data and 'current_u' in data and 'current_v' in data
     assert any('product=currents_predictions' in u for u in seen)
-    assert any('erddap' in u for u in seen)
+    assert any('ncss.hycom.org' in u for u in seen)
+    assert any('time=present' in u and 'horizStride=4' in u for u in seen if 'ncss.hycom.org' in u)
 
 
 def test_coastwatch_returns_chlorophyll_and_water_color(monkeypatch):

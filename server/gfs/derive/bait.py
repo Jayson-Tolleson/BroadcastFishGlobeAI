@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 import math
+import logging
+
+
+log = logging.getLogger("server.gfs.derive.bait")
 
 
 def _safe(v: Any, default: float = float('nan')) -> float:
@@ -218,11 +222,18 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
     current_u_raw = (ocean or {}).get('current_u') or []
     current_v_raw = (ocean or {}).get('current_v') or []
     chlorophyll_raw = (bio or {}).get('chlorophyll') or []
+    has_sst = bool(sst_raw)
+    has_chlorophyll = bool(chlorophyll_raw)
 
     source_grid = sst_raw or wind_u_raw or wind_v_raw or chlorophyll_raw
     src_ny = len(source_grid)
     src_nx = len(source_grid[0]) if src_ny else 0
     if src_ny < 1 or src_nx < 1:
+        log.info(
+            "bait derive skipped status=incomplete has_sst=%s has_chlorophyll=%s reason=missing_source_grid polygon_count=0",
+            has_sst,
+            has_chlorophyll,
+        )
         return {
             'bait': {
                 'status': 'incomplete',
@@ -374,7 +385,7 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
     fronts = _derive_front_lines_from_sst(sst, bbox) if valid_cells > 0 else []
     overall = round((sum(item['probability'] for item in bait_score) / len(bait_score)), 3) if bait_score else 0.0
 
-    return {
+    payload = {
         'bait': {
             'status': 'ready' if valid_cells > 0 else 'incomplete',
             'source': 'full_stack' if valid_cells > 0 else 'suppressed_incomplete',
@@ -387,7 +398,10 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
                 'harbor_filled_cells': harbor_filled_cells,
                 'grid_ny': target_ny,
                 'grid_nx': target_nx,
-                'chlorophyll_available': bool(chlorophyll_raw),
+                'has_sst': has_sst,
+                'has_chlorophyll': has_chlorophyll,
+                'chlorophyll_available': has_chlorophyll,
+                'chlorophyll_mode': 'observed' if has_chlorophyll else 'degraded_default',
             },
         },
         'bait_score': bait_score,
@@ -396,3 +410,15 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
         'boil_probability_polygons': [p for p in core_polygons if _safe(p.get('probability'), 0.0) >= 0.72],
         'confidence': {'overall': overall},
     }
+    log.info(
+        "bait derive complete status=%s has_sst=%s has_chlorophyll=%s polygon_count=%s outer=%s inner=%s core=%s valid_cells=%s",
+        payload['bait']['status'],
+        has_sst,
+        has_chlorophyll,
+        len(payload['bait']['polygons']),
+        len(payload['bait']['outer_polygons']),
+        len(payload['bait']['inner_polygons']),
+        len(payload['bait']['core_polygons']),
+        valid_cells,
+    )
+    return payload

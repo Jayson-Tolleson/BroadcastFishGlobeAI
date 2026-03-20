@@ -6,6 +6,9 @@ from pathlib import Path
 from quart import Quart
 
 from server.config import load_settings
+from server.gfs.engine import GfsEngine
+from server.gfs.media import LocationMediaStore
+from server.routes import register_routes
 from server.rtc import RTCManager
 from server.state import AppState
 
@@ -37,35 +40,13 @@ def create_quart_app() -> Quart:
     app = Quart(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
     state = AppState(default_room=settings.default_room)
     rtc = RTCManager(state)
-    startup_log = logging.getLogger("server.startup")
-
-    gfs_engine = None
     try:
-        from server.gfs.engine import GfsEngine
+        app.extensions["gfs_engine"] = GfsEngine(debug_enabled=settings.debug)
+    except TypeError:
+        app.extensions["gfs_engine"] = GfsEngine()
+    app.extensions["gfs_media_store"] = LocationMediaStore(data_dir=STATIC_DIR / "data", media_dir=STATIC_DIR / "fishvid")
 
-        try:
-            gfs_engine = GfsEngine(debug_enabled=settings.debug)
-        except TypeError:
-            gfs_engine = GfsEngine()
-    except Exception as exc:
-        startup_log.warning("gfs engine unavailable at startup; extension left null err=%s", exc)
-    app.extensions["gfs_engine"] = gfs_engine
-
-    media_store = None
-    try:
-        from server.gfs.media import LocationMediaStore
-
-        media_store = LocationMediaStore(data_dir=STATIC_DIR / "data", media_dir=STATIC_DIR / "fishvid")
-    except Exception as exc:
-        startup_log.warning("gfs media store unavailable at startup; extension left null err=%s", exc)
-    app.extensions["gfs_media_store"] = media_store
-
-    try:
-        from server.routes import register_routes
-
-        register_routes(app, state, settings, rtc)
-    except Exception as exc:
-        startup_log.warning("route registration skipped during startup err=%s", exc)
+    register_routes(app, state, settings, rtc)
 
     app.settings_obj = settings
     app.state_obj = state

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_cloud_clusters(lat, lon, cloud_fraction, humidity, z: int) -> list[dict[str, Any]]:
+def build_cloud_clusters(lat, lon, cloud_fraction, humidity, precip_rate, z: int) -> list[dict[str, Any]]:
     """Create LOD cloud polygons with vertical profile metadata."""
     if cloud_fraction is None:
         return []
@@ -17,11 +17,19 @@ def build_cloud_clusters(lat, lon, cloud_fraction, humidity, z: int) -> list[dic
             if cf < 0.15:
                 continue
             rh = float(humidity[y, x]) if humidity is not None else 50.0
+            pr = float(precip_rate[y, x]) if precip_rate is not None else 0.0
             ctype = "cirrus" if cf < 0.35 else "cumulus" if cf < 0.7 else "cumulonimbus"
+            
+            # Force nimbus classification if raining
+            if pr > 0.1:
+                ctype = "cumulonimbus"
+
             if ctype == "cirrus":
                 base, top = 8000, 12000
             elif ctype == "cumulonimbus":
-                base, top = 2000, 12000
+                # Lower base for active rain
+                base = 800 if pr > 1.0 else 1800
+                top = 12000
             else:
                 base, top = 1500, 5000
             out.append({
@@ -33,6 +41,7 @@ def build_cloud_clusters(lat, lon, cloud_fraction, humidity, z: int) -> list[dic
                 "cloud_top": top,
                 "density": max(0.0, min(1.0, cf)),
                 "convective_intensity": max(0.0, min(1.0, rh / 100.0)),
+                "rain_intensity": max(0.0, pr),
                 "layers": 5 if z < 4 else 10 if z < 7 else 16,
             })
     return out

@@ -65,14 +65,13 @@ def _resample_bilinear(grid: list[list[float]], ny: int, nx: int) -> list[list[f
             if not any(math.isfinite(v) for v in (q00, q10, q01, q11)):
                 row.append(float('nan'))
                 continue
-            if not math.isfinite(q00):
-                q00 = 0.0
-            if not math.isfinite(q10):
-                q10 = q00
-            if not math.isfinite(q01):
-                q01 = q00
-            if not math.isfinite(q11):
-                q11 = q10
+
+            valid_corners = [v for v in (q00, q10, q01, q11) if math.isfinite(v)]
+            fill_val = sum(valid_corners) / len(valid_corners) if valid_corners else 0.0
+            if not math.isfinite(q00): q00 = fill_val
+            if not math.isfinite(q10): q10 = fill_val
+            if not math.isfinite(q01): q01 = fill_val
+            if not math.isfinite(q11): q11 = fill_val
             top = q00 + ((q10 - q00) * fx)
             bottom = q01 + ((q11 - q01) * fx)
             row.append(top + ((bottom - top) * fy))
@@ -360,6 +359,8 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
 
     def _attach_depth(polygons: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for poly in polygons:
+            if 'preferred_depth_m' in poly:
+                continue
             p = _safe(poly.get('probability'), 0.5)
             depth = max(2.0, min(45.0, 9.0 + ((1.0 - p) * 18.0)))
             poly['preferred_depth_m'] = round(depth, 1)

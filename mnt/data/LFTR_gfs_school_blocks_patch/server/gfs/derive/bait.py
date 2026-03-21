@@ -8,6 +8,16 @@ from typing import Any
 
 log = logging.getLogger("server.gfs.derive.bait")
 
+can we analyze the repo for functionality on route /gfs for bait and ocean intelligence to be displayed with polygons and contribute to a bait intelligence score....# Scoring weights for bait probability derivation.
+# Must sum to approx 1.0.
+SCORING_WEIGHTS = {
+    "sst": 0.24,
+    "wind": 0.22,
+    "chlorophyll": 0.16,
+    "cloud": 0.16,
+    "rain": 0.16,
+    "current": 0.06,
+}
 
 def _to_2d(field: Any) -> list[list[float]]:
     if not isinstance(field, list) or not field:
@@ -22,10 +32,10 @@ def _to_2d(field: Any) -> list[list[float]]:
 def _safe(v: Any, default: float = 0.0) -> float:
     try:
         n = float(v)
-        if n != n or not math.isfinite(n):
+        if not math.isfinite(n):
             return default
         return n
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -85,7 +95,7 @@ def _resample_nearest(grid: list[list[float]], ny: int, nx: int) -> list[list[fl
         row: list[float] = []
         for j in range(nx):
             sj = min(src_nx - 1, round((j + 0.5) * src_nx / nx - 0.5))
-            row.append(_safe(grid[si][sj], float("nan")))
+            row.append(_safe(grid[si][sj], math.nan))
         out.append(row)
     return out
 
@@ -368,10 +378,18 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
     ocean_masked_cells = 0
     land_suppressed_cells = 0
 
+    # Pre-unpack weights for loop efficiency
+    w_sst = SCORING_WEIGHTS["sst"]
+    w_wind = SCORING_WEIGHTS["wind"]
+    w_chl = SCORING_WEIGHTS["chlorophyll"]
+    w_cloud = SCORING_WEIGHTS["cloud"]
+    w_rain = SCORING_WEIGHTS["rain"]
+    w_current = SCORING_WEIGHTS["current"]
+
     for i in range(target_ny):
         for j in range(target_nx):
-            sst_v = _safe(sst[i][j], float("nan"))
-            chl_v = _safe(chlorophyll[i][j], float("nan"))
+            sst_v = _safe(sst[i][j], math.nan)
+            chl_v = _safe(chlorophyll[i][j], math.nan)
             if not _is_ocean_valid(sst_v, chl_v):
                 ocean_masked_cells += 1
                 land_suppressed_cells += 1
@@ -392,7 +410,14 @@ def derive_bait_payload(atmospheric: dict[str, Any], ocean: dict[str, Any], bio:
             chl_score = _norm(chl_v, 0.1, 2.4)
             current_score = _norm(math.hypot(cu, cv), 0.02, 1.2)
 
-            score = (0.22 * wind_score) + (0.16 * rain_score) + (0.16 * cloud_score) + (0.24 * sst_score) + (0.16 * chl_score) + (0.06 * current_score)
+            score = (
+                (w_wind * wind_score)
+                + (w_rain * rain_score)
+                + (w_cloud * cloud_score)
+                + (w_sst * sst_score)
+                + (w_chl * chl_score)
+                + (w_current * current_score)
+            )
             score = max(0.0, min(1.0, score))
             score_grid[i][j] = score
             zone_mask[i][j] = score >= 0.58

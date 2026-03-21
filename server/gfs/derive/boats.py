@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-BOAT_COUNT_MAX = 12
+BOAT_COUNT_MAX = 16
 WAVE_GREEN_MAX_FT = 3.0
 WAVE_YELLOW_MAX_FT = 4.0
 
@@ -192,6 +192,7 @@ def derive_boats_payload(*, bbox: list[float], weather: dict[str, Any], ocean: d
             wv = _safe(wind_v[i][j], 0.0) if i < len(wind_v) and j < len(wind_v[i]) else 0.0
             fallback_wind_kt = math.hypot(wu, wv) * 1.94384
             heading_deg = heading_from_uv(u, v, 0.0)
+            wind_heading_from = heading_from_uv(-wu, -wv, heading_deg)
 
             station = None
             if marine_observations:
@@ -207,11 +208,11 @@ def derive_boats_payload(*, bbox: list[float], weather: dict[str, Any], ocean: d
                         station = dict(obs)
                         station["distanceKm"] = round(km, 1)
 
-            waves, wind, water, marine_source = _station_wave_bundle(station, heading_deg)
+            waves, wind, water, marine_source = _station_wave_bundle(station, wind_heading_from)
             if wind["speedKt"] is None:
                 wind = {
                     "speedKt": _safe_round(fallback_wind_kt, 1) if math.isfinite(fallback_wind_kt) else None,
-                    "dirDeg": _safe_round(heading_from_uv(wu, wv, heading_deg), 1) if math.isfinite(fallback_wind_kt) else None,
+                    "dirDeg": _safe_round(wind_heading_from, 1) if math.isfinite(fallback_wind_kt) else None,
                 }
             if water["tempF"] is None:
                 water["tempF"] = round((sst_c * 9.0 / 5.0) + 32.0, 1)
@@ -223,7 +224,7 @@ def derive_boats_payload(*, bbox: list[float], weather: dict[str, Any], ocean: d
                 wave_ft = _proxy_wave_ft(wu, wv, current_speed_kt)
                 waves["sigHeightFt"] = wave_ft
                 if wave_ft is not None and waves.get("primary") is None:
-                    waves["primary"] = {"heightFt": _safe_round(wave_ft, 1), "periodS": None, "dirDeg": _safe_round(heading_deg, 1)}
+                    waves["primary"] = {"heightFt": _safe_round(wave_ft, 1), "periodS": None, "dirDeg": _safe_round(wind_heading_from, 1)}
             safety_color, safety_label = safety_color_from_wave_ft(wave_ft, wind.get("speedKt"))
             boat = {
                 "id": f"boat_{i}_{j}",

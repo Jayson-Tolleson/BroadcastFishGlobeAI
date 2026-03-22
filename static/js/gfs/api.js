@@ -226,6 +226,7 @@ export async function uploadSafe(url, file, fields = {}, fallback = null, option
     const fd = new FormData();
     Object.entries(fields || {}).forEach(([k, v]) => fd.append(k, v));
     fd.append('file', file);
+    fd.append('video', file);
     return await getJson(url, {
       ...normalizeOptions(options),
       method: 'POST',
@@ -260,3 +261,52 @@ export function clearInflightRequests() {
   }
   abortControllers.clear();
 }
+
+
+
+function viewportQuery(viewport = {}) {
+  if (typeof viewport === 'string') {
+    // compatibility shim: raw bbox string still supported
+    return `bbox=${encodeURIComponent(viewport)}&quality=coarse&stride=1`;
+  }
+  const west = Number(viewport.west ?? -180);
+  const south = Number(viewport.south ?? -80);
+  const east = Number(viewport.east ?? 180);
+  const north = Number(viewport.north ?? 80);
+  const quality = String(viewport.quality || 'coarse');
+  const stride = Number(viewport.stride || 1);
+  const bbox = `${west.toFixed(4)},${south.toFixed(4)},${east.toFixed(4)},${north.toFixed(4)}`;
+  return `bbox=${encodeURIComponent(bbox)}&quality=${encodeURIComponent(quality)}&stride=${encodeURIComponent(stride)}`;
+}
+
+export async function fetchOceanState(viewport, options = {}) {
+  return getJsonSafe(`/gfs/api/ocean?${viewportQuery(viewport)}`, null, options);
+}
+
+export async function fetchLocations(viewport, options = {}) {
+  const merged = { timeoutMs: 2500, abortPrevious: false, ...options };
+  return getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, merged);
+}
+
+export async function fetchLocation(id, options = {}) {
+  return getJsonSafe(`/gfs/api/location/${encodeURIComponent(String(id || ''))}`, null, options);
+}
+
+export async function fetchLocationLive(id, options = {}) {
+  return getJsonSafe(`/gfs/api/location/${encodeURIComponent(String(id || ''))}/live`, null, options);
+}
+
+export async function fetchBait(viewport, options = {}) {
+  return getJsonSafe(`/gfs/api/bait?${viewportQuery(viewport)}`, null, options);
+}
+
+export async function fetchBoats(viewport, options = {}) {
+  return getJsonSafe(`/gfs/api/boats?${viewportQuery(viewport)}`, null, options);
+}
+
+export async function fetchFish(viewport, options = {}) {
+  return getJsonSafe(`/gfs/api/fish?${viewportQuery(viewport)}`, { items: [] }, options);
+}
+
+// compatibility thin aliases
+export const getOceanState = fetchOceanState;

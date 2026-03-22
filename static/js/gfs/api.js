@@ -325,7 +325,8 @@ function viewportQuery(viewport = {}) {
 }
 
 export async function fetchOceanState(viewport, options = {}) {
-  return getJsonSafe(`/gfs/api/ocean?${viewportQuery(viewport)}`, null, options);
+  const merged = { timeoutMs: 8000, abortPrevious: true, ...options };
+  return getJsonSafe(`/gfs/api/ocean?${viewportQuery(viewport)}`, null, merged);
 }
 
 export async function fetchLocations(viewport, options = {}) {

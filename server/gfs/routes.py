@@ -183,8 +183,12 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/frame")
     async def api_frame():
+        started = time.time()
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().frame_payload(vp.as_dict()))
+        payload = gfs().frame_payload(vp.as_dict())
+        payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
+        log.info("/gfs/api/frame latency_ms=%s viewport=%s", payload.get("latency_ms"), vp.as_dict())
+        return jsonify(payload)
 
     @bp.route("/api/tiles/<layer>/<int:z>/<int:x>/<int:y>")
     async def api_tiles(layer, z, x, y):

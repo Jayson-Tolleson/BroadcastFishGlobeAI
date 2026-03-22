@@ -372,8 +372,13 @@ async function refreshData(reason = 'manual') {
   try {
     const bboxQ = encodeURIComponent(bboxToQuery(viewport));
     const vpQ = viewportToQuery(viewport);
-    const frame = await getJsonSafe(`/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=full`, null, { signal: controller.signal });
-    const ocean = await fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true });
+    const frameQuality = 'coarse';
+    const frameStride = Math.max(1, Number(viewport.sourceStride || 2));
+    const frameUrl = `/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=${encodeURIComponent(frameQuality)}&stride=${encodeURIComponent(frameStride)}`;
+    const [frame, ocean] = await Promise.all([
+      getJsonSafe(frameUrl, null, { signal: controller.signal, timeoutMs: 12000, abortPrevious: true }),
+      fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true }),
+    ]);
     if (frame && ocean) frame.ocean = ocean;
     if (!ocean) gfsState.setStaleHold('ocean payload unavailable; holding prior ocean metadata');
     if (!frame) { gfsState.debugHoldReason = 'frame missing; held previous visuals'; return dataState.latest; }

@@ -47,6 +47,7 @@ class OceanService:
         grid = build_canonical_grid(viewport)
         log.info("canonical grid rows=%s cols=%s cell_deg=%s", grid.rows, grid.cols, grid.cell_deg)
 
+        currents_started = time.time()
         currents = self.rtofs.fetch(weather, viewport.as_dict())
         currents_status = dict(getattr(self.rtofs, "last_status", {}) or {})
         if currents is None:
@@ -60,7 +61,9 @@ class OceanService:
             currents_status["degraded"] = True
             currents_status.setdefault("reason", "fallback_to_ekman")
         log.info("currents source=%s degraded=%s", currents.get("source"), currents.get("degraded"))
+        currents_ms = (time.time() - currents_started) * 1000
 
+        chl_started = time.time()
         chlorophyll = self.chl.fetch(weather, viewport.as_dict())
         chl_source = "coastwatch"
         if chlorophyll is None and self._chl_last_good is not None:
@@ -72,9 +75,14 @@ class OceanService:
         if chlorophyll:
             self._chl_last_good = chlorophyll
         log.info("chlorophyll source=%s", chl_source)
+        chl_ms = (time.time() - chl_started) * 1000
 
+        waves_started = time.time()
         waves = self.waves.fetch(weather, viewport.as_dict())
+        waves_ms = (time.time() - waves_started) * 1000
+        depth_started = time.time()
         depth_grid, depth_degraded = self.depth.fetch(grid.rows, grid.cols, viewport.as_dict())
+        depth_ms = (time.time() - depth_started) * 1000
         sst = self._sst_grid(weather)
 
         speed: list[list[float]] = []
@@ -120,4 +128,14 @@ class OceanService:
             "count": grid.rows * grid.cols,
             "latency_ms": round((time.time() - started) * 1000, 2),
         }
+        log.info(
+            "[gfs-perf] ocean-service rows=%s cols=%s currents_ms=%.2f chl_ms=%.2f waves_ms=%.2f depth_ms=%.2f total_ms=%.2f",
+            grid.rows,
+            grid.cols,
+            currents_ms,
+            chl_ms,
+            waves_ms,
+            depth_ms,
+            (time.time() - started) * 1000,
+        )
         return payload

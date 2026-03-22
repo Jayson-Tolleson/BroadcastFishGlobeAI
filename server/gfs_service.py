@@ -764,6 +764,7 @@ class GFSService:
         self._weather_refresh_lock = threading.Lock()
         self._decode_cache: Dict[str, Dict[str, Any]] = {}
         self._weather_payload_cache: Dict[str, Any] = {"ts": 0, "payload": None}
+        self._weather_fast_cache: Dict[str, Any] = {"ts": 0, "payload": None}
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -3143,6 +3144,47 @@ class GFSService:
             raise
         finally:
             self._weather_refresh_lock.release()
+
+    def generate_weather_payload_fast(self, bbox: dict[str, float] | None = None, *, max_stale_seconds: int = 21_600) -> dict[str, Any]:
+        """Non-blocking weather payload path for latency-sensitive API handlers.
+
+        Order:
+        1) in-memory fast cache (stale-while-refresh)
+        2) in-memory live weather cache
+        3) lightweight synthetic fallback payload
+        """
+        bbox_norm = self._normalize_bbox(bbox)
+        fast_row = self._weather_fast_cache or {}
+        fast_payload = fast_row.get("payload") if isinstance(fast_row.get("payload"), dict) else None
+        fast_ts = int(fast_row.get("ts") or 0)
+        if fast_payload and fast_ts > 0 and (self._now_ms() - fast_ts) <= int(max_stale_seconds * 1000):
+            return fast_payload
+        row = self._weather_payload_cache or {}
+        cached_payload = row.get("payload") if isinstance(row.get("payload"), dict) else None
+        if cached_payload:
+            self._weather_fast_cache = {"ts": self._now_ms(), "payload": cached_payload}
+            return cached_payload
+        fallback = {
+            "ok": True,
+            "source": "fallback_proxy",
+            "payload_state": "synthetic",
+            "bbox_used": bbox_norm,
+            "heuristic": True,
+            "confidence": "low",
+            "quality_note": "Fast fallback weather payload.",
+            "fields": {
+                "wind_u": [[0.6, 0.6], [0.6, 0.6]],
+                "wind_v": [[0.3, 0.3], [0.3, 0.3]],
+                "air_temp": [[289.0, 289.0], [289.0, 289.0]],
+                "cloud_total": [[0.25, 0.25], [0.25, 0.25]],
+            },
+            "rain": {"items": [], "count": 0},
+            "hail": {"items": [], "count": 0},
+            "lightning": {"items": [], "count": 0},
+            "balloons": {"items": [], "count": 0},
+        }
+        self._weather_fast_cache = {"ts": self._now_ms(), "payload": fallback}
+        return fallback
 
     def debug_real_gfs_cycle(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
         """Manual debug helper for cycle/hour/url/group visibility."""

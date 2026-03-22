@@ -42,6 +42,8 @@ class GfsEngine(GFSService):
         self._gfs_ws_active_clients = 0
         self._gfs_ws_last_exception: str | None = None
         self._gfs_ws_last_open_ts: int | None = None
+        self._weather_refresh_inflight = False
+        self._weather_refresh_last_ts = 0.0
 
     def parse_intent(self, args: Any) -> ParsedIntent:
         vp = canonicalize_viewport({
@@ -84,11 +86,47 @@ class GfsEngine(GFSService):
         }
 
     def _safe_weather_payload(self, vp) -> dict[str, Any]:
+        started = time.time()
+        payload = self.generate_weather_payload_fast(vp.as_dict())
+        if str(payload.get("payload_state") or "").lower() != "live":
+            self._maybe_refresh_weather_async()
+        log.info(
+            "[gfs-perf] weather fast_path payload_state=%s source=%s latency_ms=%.2f",
+            payload.get("payload_state"),
+            payload.get("source"),
+            (time.time() - started) * 1000,
+        )
+        return payload
+
+    def _maybe_refresh_weather_async(self) -> None:
+        now = time.time()
+        if self._weather_refresh_inflight:
+            return
+        if (now - float(self._weather_refresh_last_ts or 0.0)) < 30.0:
+            return
+        self._weather_refresh_inflight = True
+        self._weather_refresh_last_ts = now
+
+        def _refresh() -> None:
+            started = time.time()
+            try:
+                payload = self.generate_weather_payload(self._default_warm_viewport().as_dict())
+                log.info(
+                    "[gfs-perf] weather async refresh complete payload_state=%s source=%s latency_ms=%.2f",
+                    payload.get("payload_state"),
+                    payload.get("source"),
+                    (time.time() - started) * 1000,
+                )
+            except Exception as exc:
+                log.warning("[gfs-perf] weather async refresh failed err=%s", exc)
+            finally:
+                self._weather_refresh_inflight = False
+
         try:
-            return self.generate_weather_payload(vp.as_dict())
+            threading.Thread(target=_refresh, daemon=True).start()
         except Exception as exc:
-            log.warning("weather payload fallback activated: %s", exc)
-            return self._fallback_weather(vp)
+            self._weather_refresh_inflight = False
+            log.warning("[gfs-perf] failed to start weather async refresh thread: %s", exc)
 
     def _build_shared_products(self, vp):
         weather = self._safe_weather_payload(vp)
@@ -126,16 +164,29 @@ class GfsEngine(GFSService):
             log.warning("gfs prewarm failed: %s", exc)
 
     def shared_ocean_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:
+        started = time.time()
         vp = canonicalize_viewport(bbox)
         key = self._cache_key("ocean", vp)
         cached = self._cache.get(key)
         if cached:
             out = {**cached, "warm": self._warm_ready, "stale": False, "cache": "fresh"}
+            log.info("[gfs-perf] ocean cache=hit viewport=%s latency_ms=%.2f", vp.as_bbox(), (time.time() - started) * 1000)
             return out
+        weather_started = time.time()
         weather = self._safe_weather_payload(vp)
+        weather_ms = (time.time() - weather_started) * 1000
+        ocean_started = time.time()
         ocean = self.ocean_service.build_shared_state(vp, weather)
+        ocean_ms = (time.time() - ocean_started) * 1000
         ocean.update({"warm": self._warm_ready, "stale": False, "cache": "miss"})
         self._cache.set(key, ocean)
+        log.info(
+            "[gfs-perf] ocean cache=miss viewport=%s weather_ms=%.2f ocean_build_ms=%.2f latency_ms=%.2f",
+            vp.as_bbox(),
+            weather_ms,
+            ocean_ms,
+            (time.time() - started) * 1000,
+        )
         return ocean
 
     def fish_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
@@ -282,14 +333,42 @@ class GfsEngine(GFSService):
         return payload
 
     def frame_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:
+        started = time.time()
         vp = canonicalize_viewport(bbox)
+        weather_started = time.time()
         weather = self._safe_weather_payload(vp)
-        clouds = self.cloud_tiles_payload(vp.as_dict())
+        weather_ms = (time.time() - weather_started) * 1000
+        clouds_started = time.time()
+        payload_state = str(weather.get("payload_state") or "").lower()
+        if payload_state in {"synthetic", "degraded"}:
+            clouds = {"cloud_layers": [], "convective": {}, "stale": True, "source": "fast_degraded"}
+        else:
+            clouds = self.cloud_tiles_payload(vp.as_dict())
+        clouds_ms = (time.time() - clouds_started) * 1000
+        ocean_started = time.time()
         ocean = self.shared_ocean_payload(vp.as_dict())
+        ocean_ms = (time.time() - ocean_started) * 1000
+        fish_started = time.time()
         fish_items = self.fish_service.score_markers(ocean, vp)
+        fish_ms = (time.time() - fish_started) * 1000
+        bait_started = time.time()
         bait = self.bait_service.score(ocean, vp)
+        bait_ms = (time.time() - bait_started) * 1000
+        boats_started = time.time()
         boats = self.boat_service.agents(ocean, vp, count=12)
+        boats_ms = (time.time() - boats_started) * 1000
         log.info("frame refresh viewport=%s fish=%s bait=%s boats=%s", vp.as_bbox(), len(fish_items), len(bait.get("polygons") or []), len(boats))
+        log.info(
+            "[gfs-perf] frame viewport=%s weather_ms=%.2f clouds_ms=%.2f ocean_ms=%.2f fish_ms=%.2f bait_ms=%.2f boats_ms=%.2f total_ms=%.2f",
+            vp.as_bbox(),
+            weather_ms,
+            clouds_ms,
+            ocean_ms,
+            fish_ms,
+            bait_ms,
+            boats_ms,
+            (time.time() - started) * 1000,
+        )
         return {
             "ok": True,
             "bbox": vp.as_bbox(),

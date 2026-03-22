@@ -76,6 +76,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_ocean():
         started = time.time()
         vp = parse_viewport_args(request.args)
+        log.info("/gfs/api/ocean viewport=%s", vp.as_dict())
         payload = gfs().shared_ocean_payload(vp.as_dict())
         payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
         log.info("/gfs/api/ocean latency_ms=%s", payload.get("latency_ms"))
@@ -108,6 +109,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_boats():
         started = time.time()
         vp = parse_viewport_args(request.args)
+        log.info("/gfs/api/boats viewport=%s", vp.as_dict())
         payload = gfs().boats_from_ocean(vp.as_dict())
         payload["latency_ms"] = round((time.time() - started) * 1000, 2)
         log.info("/gfs/api/boats count=%s latency_ms=%s", payload.get("count"), payload.get("latency_ms"))
@@ -144,6 +146,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_locations():
         vp = parse_viewport_args(request.args)
         payload = gfs().fish_from_ocean(vp.as_dict())
+        log.info("/gfs/api/locations viewport=%s fish_count=%s", vp.as_dict(), payload.get("count"))
         items = payload.get("items") if isinstance(payload, dict) else []
         locations = [{
             "id": item.get("id") or "loc",

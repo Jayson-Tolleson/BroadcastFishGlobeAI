@@ -3,18 +3,24 @@ export class LayerEngine {
     this.layers = {};
     this.lastTs = performance.now();
     this.latestData = null;
+    this.inflight = {};
   }
   register(name, layer){
     this.layers[name] = { enabled:false, instance:layer };
     layer.disable?.();
   }
-  setData(payload){
+  async setData(payload){
     this.latestData = payload || null;
-    Object.entries(this.layers).forEach(([name, layer]) => {
-      if (layer.enabled) {
-        try { layer.instance.refresh?.(this.latestData); } catch (err) { console.error('[gfs layers] refresh failed', name, err); }
+    await Promise.all(Object.entries(this.layers).map(async ([name, layer]) => {
+      if (!layer.enabled) return;
+      if (this.inflight[name]) {
+        try { this.inflight[name].abort?.(); } catch (_) {}
       }
-    });
+      const token = { aborted: false, abort(){ this.aborted = true; } };
+      this.inflight[name] = token;
+      try { await layer.instance.refresh?.(this.latestData, token); } catch (err) { console.error('[gfs layers] refresh failed', name, err); }
+      finally { if (this.inflight[name] === token) this.inflight[name] = null; }
+    }));
   }
   setEnabled(name, enabled){
     const layer = this.layers[name];

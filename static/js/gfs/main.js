@@ -371,9 +371,10 @@ async function refreshData(reason = 'manual') {
     const bboxQ = encodeURIComponent(bboxToQuery(viewport));
     const vpQ = viewportToQuery(viewport);
     const frame = await getJsonSafe(`/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=full`, null, { signal: controller.signal });
-    const ocean = await fetchOceanState(bboxToQuery(viewport), { signal: controller.signal, abortPrevious: true });
+    const ocean = await fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true });
     if (frame && ocean) frame.ocean = ocean;
-    if (!frame) return dataState.latest;
+    if (!ocean) gfsState.setStaleHold('ocean payload unavailable; holding prior ocean metadata');
+    if (!frame) { gfsState.debugHoldReason = 'frame missing; held previous visuals'; return dataState.latest; }
     if (seq !== dataState.requestSeq) return dataState.latest;
 
     dataState.latest.weather = frame.weather || null;
@@ -390,10 +391,11 @@ async function refreshData(reason = 'manual') {
     window.__gfsLastFrame = frame;
     window.currentBBox = window.__gfsLastBbox;
     window.__gfsRecursiveGrid = { latest: dataState.latest.recursiveGrid, bbox: bboxToQuery(viewport) };
-    gfsState.setFrame(frame);
+    gfsState.debugHoldReason = '';
+    gfsState.setFrame(frame, viewport);
     const debugEl = document.getElementById('debugPrompt');
     renderDebugPanel(debugEl, gfsState);
-    layerRuntime.engine?.setData?.(frame || null);
+    await layerRuntime.engine?.setData?.(frame || null);
     console.info('[gfs data] refreshed', {
       reason,
       signature,
@@ -425,7 +427,7 @@ async function refreshDeferredBaitAdvanced(viewport, reason = 'manual') {
   const bboxQ = encodeURIComponent(bboxToQuery(viewport));
   const vpQ = viewportToQuery(viewport);
   const payload = await getJsonSafe(`/gfs/api/bait-advanced?bbox=${bboxQ}&viewport=${vpQ}&quality=full`, null, { abortPrevious: true });
-  if (!payload) return null;
+  if (!payload) { gfsState.debugHoldReason = 'bait refresh unavailable; holding prior payload'; return null; }
   dataState.latest.baitAdvanced = preferStableBaitAdvanced(payload, dataState.latest.baitAdvanced || null);
   console.info('[gfs bait advanced] refreshed', { reason, polygons: Array.isArray(payload?.bait?.polygons) ? payload.bait.polygons.length : 0, status: payload?.bait?.status });
   return payload;

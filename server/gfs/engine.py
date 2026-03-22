@@ -79,6 +79,7 @@ class GfsEngine(GFSService):
         vp = canonicalize_viewport(bbox)
         ocean = self.shared_ocean_payload(vp.as_dict())
         items = self.fish_service.score_markers(ocean, vp)
+        log.info("fish derived count=%s viewport=%s", len(items), vp.as_bbox())
         return {
             "ok": True,
             "source": "shared_ocean",
@@ -94,6 +95,7 @@ class GfsEngine(GFSService):
         vp = canonicalize_viewport(bbox)
         ocean = self.shared_ocean_payload(vp.as_dict())
         scored = self.bait_service.score(ocean, vp)
+        log.info("bait derived polygons=%s viewport=%s", len(scored.get("polygons") or []), vp.as_bbox())
         return {
             "ok": True,
             "source": scored.get("source", "shared_ocean"),
@@ -111,6 +113,7 @@ class GfsEngine(GFSService):
         vp = canonicalize_viewport(bbox)
         ocean = self.shared_ocean_payload(vp.as_dict())
         boats = self.boat_service.agents(ocean, vp, count=12)
+        log.info("boats derived count=%s viewport=%s", len(boats), vp.as_bbox())
         return {
             "ok": True,
             "source": "shared_ocean",

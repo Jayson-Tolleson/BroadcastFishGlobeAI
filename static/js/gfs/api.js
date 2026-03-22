@@ -266,7 +266,8 @@ export function clearInflightRequests() {
 
 function viewportQuery(viewport = {}) {
   if (typeof viewport === 'string') {
-    return `bbox=${encodeURIComponent(viewport)}`;
+    // compatibility shim: raw bbox string still supported
+    return `bbox=${encodeURIComponent(viewport)}&quality=coarse&stride=1`;
   }
   const west = Number(viewport.west ?? -180);
   const south = Number(viewport.south ?? -80);

@@ -1,0 +1,14 @@
+API key repair notes
+
+What changed:
+- /gfs/api/config now returns google_maps_api_key for the frontend globe bootstrap.
+- Backend accepts either GOOGLE_MAPS_API_KEY or MAPS_API_KEY.
+
+Manual placement post-install:
+1. Put the key in /etc/broadcast/install.env OR your app .env
+2. Use one of these lines:
+   GOOGLE_MAPS_API_KEY=YOUR_KEY
+   MAPS_API_KEY=YOUR_KEY
+3. Restart service:
+   sudo systemctl daemon-reload
+   sudo systemctl restart broadcast

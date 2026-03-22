@@ -1,0 +1,23 @@
+Cleaned repair package notes
+
+What was repaired:
+- Restored missing backend modules required at import time:
+  - server/gfs/config.py
+  - server/gfs/engine.py
+  - server/gfs/media.py
+  - server/gfs/errors.py
+  - server/gfs_state.py
+  - server/gfs/greek_math.py
+  - server/gfs/polygon_builder.py
+- Rewired app startup so the GFS engine uses the real static directory.
+- Repaired installer/service path templating so APP_DIR is substituted into systemd.
+- Added a preflight Python import check before restarting broadcast.service.
+- Expanded /gfs routes so install/runtime health checks and common frontend endpoints exist.
+- Added a lightweight /ws/gfs websocket endpoint.
+
+Primary install blocker fixed:
+- The app could fail before binding to 127.0.0.1:8000 because server.app_factory imported missing GFS modules.
+
+Notes:
+- This is a stabilization repair focused on boot, health checks, and route completeness.
+- Some advanced GFS/ocean feature logic remains wrapper/fallback oriented and may still need deeper feature work.

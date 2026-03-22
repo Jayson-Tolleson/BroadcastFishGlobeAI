@@ -1,0 +1,26 @@
+V5 repair notes
+
+Primary fix:
+- Added missing GET routes expected by the /gfs frontend:
+  - /gfs/api/location/<location_key>
+  - /gfs/api/location/<location_key>/live
+
+Contract-alignment fixes:
+- Added /gfs/api/location/<location_key>/videos alias returning {videos:[...]}
+- Added /gfs/api/location/<location_key>/reports POST alias
+- /gfs/api/location/<location_key>/report now accepts either {text} or {report}
+- /gfs/api/location/<location_key>/media now also exposes normalized videos[]
+
+Why this matters:
+- Browser was polling GET /gfs/api/location/:id/live
+- Backend only supported POST on /live, producing 405s in nginx
+- /gfs/api/location/:id was also missing, stalling HUD/marker detail fetches
+- Those repeated failures could cascade into broken fish marker behavior and noisy socket reconnects
+
+Validation performed:
+- Python syntax check on server/gfs/routes.py
+
+Recommended post-install spot checks:
+- curl http://127.0.0.1:8000/gfs/api/location/1
+- curl http://127.0.0.1:8000/gfs/api/location/1/live
+- curl http://127.0.0.1:8000/gfs/api/location/1/videos

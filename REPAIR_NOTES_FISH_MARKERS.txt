@@ -1,0 +1,13 @@
+Fish marker repair
+
+Root cause:
+- Frontend boot requested /gfs/api/locations
+- Backend did not expose /gfs/api/locations
+- Result: marker list stayed empty, so no fish orbs rendered on /gfs
+
+Fixes applied:
+- Added /gfs/api/locations route as an alias over fish_payload()
+- Added frontend fallback: if /gfs/api/locations is empty, boot falls back to /gfs/api/fish
+
+Note:
+- The cfgrib log lines about surface/2m/10m/isobaric groups are normal data-load messages and are not the fish-marker failure.

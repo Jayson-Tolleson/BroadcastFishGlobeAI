@@ -19,6 +19,7 @@ export function renderDebugPanel(el, state) {
     `Degraded: ${JSON.stringify(degraded)}`,
     `WebSocket: ${ws.connected ? 'connected' : 'disconnected'} (${ws.lastEvent || 'none'})`,
     `Counts: ${JSON.stringify(counts)}`,
+    `Boat viewport: shared_ocean canonical`,
     `Stale hold: ${stale}`,
   ].join('\n');
 }

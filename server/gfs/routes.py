@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
 import logging
 import time
 
@@ -11,6 +12,38 @@ from quart import Blueprint, current_app, request, jsonify, send_file, websocket
 from server.gfs.viewport import parse_viewport_args
 
 log = logging.getLogger("server.gfs.routes")
+
+
+async def handle_gfs_ws(engine_getter, ws_obj) -> None:
+    log.info("/ws/gfs connect")
+    await ws_obj.send_json({"type": "hello", "channel": "gfs", "ws": "connected"})
+    while True:
+        try:
+            msg = await ws_obj.receive()
+            if msg is None:
+                log.info("/ws/gfs disconnect: empty")
+                break
+            parsed = msg
+            if isinstance(msg, str):
+                try:
+                    parsed = json.loads(msg)
+                except Exception:
+                    parsed = {"type": msg}
+            msg_type = str((parsed or {}).get("type") or msg).lower()
+            if msg_type == "ping":
+                await ws_obj.send_json({"type": "pong", "detail": "ping"})
+            elif msg_type == "status":
+                status_payload = engine_getter().websocket_status_payload()
+                await ws_obj.send_json(status_payload)
+                log.info("/ws/gfs status served")
+            elif msg_type in {"refresh", "refresh_nudge"}:
+                await ws_obj.send_json({"type": "refresh_nudge", "layer": "ocean"})
+            else:
+                await ws_obj.send_json({"type": "ack", "detail": msg_type})
+        except Exception as exc:
+            log.warning("/ws/gfs exception: %s", exc)
+            break
+    log.info("/ws/gfs closed")
 
 
 def create_gfs_blueprint(static_dir: Path) -> Blueprint:
@@ -41,8 +74,11 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/ocean")
     async def api_ocean():
+        started = time.time()
         vp = parse_viewport_args(request.args)
         payload = gfs().shared_ocean_payload(vp.as_dict())
+        payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
+        log.info("/gfs/api/ocean latency_ms=%s", payload.get("latency_ms"))
         return jsonify(payload)
 
     @bp.route("/api/weather")
@@ -58,13 +94,24 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/bait")
     async def api_bait():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().bait_from_ocean(vp.as_dict()))
+        payload = gfs().bait_from_ocean(vp.as_dict())
+        log.info("/gfs/api/bait polygons=%s", len((payload.get("bait") or {}).get("polygons") or []))
+        return jsonify(payload)
 
     @bp.route("/api/bait-advanced")
     @bp.route("/api/bait/advanced")
     async def api_bait_advanced():
         vp = parse_viewport_args(request.args)
         return jsonify(gfs().bait_from_ocean(vp.as_dict()))
+
+    @bp.route("/api/boats")
+    async def api_boats():
+        started = time.time()
+        vp = parse_viewport_args(request.args)
+        payload = gfs().boats_from_ocean(vp.as_dict())
+        payload["latency_ms"] = round((time.time() - started) * 1000, 2)
+        log.info("/gfs/api/boats count=%s latency_ms=%s", payload.get("count"), payload.get("latency_ms"))
+        return jsonify(payload)
 
     @bp.route("/api/frame")
     async def api_frame():
@@ -104,12 +151,13 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
             "name": item.get("name") or "Fishing location",
             "lat": item.get("lat"),
             "lon": item.get("lon"),
+            "fish_index": item.get("fish_index"),
             "probability": item.get("probability"),
             "confidence": item.get("confidence"),
             "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
             "score": item.get("score"),
         } for item in (items or []) if isinstance(item, dict)]
-        return jsonify({"ok": True, "count": len(locations), "locations": locations, "source": "fish_from_ocean", "ts": payload.get("ts") if isinstance(payload, dict) else None})
+        return jsonify({"ok": True, "count": len(locations), "locations": locations, "source": "fish_from_ocean", "degraded": payload.get("degraded") if isinstance(payload, dict) else False, "ts": payload.get("ts") if isinstance(payload, dict) else None})
 
     @bp.route("/api/live/session", methods=["POST"])
     async def create_live_session():
@@ -137,6 +185,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
             "name": item.get("name") or media_payload.get("label") or location_key,
             "lat": item.get("lat"),
             "lon": item.get("lon"),
+            "fish_index": item.get("fish_index"),
             "probability": item.get("probability"),
             "confidence": item.get("confidence"),
             "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
@@ -183,23 +232,14 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/location/<location_key>/upload", methods=["POST"])
     async def upload_video(location_key):
         files = await request.files
-        if "video" not in files:
-            return jsonify({"ok": False, "error": "no video file"}), 400
-        video = files["video"]
+        video = files.get("video") or files.get("file")
+        if video is None:
+            return jsonify({"ok": False, "error": "no video/file field"}), 400
         return jsonify(media().save_upload_video(location_key, video.filename, video.read()))
 
     @bp.websocket("/ws")
-    async def ws_gfs():
-        await websocket.send_json({"type": "hello", "detail": "gfs websocket optional"})
-        while True:
-            msg = await websocket.receive()
-            if msg is None:
-                break
-            if str(msg).lower() in {"ping", '{"type":"ping"}'}:
-                await websocket.send_json({"type": "status", "detail": "ok"})
-            elif "refresh" in str(msg).lower():
-                await websocket.send_json({"type": "refresh_nudge", "detail": "frame"})
-            else:
-                await websocket.send_json({"type": "ack", "detail": msg})
+    async def ws_gfs_legacy():
+        # compatibility websocket path under /gfs/ws; /ws/gfs remains authoritative.
+        await handle_gfs_ws(gfs, websocket)
 
     return bp

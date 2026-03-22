@@ -1,5 +1,6 @@
 export class JetstreamLayer { constructor(){ this.enabled=false; }
-enable(v){ this.enabled=!!v; if(typeof window.setJetBalloonsEnabled==='function') window.setJetBalloonsEnabled(this.enabled); }
+enable(){ this.enabled=true; if(typeof window.setJetBalloonsEnabled==='function') window.setJetBalloonsEnabled(true); }
+disable(){ this.enabled=false; if(typeof window.setJetBalloonsEnabled==='function') window.setJetBalloonsEnabled(false); }
 refresh(){}
 update(){}
-destroy(){ this.enable(false); } }
+destroy(){ this.disable(); } }

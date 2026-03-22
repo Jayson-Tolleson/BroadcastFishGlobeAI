@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchOceanState } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -39,14 +39,13 @@ function syncPillState(name, enabled) {
 
 
 function baitAdvancedReady(payload) {
-  return Boolean(
-    payload
-    && payload.bait
-    && payload.bait.status === 'ready'
-    && payload.bait.source === 'full_stack'
-    && Array.isArray(payload.bait.polygons)
-    && payload.bait.polygons.length > 0
-  );
+  if (!payload || !payload.bait) return false;
+  const polygons = payload.bait.polygons;
+  const hasPolygons = Array.isArray(polygons) && polygons.length > 0;
+  const hasField = Array.isArray(payload.bait_score) && payload.bait_score.length > 0;
+  const src = String(payload.bait.source || payload.source || '');
+  const hasSource = src.length > 0 && ['shared_ocean', 'full_stack'].includes(src) || src.length > 0;
+  return Boolean(payload.bait.status === 'ready' && hasSource && (hasPolygons || hasField));
 }
 
 function preferStableBaitAdvanced(nextPayload, fallbackPayload) {
@@ -184,9 +183,9 @@ function currentLiveOverlayRefs() {
 
 async function refreshSelectedLiveState() {
   if (!selectedLocation) return;
-  const locationId = encodeURIComponent(selectedLocation.id);
+  const locationId = String(selectedLocation.id);
   if (missingLiveLocationIds.has(selectedLocation.id)) return;
-  const payload = await getJsonSafe(`/gfs/api/location/${locationId}/live`, null);
+  const payload = await fetchLocationLive(locationId, { abortPrevious: true });
   if (!payload) return;
   if (payload?.error === 'location_not_found' || payload?.ok === false) {
     missingLiveLocationIds.add(selectedLocation.id);
@@ -530,9 +529,14 @@ function createGfsSocket() {
     };
     ws.onmessage = (ev) => {
       lastMessageAt = Date.now();
-      try { handleMessage(JSON.parse(ev.data)); } catch (_) {}
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg?.type === 'status') gfsState.setWs(true, 'status');
+        if (msg?.type === 'hello') gfsState.setWs(true, 'hello');
+        handleMessage(msg);
+      } catch (_) {}
     };
-    ws.onerror = () => console.warn('[gfs/ws] socket error');
+    ws.onerror = (err) => { gfsState.setWs(false, 'error'); console.warn('[gfs/ws] socket error', err); };
     ws.onclose = () => {
       gfsState.setWs(false, 'close');
       connecting = false;

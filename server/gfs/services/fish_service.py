@@ -24,11 +24,13 @@ class FishService:
                 chl = sample_grid(fields.get("chlorophyll_mg_m3"), viewport, lat, lon)
                 cur = sample_grid(fields.get("current_speed"), viewport, lat, lon)
                 depth = sample_grid(fields.get("depth_m"), viewport, lat, lon)
+                if not math.isfinite(depth) or depth <= 15:
+                    continue
                 temp_score = max(0.0, 1.0 - abs(sst - 292.0) / 8.0) if math.isfinite(sst) else 0.35
                 chl_score = min(1.0, chl / 1.8) if math.isfinite(chl) else 0.2
                 cur_score = max(0.0, 1.0 - abs(cur - 0.7) / 1.0) if math.isfinite(cur) else 0.2
-                depth_score = max(0.0, 1.0 - abs(depth - 900.0) / 1400.0) if math.isfinite(depth) else 0.2
-                suitability = max(0.0, min(1.0, (temp_score * 0.35) + (chl_score * 0.3) + (cur_score * 0.2) + (depth_score * 0.15)))
+                depth_score = max(0.0, 1.0 - abs(depth - 900.0) / 1400.0)
+                fish_index = max(0.0, min(1.0, (temp_score * 0.35) + (chl_score * 0.3) + (cur_score * 0.2) + (depth_score * 0.15)))
                 reasons = [
                     f"SST score {temp_score:.2f}",
                     f"chlorophyll score {chl_score:.2f}",
@@ -40,11 +42,11 @@ class FishService:
                     "name": "Pelagic zone",
                     "lat": round(lat, 5),
                     "lon": round(lon, 5),
-                    "score": round(suitability * 100.0, 1),
-                    "suitability": round(suitability, 3),
+                    "fish_index": round(fish_index, 3),
+                    "score": round(fish_index * 100.0, 1),
+                    "confidence": round(fish_index, 3),
+                    "probability": round(fish_index, 3),
                     "reason": "; ".join(reasons),
                     "reasons": reasons,
-                    "confidence": round(suitability, 3),
-                    "probability": round(suitability, 3),
                 })
         return sorted(out, key=lambda item: item["score"], reverse=True)[:18]

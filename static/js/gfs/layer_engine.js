@@ -6,7 +6,7 @@ export class LayerEngine {
   }
   register(name, layer){
     this.layers[name] = { enabled:false, instance:layer };
-    layer.enable?.(false);
+    layer.disable?.();
   }
   setData(payload){
     this.latestData = payload || null;
@@ -22,10 +22,10 @@ export class LayerEngine {
     if(layer.enabled === enabled) return true;
     layer.enabled = enabled;
     if (enabled) {
-      layer.instance.enable?.(true);
+      layer.instance.enable?.();
       if (this.latestData) layer.instance.refresh?.(this.latestData);
     } else {
-      layer.instance.enable?.(false);
+      layer.instance.disable?.();
     }
     return true;
   }

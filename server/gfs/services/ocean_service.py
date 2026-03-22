@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-import math
 import time
 from typing import Any
 
 from server.gfs.canonical import build_canonical_grid, vector_speed
-from server.gfs.providers.bathymetry import build_depth_grid
+from server.gfs.providers.bathymetry import BathymetryProvider
 from server.gfs.providers.coastwatch_chl import CoastwatchChlProvider
 from server.gfs.providers.hycom_currents import HycomCurrentsProvider
 from server.gfs.providers.rtofs_currents import RtofsCurrentsProvider
@@ -21,6 +20,7 @@ class OceanService:
         self.hycom = HycomCurrentsProvider()
         self.chl = CoastwatchChlProvider()
         self.waves = WavewatchWavesProvider()
+        self.depth = BathymetryProvider()
         self._chl_last_good: list[list[float]] | None = None
 
     def _ekman_from_weather(self, weather: dict[str, Any]) -> dict[str, Any]:
@@ -45,14 +45,14 @@ class OceanService:
     def build_shared_state(self, viewport, weather: dict[str, Any]) -> dict[str, Any]:
         started = time.time()
         grid = build_canonical_grid(viewport)
-        log.info("canonical grid rows=%s cols=%s viewport=%s", grid.rows, grid.cols, viewport.as_bbox())
+        log.info("canonical grid rows=%s cols=%s cell_deg=%s", grid.rows, grid.cols, grid.cell_deg)
 
         currents = self.rtofs.fetch(weather, viewport.as_dict())
         if currents is None:
             currents = self.hycom.fetch(weather, viewport.as_dict())
         if currents is None:
             currents = self._ekman_from_weather(weather)
-        log.info("currents source selected=%s degraded=%s", currents.get("source"), currents.get("degraded"))
+        log.info("currents source=%s degraded=%s", currents.get("source"), currents.get("degraded"))
 
         chlorophyll = self.chl.fetch(weather, viewport.as_dict())
         chl_source = "coastwatch"
@@ -67,30 +67,36 @@ class OceanService:
         log.info("chlorophyll source=%s", chl_source)
 
         waves = self.waves.fetch(weather, viewport.as_dict())
-        depth = build_depth_grid(grid.rows, grid.cols, viewport.as_dict())
+        depth_grid, depth_degraded = self.depth.fetch(grid.rows, grid.cols, viewport.as_dict())
         sst = self._sst_grid(weather)
 
         speed: list[list[float]] = []
         for ru, rv in zip(currents.get("u") or [], currents.get("v") or []):
             speed.append([vector_speed(float(u), float(v)) for u, v in zip(ru, rv)])
 
-        return {
+        payload = {
             "ok": True,
+            "timestamp": int(time.time() * 1000),
             "ts": int(time.time() * 1000),
             "cycle": weather.get("source_time") or weather.get("valid_time"),
             "bbox": viewport.as_bbox(),
-            "grid": {"rows": grid.rows, "cols": grid.cols, "lats": grid.lats, "lons": grid.lons},
+            "quality": viewport.quality,
+            "stride": viewport.stride,
+            "grid": {"rows": grid.rows, "cols": grid.cols, "lats": grid.lats, "lons": grid.lons, "cell_deg": grid.cell_deg},
+            "source": "shared_ocean",
             "sources": {
+                "weather": "gfs",
                 "currents": currents.get("source"),
                 "chlorophyll": chl_source,
                 "waves": waves.get("source"),
-                "depth": "bathymetry_derived",
+                "depth": "bathymetry_cacheable",
                 "sst": "gfs_air_temp_adjusted",
             },
             "degraded": {
                 "currents": bool(currents.get("degraded")),
                 "waves": bool(waves.get("derived")),
                 "chlorophyll": chl_source != "coastwatch",
+                "depth": bool(depth_degraded),
             },
             "fields": {
                 "current_u": currents.get("u") or [],
@@ -99,7 +105,9 @@ class OceanService:
                 "sst_k": sst,
                 "chlorophyll_mg_m3": chlorophyll,
                 "wave_height_m": waves.get("height_m") or [],
-                "depth_m": depth,
+                "depth_m": depth_grid,
             },
+            "count": grid.rows * grid.cols,
             "latency_ms": round((time.time() - started) * 1000, 2),
         }
+        return payload

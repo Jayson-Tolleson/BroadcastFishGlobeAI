@@ -46,6 +46,38 @@ async def handle_gfs_ws(engine_getter, ws_obj) -> None:
     log.info("/ws/gfs closed")
 
 
+def _normalize_location_item(item: dict[str, Any]) -> dict[str, Any]:
+    item_id = item.get("id") or item.get("location_key") or "loc"
+    location_key = item.get("location_key") or item.get("id") or "loc"
+    return {
+        "id": item_id,
+        "location_key": location_key,
+        "name": item.get("name") or "Fishing location",
+        "lat": item.get("lat"),
+        "lon": item.get("lon"),
+        "fish_index": item.get("fish_index"),
+        "probability": item.get("probability"),
+        "confidence": item.get("confidence"),
+        "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
+        "score": item.get("score"),
+    }
+
+
+def _locations_response(payload: dict[str, Any], locations: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "count": len(locations),
+        "locations": locations,
+        "source": payload.get("source"),
+        "degraded": payload.get("degraded"),
+        "warm": payload.get("warm"),
+        "stale": payload.get("stale"),
+        "fallback_reason": payload.get("fallback_reason"),
+        "timestamp": payload.get("timestamp", int(time.time() * 1000)),
+        "ts": payload.get("ts"),
+    }
+
+
 def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     bp = Blueprint("gfs", __name__, url_prefix="/gfs")
 
@@ -147,23 +179,20 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/locations")
     async def api_locations():
         vp = parse_viewport_args(request.args)
-        started = time.time()
         payload = gfs().locations_fast(vp.as_dict(), budget_ms=1800)
-        log.info("/gfs/api/locations viewport=%s source=%s warm=%s stale=%s count=%s latency_ms=%s", vp.as_dict(), payload.get("source"), payload.get("warm"), payload.get("stale"), payload.get("count"), payload.get("latency_ms"))
+        log.info(
+            "/gfs/api/locations viewport=%s source=%s warm=%s stale=%s count=%s latency_ms=%s",
+            vp.as_dict(),
+            payload.get("source"),
+            payload.get("warm"),
+            payload.get("stale"),
+            payload.get("count"),
+            payload.get("latency_ms"),
+        )
         items = payload.get("items") if isinstance(payload, dict) else []
-        locations = [{
-            "id": item.get("id") or item.get("location_key") or "loc",
-            "location_key": item.get("location_key") or item.get("id") or "loc",
-            "name": item.get("name") or "Fishing location",
-            "lat": item.get("lat"),
-            "lon": item.get("lon"),
-            "fish_index": item.get("fish_index"),
-            "probability": item.get("probability"),
-            "confidence": item.get("confidence"),
-            "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
-            "score": item.get("score"),
-        } for item in (items or []) if isinstance(item, dict)]
-        return jsonify({"ok": True, "count": len(locations), "locations": locations, "source": payload.get("source") if isinstance(payload, dict) else "unknown", "degraded": payload.get("degraded") if isinstance(payload, dict) else True, "warm": payload.get("warm") if isinstance(payload, dict) else False, "stale": payload.get("stale") if isinstance(payload, dict) else False, "fallback_reason": payload.get("fallback_reason") if isinstance(payload, dict) else "none", "timestamp": payload.get("timestamp") if isinstance(payload, dict) else int(time.time()*1000), "ts": payload.get("ts") if isinstance(payload, dict) else None})
+        locations = [_normalize_location_item(item) for item in (items or []) if isinstance(item, dict)]
+        safe_payload = payload if isinstance(payload, dict) else {}
+        return jsonify(_locations_response(safe_payload, locations))
 
     @bp.route("/api/live/session", methods=["POST"])
     async def create_live_session():
@@ -185,17 +214,18 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     def _location_detail_payload(location_key: str) -> dict[str, Any]:
         item = _find_fish_item(location_key) or {}
         media_payload = media().location_media(location_key)
+        normalized = _normalize_location_item(item)
         return {
             "ok": True,
-            "id": item.get("id") or item.get("location_key") or location_key,
-            "location_key": item.get("location_key") or item.get("id") or location_key,
-            "name": item.get("name") or media_payload.get("label") or location_key,
-            "lat": item.get("lat"),
-            "lon": item.get("lon"),
-            "fish_index": item.get("fish_index"),
-            "probability": item.get("probability"),
-            "confidence": item.get("confidence"),
-            "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
+            "id": normalized.get("id") or location_key,
+            "location_key": normalized.get("location_key") or location_key,
+            "name": normalized.get("name") or media_payload.get("label") or location_key,
+            "lat": normalized.get("lat"),
+            "lon": normalized.get("lon"),
+            "fish_index": normalized.get("fish_index"),
+            "probability": normalized.get("probability"),
+            "confidence": normalized.get("confidence"),
+            "meta": normalized.get("meta"),
             "reports": [media_payload.get("report_text")] if media_payload.get("report_text") else [],
             "report_text": media_payload.get("report_text") or "",
             "uploads": media_payload.get("uploads") or [],
@@ -230,7 +260,20 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
             payload = media().location_media(location_key)
             live = payload.get("live") or {"active": False, "stream_url": "", "updated_at": None}
             fish = _find_fish_item(location_key) or {}
-            return jsonify({"ok": True, "id": fish.get("id") or fish.get("location_key") or location_key, "location_key": fish.get("location_key") or fish.get("id") or location_key, "name": fish.get("name") or payload.get("label") or location_key, "lat": fish.get("lat"), "lon": fish.get("lon"), "active": bool(live.get("active")), "stream_url": live.get("stream_url") or "", "updated_at": live.get("updated_at"), "live": live, "ts": payload.get("ts") or int(time.time() * 1000)})
+            normalized = _normalize_location_item(fish)
+            return jsonify({
+                "ok": True,
+                "id": normalized.get("id") or location_key,
+                "location_key": normalized.get("location_key") or location_key,
+                "name": normalized.get("name") or payload.get("label") or location_key,
+                "lat": normalized.get("lat"),
+                "lon": normalized.get("lon"),
+                "active": bool(live.get("active")),
+                "stream_url": live.get("stream_url") or "",
+                "updated_at": live.get("updated_at"),
+                "live": live,
+                "ts": payload.get("ts") or int(time.time() * 1000),
+            })
         data = await request.get_json() or {}
         active = bool(data.get("active"))
         url = data.get("stream_url", "")

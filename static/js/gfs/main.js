@@ -24,6 +24,7 @@ const missingLiveLocationIds = new Set();
 const GFS_DEBUG = Boolean(window.__GFS_DEBUG);
 
 const gfsState = createGfsState();
+const STEADY_EVENTS = ['gmp-centerchange', 'gmp-headingchange', 'gmp-rangechange', 'gmp-rollchange', 'gmp-tiltchange', 'gmp-camerapositionchange'];
 
 const layerRuntime = {
   engine: null,
@@ -455,16 +456,12 @@ function installSteadyRefresh() {
     refreshData('steady');
   };
 
-  ['gmp-centerchange', 'gmp-headingchange', 'gmp-rangechange', 'gmp-rollchange', 'gmp-tiltchange', 'gmp-camerapositionchange'].forEach((evt) => {
-    globeEl.addEventListener(evt, onMove);
-  });
+  STEADY_EVENTS.forEach((evt) => globeEl.addEventListener(evt, onMove));
   globeEl.addEventListener('gmp-steadystate', onSteady);
   globeEl.addEventListener('gmp-steadychange', onSteady);
 
   return () => {
-    ['gmp-centerchange', 'gmp-headingchange', 'gmp-rangechange', 'gmp-rollchange', 'gmp-tiltchange', 'gmp-camerapositionchange'].forEach((evt) => {
-      globeEl.removeEventListener(evt, onMove);
-    });
+    STEADY_EVENTS.forEach((evt) => globeEl.removeEventListener(evt, onMove));
     globeEl.removeEventListener('gmp-steadystate', onSteady);
     globeEl.removeEventListener('gmp-steadychange', onSteady);
   };
@@ -506,6 +503,8 @@ function createGfsSocket() {
     }, 20000);
   };
 
+  const setWsState = (connected, reason) => gfsState.setWs(Boolean(connected), reason);
+
   const handleMessage = (msg) => {
     if (!msg || typeof msg !== 'object') return;
     if (msg.type === 'snapshot_changed' && msg.detail?.location_id) {
@@ -527,20 +526,20 @@ function createGfsSocket() {
       backoffMs = MIN_BACKOFF_MS;
       clearTimers();
       startHeartbeat();
-      gfsState.setWs(true, 'open');
+      setWsState(true, 'open');
       console.info('[gfs/ws] connected');
     };
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
-        if (msg?.type === 'status') gfsState.setWs(true, 'status');
-        if (msg?.type === 'hello') gfsState.setWs(true, 'hello');
+        if (msg?.type === 'status') setWsState(true, 'status');
+        if (msg?.type === 'hello') setWsState(true, 'hello');
         handleMessage(msg);
       } catch (_) {}
     };
-    ws.onerror = (err) => { gfsState.setWs(false, 'error'); console.warn('[gfs/ws] socket error', err); };
+    ws.onerror = (err) => { setWsState(false, 'error'); console.warn('[gfs/ws] socket error', err); };
     ws.onclose = (ev) => {
-      gfsState.setWs(false, 'close');
+      setWsState(false, 'close');
       connecting = false;
       clearTimers();
       console.info('[gfs/ws] closed', { code: ev?.code, reason: ev?.reason || '', wasClean: Boolean(ev?.wasClean) });

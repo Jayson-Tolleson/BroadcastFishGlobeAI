@@ -6,6 +6,10 @@ from pathlib import Path
 
 from quart import Quart
 
+from server.ai.core import AICore
+from server.ai.memory import AIMemory
+from server.ai.queue import shared_ai_queue
+from server.ai.worker import AIWorker
 from server.config import load_settings
 from server.gfs.config import load_gfs_config
 from server.gfs.engine import GfsEngine
@@ -42,10 +46,30 @@ def create_quart_app() -> Quart:
     app = Quart(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
     state = AppState(default_room=settings.default_room)
     rtc = RTCManager(state)
+    app.extensions["ai_core"] = AICore()
+    app.extensions["ai_memory"] = AIMemory()
+    app.extensions["ai_queue"] = shared_ai_queue
+    app.extensions["ai_worker"] = AIWorker(app.extensions["ai_core"], app.extensions["ai_queue"])
     app.extensions["gfs_engine"] = GfsEngine(load_gfs_config(debug_enabled=settings.debug), static_dir=str(STATIC_DIR))
     app.extensions["gfs_media_store"] = app.extensions["gfs_engine"]
 
     register_routes(app, state, settings, rtc)
+
+    @app.before_serving
+    async def _start_ai_worker() -> None:
+        task = app.extensions.get("ai_worker_task")
+        if task and not task.done():
+            return
+        app.extensions["ai_worker_task"] = app.add_background_task(app.extensions["ai_worker"].run_forever)
+
+    @app.after_serving
+    async def _stop_ai_worker() -> None:
+        worker = app.extensions.get("ai_worker")
+        if worker:
+            worker.stop()
+        task = app.extensions.get("ai_worker_task")
+        if task and not task.done():
+            task.cancel()
 
     try:
         threading.Thread(target=app.extensions["gfs_engine"].prewarm_startup, daemon=True).start()

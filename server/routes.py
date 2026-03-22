@@ -5,6 +5,12 @@ from pathlib import Path
 from quart import Quart, current_app, websocket
 
 from server.api import api_bp
+from server.ai.blueprints import (
+    create_ai_blueprint,
+    create_broadcast_ai_blueprint,
+    create_gfs_ai_blueprint,
+    create_lftr_ai_blueprint,
+)
 from server.broadcast.routes import register_broadcast_routes
 from server.config import Settings
 from server.gfs import create_gfs_blueprint
@@ -25,6 +31,10 @@ def register_routes(app: Quart, state: AppState, settings: Settings, rtc: RTCMan
     register_core_routes(app, settings, STATIC_DIR)
     register_broadcast_routes(app, state, rtc)
     app.register_blueprint(create_gfs_blueprint(STATIC_DIR))
+    app.register_blueprint(create_ai_blueprint())
+    app.register_blueprint(create_gfs_ai_blueprint())
+    app.register_blueprint(create_broadcast_ai_blueprint())
+    app.register_blueprint(create_lftr_ai_blueprint())
     app.register_blueprint(api_bp)
 
     @app.websocket("/ws/gfs")

@@ -314,3 +314,32 @@ class GfsEngine(GFSService):
             "cycle": ocean.get("cycle"),
             "warm": self.warm_status(),
         }
+
+    def health_payload(self) -> dict[str, Any]:
+        payload = super().health_payload()
+        try:
+            ocean = self.shared_ocean_payload(None)
+        except Exception as exc:
+            payload["ocean"] = {
+                "currents": {
+                    "selected_source": "unknown",
+                    "degraded": True,
+                    "primary": {
+                        "name": "rtofs",
+                        "attempted": True,
+                        "ok": False,
+                        "reason": "ocean_health_failed",
+                        "detail": str(exc),
+                    },
+                }
+            }
+            return payload
+        currents_diag = (ocean.get("diagnostics") or {}).get("currents") or {}
+        payload["ocean"] = {
+            "currents": {
+                "selected_source": (ocean.get("sources") or {}).get("currents"),
+                "degraded": bool((ocean.get("degraded") or {}).get("currents")),
+                "primary": currents_diag,
+            }
+        }
+        return payload

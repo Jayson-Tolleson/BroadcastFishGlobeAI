@@ -48,10 +48,17 @@ class OceanService:
         log.info("canonical grid rows=%s cols=%s cell_deg=%s", grid.rows, grid.cols, grid.cell_deg)
 
         currents = self.rtofs.fetch(weather, viewport.as_dict())
+        currents_status = dict(getattr(self.rtofs, "last_status", {}) or {})
         if currents is None:
             currents = self.hycom.fetch(weather, viewport.as_dict())
+            currents_status["selected_source"] = currents.get("source") if isinstance(currents, dict) else "none"
+            currents_status["degraded"] = True
+            currents_status.setdefault("reason", "missing_weather_vectors")
         if currents is None:
             currents = self._ekman_from_weather(weather)
+            currents_status["selected_source"] = currents.get("source")
+            currents_status["degraded"] = True
+            currents_status.setdefault("reason", "fallback_to_ekman")
         log.info("currents source=%s degraded=%s", currents.get("source"), currents.get("degraded"))
 
         chlorophyll = self.chl.fetch(weather, viewport.as_dict())
@@ -97,6 +104,9 @@ class OceanService:
                 "waves": bool(waves.get("derived")),
                 "chlorophyll": chl_source != "coastwatch",
                 "depth": bool(depth_degraded),
+            },
+            "diagnostics": {
+                "currents": currents_status,
             },
             "fields": {
                 "current_u": currents.get("u") or [],

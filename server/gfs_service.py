@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover - optional fallback decoder
 
 from werkzeug.utils import secure_filename
 
+from server.gfs.field_aliases import resolve_aliases
 from server.gfs_state import GFSState
 
 
@@ -1061,12 +1062,13 @@ class GFSService:
             for v in list(getattr(ds, "data_vars", {}).keys()):
                 available.add(f"{gname}:{v}")
 
-        desired = {
+        desired = [
             "surface:PRATE", "surface:APCP", "surface:TCDC", "surface:CAPE", "surface:UGRD", "surface:VGRD",
             "2m:TCDC", "2m:UGRD", "2m:VGRD", "10m:UGRD", "10m:VGRD",
             "isobaricInhPa:RH", "isobaricInhPa:TMP", "isobaricInhPa:HGT", "isobaricInhPa:UGRD", "isobaricInhPa:VGRD",
-        }
-        missing = sorted([k for k in desired if k not in available])
+        ]
+        resolved = resolve_aliases(available, desired)
+        missing = sorted(resolved["missing"])
         return sorted(available), missing
 
     def _update_ingest_state_success(self, fetch: FetchResult, groups: dict[str, Any], mode: str, error: str | None = None) -> None:
@@ -2726,6 +2728,29 @@ class GFSService:
             }
         self.state.scalar_fields = scalar_fields
 
+    def _weather_fields_payload(self, fields: dict[str, Any]) -> dict[str, Any]:
+        if np is None:
+            return {}
+        out: dict[str, Any] = {}
+        for key in ("wind_u", "wind_v", "temperature_k", "cloud_density"):
+            val = fields.get(key)
+            if val is None:
+                continue
+            try:
+                arr = np.asarray(val, dtype=float)
+            except Exception:
+                continue
+            if arr.ndim != 2:
+                continue
+            out[key] = arr.astype(np.float32).tolist()
+        if "wind_u" in out:
+            out["10m:u10"] = out["wind_u"]
+            out["10m:UGRD"] = out["wind_u"]
+        if "wind_v" in out:
+            out["10m:v10"] = out["wind_v"]
+            out["10m:VGRD"] = out["wind_v"]
+        return out
+
     def tile_to_bounds(self, z: int, x: int, y: int) -> dict[str, float]:
         return self._tile_bounds_xyz(z, x, y)
 
@@ -2962,6 +2987,7 @@ class GFSService:
                 "cache_path": str(fetch.path) if fetch.path else None,
                 "fields_available": list(self.state.fields_available or []),
                 "fields_missing": list(self.state.fields_missing or []),
+                "fields": self._weather_fields_payload(fields),
                 "using_last_known_good": mode == "last_known_good",
                 "degraded_mode": mode != "live",
                 "decode_backend": self.state.decode_backend,

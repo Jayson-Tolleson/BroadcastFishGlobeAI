@@ -10,6 +10,14 @@ export class LayerEngine {
     layer.disable?.();
   }
   async setData(payload){
+    if (payload?.locations && payload?.entity_type === 'fish') {
+      console.warn('[gfs layers] rejected mixed payload: fish entity carrying locations collection');
+      payload = { ...payload, locations: [] };
+    }
+    if (payload?.locations && payload?.derived === true) {
+      console.warn('[gfs layers] rejected derived locations payload contract');
+      payload = { ...payload, locations: [] };
+    }
     this.latestData = payload || null;
     await Promise.all(Object.entries(this.layers).map(async ([name, layer]) => {
       if (!layer.enabled) return;

@@ -145,8 +145,10 @@ class GfsEngine(GFSService):
             "sources": ocean.get("sources"),
             "warm": self._warm_ready,
             "stale": False,
+            "entity_type": "fish",
+            "derived": True,
         }
-        self._cache.set(self._cache_key("locations", vp), {"items": items, "count": len(items), "ts": payload["ts"]})
+        self._cache.set(self._cache_key("fish", vp), {"items": items, "count": len(items), "ts": payload["ts"]})
         return payload
 
     @staticmethod
@@ -207,6 +209,8 @@ class GfsEngine(GFSService):
             "timestamp": int(time.time() * 1000),
             "ts": raw.get("ts") or int(time.time() * 1000),
             "error": raw.get("error"),
+            "entity_type": "location",
+            "derived": False,
         }
 
     def locations_fast(self, bbox: dict[str, float] | None, budget_ms: int = 1800) -> dict[str, Any]:
@@ -215,7 +219,7 @@ class GfsEngine(GFSService):
         key = self._cache_key("locations", vp)
         cached = self._cache.get(key)
         if cached:
-            return {"ok": True, "source": "fish_csv_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
+            return {"ok": True, "source": "fish_csv_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2), "entity_type": "location", "derived": False}
 
         payload = self._csv_locations(vp.as_dict())
         self._cache.set(key, {"items": payload.get("items") or [], "count": payload.get("count") or 0, "ts": payload.get("ts")})
@@ -240,6 +244,8 @@ class GfsEngine(GFSService):
             "sources": ocean.get("sources"),
             "warm": self._warm_ready,
             "stale": False,
+            "entity_type": "bait",
+            "derived": True,
         }
         self._cache.set(self._cache_key("bait", vp), scored)
         return payload
@@ -260,6 +266,8 @@ class GfsEngine(GFSService):
             "sources": ocean.get("sources"),
             "warm": self._warm_ready,
             "stale": False,
+            "entity_type": "boat",
+            "derived": True,
         }
         self._cache.set(self._cache_key("boats", vp), payload)
         return payload
@@ -317,6 +325,7 @@ class GfsEngine(GFSService):
 
     def health_payload(self) -> dict[str, Any]:
         payload = super().health_payload()
+        csv = self.fish_payload()
         try:
             ocean = self.shared_ocean_payload(None)
         except Exception as exc:
@@ -342,4 +351,30 @@ class GfsEngine(GFSService):
                 "primary": currents_diag,
             }
         }
+        payload["entities"] = {
+            "locations": {
+                "entity_type": "location",
+                "source": "fishloclist.csv",
+                "derived": False,
+                "ok": bool(csv.get("ok")),
+                "count": int(csv.get("count") or 0),
+                "error": csv.get("error"),
+            },
+            "fish_intelligence": {
+                "entity_type": "fish",
+                "source": "shared_ocean",
+                "derived": True,
+                "ok": bool((ocean.get("fields") or {}).get("current_u")),
+                "currents_source": (ocean.get("sources") or {}).get("currents"),
+                "degraded": bool((ocean.get("degraded") or {}).get("currents")),
+            },
+        }
         return payload
+
+    def diagnostics_payload(self) -> dict[str, Any]:
+        out = super().diagnostics_payload()
+        out["contract"] = {
+            "locations_endpoint": {"path": "/gfs/api/locations", "entity_type": "location", "derived": False, "source": "fishloclist.csv"},
+            "fish_endpoint": {"path": "/gfs/api/fish", "entity_type": "fish", "derived": True, "source": "shared_ocean"},
+        }
+        return out

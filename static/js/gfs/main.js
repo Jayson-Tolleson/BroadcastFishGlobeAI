@@ -700,6 +700,9 @@ async function boot() {
   initLayerSystem();
   const bootViewport = getCanonicalViewport();
   let payload = await fetchLocations(bootViewport, { timeoutMs: 2200, abortPrevious: false });
+  if (payload?.contract_mismatch) {
+    console.warn('[gfs] locations contract mismatch; markers suppressed', payload);
+  }
   gfsState.setCache('locations', payload);
   if (!payload?.locations?.length) gfsState.setStaleHold('locations unavailable; showing overlays without markers');
   const locations = payload?.locations || [];
@@ -710,7 +713,7 @@ async function boot() {
 
   await refreshData('boot');
 
-  showStatus(`Ready • ${locations.length} fish beacons`);
+  showStatus(`Ready • ${locations.length} CSV locations`);
   startLivePolling();
 
   window.addEventListener('beforeunload', teardownSteady, { once: true });

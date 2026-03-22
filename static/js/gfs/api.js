@@ -11,6 +11,51 @@ function makeError(message, extra = {}) {
   return err;
 }
 
+function isExpectedEntity(payload, expectedType, expectedDerived) {
+  if (!payload || typeof payload !== 'object') return false;
+  const t = String(payload.entity_type || '');
+  const d = Boolean(payload.derived);
+  return t === expectedType && d === expectedDerived;
+}
+
+function normalizeLocationsPayload(payload) {
+  if (isExpectedEntity(payload, 'location', false)) return payload;
+  warn('locations payload contract mismatch', {
+    entity_type: payload?.entity_type,
+    derived: payload?.derived,
+    source: payload?.source,
+  });
+  return {
+    ok: false,
+    entity_type: 'location',
+    derived: false,
+    source: payload?.source || 'unknown',
+    locations: [],
+    count: 0,
+    error: 'locations_contract_mismatch',
+    contract_mismatch: true,
+  };
+}
+
+function normalizeFishPayload(payload) {
+  if (isExpectedEntity(payload, 'fish', true)) return payload;
+  warn('fish payload contract mismatch', {
+    entity_type: payload?.entity_type,
+    derived: payload?.derived,
+    source: payload?.source,
+  });
+  return {
+    ok: false,
+    entity_type: 'fish',
+    derived: true,
+    source: payload?.source || 'unknown',
+    items: [],
+    count: 0,
+    error: 'fish_contract_mismatch',
+    contract_mismatch: true,
+  };
+}
+
 function normalizeOptions(opts = {}) {
   if (opts instanceof AbortSignal) return { signal: opts };
   if (!opts || typeof opts !== 'object') return {};
@@ -285,7 +330,8 @@ export async function fetchOceanState(viewport, options = {}) {
 
 export async function fetchLocations(viewport, options = {}) {
   const merged = { timeoutMs: 2500, abortPrevious: false, ...options };
-  return getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, merged);
+  const payload = await getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, merged);
+  return normalizeLocationsPayload(payload);
 }
 
 export async function fetchLocation(id, options = {}) {
@@ -305,7 +351,8 @@ export async function fetchBoats(viewport, options = {}) {
 }
 
 export async function fetchFish(viewport, options = {}) {
-  return getJsonSafe(`/gfs/api/fish?${viewportQuery(viewport)}`, { items: [] }, options);
+  const payload = await getJsonSafe(`/gfs/api/fish?${viewportQuery(viewport)}`, { items: [] }, options);
+  return normalizeFishPayload(payload);
 }
 
 // compatibility thin aliases

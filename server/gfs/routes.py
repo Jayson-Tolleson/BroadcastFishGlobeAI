@@ -69,6 +69,8 @@ def _locations_response(payload: dict[str, Any], locations: list[dict[str, Any]]
         "count": len(locations),
         "locations": locations,
         "source": payload.get("source"),
+        "entity_type": payload.get("entity_type", "location"),
+        "derived": bool(payload.get("derived", False)),
         "degraded": payload.get("degraded"),
         "warm": payload.get("warm"),
         "stale": payload.get("stale"),
@@ -174,7 +176,10 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/fish")
     async def api_fish():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().fish_from_ocean(vp.as_dict()))
+        payload = gfs().fish_from_ocean(vp.as_dict())
+        payload.setdefault("entity_type", "fish")
+        payload.setdefault("derived", True)
+        return jsonify(payload)
 
     @bp.route("/api/locations")
     async def api_locations():

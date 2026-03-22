@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 from quart import Quart
@@ -45,6 +46,11 @@ def create_quart_app() -> Quart:
     app.extensions["gfs_media_store"] = app.extensions["gfs_engine"]
 
     register_routes(app, state, settings, rtc)
+
+    try:
+        threading.Thread(target=app.extensions["gfs_engine"].prewarm_startup, daemon=True).start()
+    except Exception as exc:
+        logging.getLogger("server.startup").warning("gfs prewarm thread start failed: %s", exc)
 
     app.settings_obj = settings
     app.state_obj = state

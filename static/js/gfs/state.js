@@ -7,10 +7,11 @@ export function createGfsState() {
     ocean: null,
     ws: { connected: false, lastEvent: null },
     layers: {},
-    debug: { cycle: null, sources: {}, degraded: {}, counts: {} },
+    debug: { cycle: null, sources: {}, degraded: {}, counts: {}, warm: null },
     cache: { locations: null, boats: null, bait: null },
     staleHold: false,
     debugHoldReason: '',
+    locationsSource: null,
     setFrame(frame, viewport = null) {
       this.frame = frame || null;
       this.ocean = frame?.ocean || this.ocean;
@@ -18,6 +19,7 @@ export function createGfsState() {
       this.quality = frame?.ocean?.quality || this.quality;
       this.stride = frame?.ocean?.stride || this.stride;
       this.debug = frame?.debug || this.debug;
+      this.debug.warm = frame?.ocean?.warm ?? this.debug.warm;
       this.staleHold = false;
     },
     setLayer(name, enabled) {
@@ -28,6 +30,9 @@ export function createGfsState() {
     },
     setCache(key, payload) {
       this.cache[key] = payload;
+      if (key === 'locations' && payload) {
+        this.locationsSource = payload.source || null;
+      }
     },
     setStaleHold(reason) {
       this.staleHold = true;

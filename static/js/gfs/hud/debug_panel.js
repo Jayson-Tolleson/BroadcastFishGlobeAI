@@ -2,16 +2,21 @@ export function renderDebugPanel(el, state) {
   if (!el) return;
   const debug = state?.debug || {};
   const ws = state?.ws || {};
-  const sources = debug.sources || state?.ocean?.sources || {};
-  const degraded = debug.degraded || state?.ocean?.degraded || {};
+  const ocean = state?.ocean || {};
+  const sources = debug.sources || ocean.sources || {};
+  const degraded = debug.degraded || ocean.degraded || {};
   const counts = debug.counts || {};
-  const quality = state?.quality || state?.ocean?.quality || 'n/a';
-  const stride = state?.stride || state?.ocean?.stride || 'n/a';
+  const quality = state?.quality || ocean.quality || 'n/a';
+  const stride = state?.stride || ocean.stride || 'n/a';
   const stale = state?.staleHold ? `yes (${state?.debugHoldReason || 'holding prior payload'})` : 'no';
+  const warm = ocean.warm ?? debug.warm;
+  const locationsSource = state?.locationsSource || state?.cache?.locations?.source || 'unknown';
   el.textContent = [
-    `Cycle: ${debug.cycle || state?.ocean?.cycle || 'n/a'}`,
+    `Cycle: ${debug.cycle || ocean.cycle || 'n/a'}`,
+    `Warm ready: ${String(warm)}`,
     `Viewport quality: ${quality}`,
     `Viewport stride: ${stride}`,
+    `Locations source: ${locationsSource}`,
     `Weather source: ${sources.weather || 'n/a'}`,
     `Current source: ${sources.currents || 'n/a'}`,
     `Chlorophyll source: ${sources.chlorophyll || 'n/a'}`,

@@ -284,7 +284,8 @@ export async function fetchOceanState(viewport, options = {}) {
 }
 
 export async function fetchLocations(viewport, options = {}) {
-  return getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, options);
+  const merged = { timeoutMs: 2500, abortPrevious: false, ...options };
+  return getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, merged);
 }
 
 export async function fetchLocation(id, options = {}) {
@@ -301,6 +302,10 @@ export async function fetchBait(viewport, options = {}) {
 
 export async function fetchBoats(viewport, options = {}) {
   return getJsonSafe(`/gfs/api/boats?${viewportQuery(viewport)}`, null, options);
+}
+
+export async function fetchFish(viewport, options = {}) {
+  return getJsonSafe(`/gfs/api/fish?${viewportQuery(viewport)}`, { items: [] }, options);
 }
 
 // compatibility thin aliases

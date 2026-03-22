@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations, fetchFish } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -108,6 +108,7 @@ function initLayerSystem() {
 }
 
 const dataState = {
+  lastRequestOutcome: 'ok',
   inFlight: false,
   requestSeq: 0,
   activeAbort: null,
@@ -412,7 +413,14 @@ async function refreshData(reason = 'manual') {
     }
     return dataState.latest;
   } catch (err) {
-    if (err?.name !== 'AbortError') {
+    if (err?.name === 'AbortError') {
+      dataState.lastRequestOutcome = 'intentional_abort';
+    } else if (String(err?.message || '').toLowerCase().includes('timeout')) {
+      dataState.lastRequestOutcome = 'timeout_fallback';
+      gfsState.setStaleHold('refresh timeout; holding prior visuals');
+      console.warn('[gfs data] refresh timeout', err?.message || err);
+    } else {
+      dataState.lastRequestOutcome = 'error';
       console.warn('[gfs data] refresh failed', err?.message || err);
     }
     return dataState.latest;
@@ -698,9 +706,11 @@ async function boot() {
 
   const { maps3d } = await libs();
   initLayerSystem();
-  let payload = await getJsonSafe('/gfs/api/locations', null);
+  const bootViewport = getCanonicalViewport();
+  let payload = await fetchLocations(bootViewport, { timeoutMs: 2200, abortPrevious: false });
+  gfsState.setCache('locations', payload);
   if (!payload?.locations?.length) {
-    const fishPayload = await getJsonSafe('/gfs/api/fish', { items: [] });
+    const fishPayload = await fetchFish(bootViewport, { timeoutMs: 2500, abortPrevious: false });
     const fallbackLocations = Array.isArray(fishPayload?.items)
       ? fishPayload.items.map((item) => ({
           id: item?.id || item?.location_key || item?.name || 'loc',
@@ -716,7 +726,8 @@ async function boot() {
           score: item?.score,
         }))
       : [];
-    payload = { ...(payload || {}), locations: fallbackLocations };
+    payload = { ...(payload || {}), locations: fallbackLocations, source: payload?.source || 'fish_fallback', degraded: true, stale: true };
+    gfsState.setStaleHold('locations timed out; using fish fallback');
   }
   const locations = payload?.locations || [];
   renderMarkers({ locations, globeEl, maps3d, onSelect: (loc) => { gfsSocket.connect(); hud.open(loc); } });

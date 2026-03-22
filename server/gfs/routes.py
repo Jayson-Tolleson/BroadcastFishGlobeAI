@@ -62,7 +62,9 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/health")
     async def api_health():
-        return jsonify(gfs().health_payload())
+        payload = gfs().health_payload()
+        payload["warm"] = gfs().warm_status()
+        return jsonify(payload)
 
     @bp.route("/api/config")
     async def api_config():
@@ -145,8 +147,9 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/locations")
     async def api_locations():
         vp = parse_viewport_args(request.args)
-        payload = gfs().fish_from_ocean(vp.as_dict())
-        log.info("/gfs/api/locations viewport=%s fish_count=%s", vp.as_dict(), payload.get("count"))
+        started = time.time()
+        payload = gfs().locations_fast(vp.as_dict(), budget_ms=1800)
+        log.info("/gfs/api/locations viewport=%s source=%s warm=%s stale=%s count=%s latency_ms=%s", vp.as_dict(), payload.get("source"), payload.get("warm"), payload.get("stale"), payload.get("count"), payload.get("latency_ms"))
         items = payload.get("items") if isinstance(payload, dict) else []
         locations = [{
             "id": item.get("id") or "loc",
@@ -160,7 +163,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
             "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
             "score": item.get("score"),
         } for item in (items or []) if isinstance(item, dict)]
-        return jsonify({"ok": True, "count": len(locations), "locations": locations, "source": "fish_from_ocean", "degraded": payload.get("degraded") if isinstance(payload, dict) else False, "ts": payload.get("ts") if isinstance(payload, dict) else None})
+        return jsonify({"ok": True, "count": len(locations), "locations": locations, "source": payload.get("source") if isinstance(payload, dict) else "unknown", "degraded": payload.get("degraded") if isinstance(payload, dict) else True, "warm": payload.get("warm") if isinstance(payload, dict) else False, "stale": payload.get("stale") if isinstance(payload, dict) else False, "fallback_reason": payload.get("fallback_reason") if isinstance(payload, dict) else "none", "timestamp": payload.get("timestamp") if isinstance(payload, dict) else int(time.time()*1000), "ts": payload.get("ts") if isinstance(payload, dict) else None})
 
     @bp.route("/api/live/session", methods=["POST"])
     async def create_live_session():

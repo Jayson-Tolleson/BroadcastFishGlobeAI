@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
+from server.gfs.cache import TinyTTLCache
 from server.gfs.models import BBox
 from server.gfs.viewport import canonicalize_viewport
 from server.gfs.services.ocean_service import OceanService
@@ -28,6 +31,12 @@ class GfsEngine(GFSService):
         self.fish_service = FishService()
         self.bait_service = BaitService()
         self.boat_service = BoatService()
+        self._cache = TinyTTLCache(ttl_seconds=75.0, max_entries=128)
+        self._warm_lock = threading.Lock()
+        self._warm_started = False
+        self._warm_ready = False
+        self._warm_error: str | None = None
+        self._warm_at: int | None = None
 
     def parse_intent(self, args: Any) -> ParsedIntent:
         vp = canonicalize_viewport({
@@ -42,6 +51,12 @@ class GfsEngine(GFSService):
 
     async def weather_payload(self, intent: ParsedIntent) -> dict[str, Any]:
         return self.generate_weather_payload({"west": intent.bbox.west, "south": intent.bbox.south, "east": intent.bbox.east, "north": intent.bbox.north})
+
+    def _cache_key(self, kind: str, vp) -> str:
+        return f"{kind}:{vp.west:.3f}:{vp.south:.3f}:{vp.east:.3f}:{vp.north:.3f}:{vp.quality}:{vp.stride}"
+
+    def _default_warm_viewport(self):
+        return canonicalize_viewport({"west": -121.5, "south": 32.5, "east": -117.5, "north": 35.8, "quality": "coarse", "stride": 2})
 
     def _fallback_weather(self, vp) -> dict[str, Any]:
         rows = max(1, int(round((vp.north - vp.south) / (0.25 * vp.stride))))
@@ -70,17 +85,55 @@ class GfsEngine(GFSService):
             log.warning("weather payload fallback activated: %s", exc)
             return self._fallback_weather(vp)
 
+    def _build_shared_products(self, vp):
+        weather = self._safe_weather_payload(vp)
+        ocean = self.ocean_service.build_shared_state(vp, weather)
+        fish = self.fish_service.score_markers(ocean, vp)
+        bait = self.bait_service.score(ocean, vp)
+        boats = self.boat_service.agents(ocean, vp, count=12)
+        return weather, ocean, fish, bait, boats
+
+    def prewarm_startup(self) -> None:
+        with self._warm_lock:
+            if self._warm_started:
+                return
+            self._warm_started = True
+        log.info("gfs prewarm start")
+        started = time.time()
+        try:
+            vp = self._default_warm_viewport()
+            weather, ocean, fish, bait, boats = self._build_shared_products(vp)
+            self._cache.set(self._cache_key("ocean", vp), ocean)
+            self._cache.set(self._cache_key("locations", vp), {"items": fish, "count": len(fish)})
+            self._cache.set(self._cache_key("bait", vp), bait)
+            self._cache.set(self._cache_key("boats", vp), {"boats": boats, "count": len(boats)})
+            self._warm_ready = True
+            self._warm_error = None
+            self._warm_at = int(time.time() * 1000)
+            log.info("gfs prewarm complete latency_ms=%.2f", (time.time() - started) * 1000)
+        except Exception as exc:
+            self._warm_error = str(exc)
+            log.warning("gfs prewarm failed: %s", exc)
+
     def shared_ocean_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
+        key = self._cache_key("ocean", vp)
+        cached = self._cache.get(key)
+        if cached:
+            out = {**cached, "warm": self._warm_ready, "stale": False, "cache": "fresh"}
+            return out
         weather = self._safe_weather_payload(vp)
-        return self.ocean_service.build_shared_state(vp, weather)
+        ocean = self.ocean_service.build_shared_state(vp, weather)
+        ocean.update({"warm": self._warm_ready, "stale": False, "cache": "miss"})
+        self._cache.set(key, ocean)
+        return ocean
 
     def fish_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         ocean = self.shared_ocean_payload(vp.as_dict())
         items = self.fish_service.score_markers(ocean, vp)
         log.info("fish derived count=%s viewport=%s", len(items), vp.as_bbox())
-        return {
+        payload = {
             "ok": True,
             "source": "shared_ocean",
             "degraded": bool(ocean.get("degraded")),
@@ -89,14 +142,57 @@ class GfsEngine(GFSService):
             "timestamp": ocean.get("timestamp"),
             "ts": ocean.get("ts"),
             "sources": ocean.get("sources"),
+            "warm": self._warm_ready,
+            "stale": False,
         }
+        self._cache.set(self._cache_key("locations", vp), {"items": items, "count": len(items), "ts": payload["ts"]})
+        return payload
+
+    def locations_fast(self, bbox: dict[str, float] | None, budget_ms: int = 1800) -> dict[str, Any]:
+        vp = canonicalize_viewport(bbox)
+        started = time.time()
+        key = self._cache_key("locations", vp)
+        cached = self._cache.get(key)
+        if cached:
+            return {"ok": True, "source": "shared_ocean_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
+
+        if not self._warm_started:
+            threading.Thread(target=self.prewarm_startup, daemon=True).start()
+
+        if not self._warm_ready:
+            last_good = self._cache.get_last_good(key)
+            if last_good:
+                return {"ok": True, "source": "locations_last_good", "degraded": True, "warm": False, "stale": True, "fallback_reason": "warm_not_ready", "items": last_good.get("items") or [], "count": len(last_good.get("items") or []), "timestamp": int(time.time() * 1000), "ts": last_good.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
+            # lightweight fallback path
+            lightweight = self.fish_payload()
+            items = []
+            for item in (lightweight.get("items") or [])[:16]:
+                if not isinstance(item, dict):
+                    continue
+                items.append({
+                    "id": item.get("id") or item.get("location_key") or item.get("name") or "loc",
+                    "name": item.get("name") or "Fishing location",
+                    "lat": item.get("lat"),
+                    "lon": item.get("lon"),
+                    "fish_index": item.get("fish_index") if item.get("fish_index") is not None else item.get("confidence"),
+                    "confidence": item.get("confidence") if item.get("confidence") is not None else item.get("probability") or 0.4,
+                    "probability": item.get("probability") if item.get("probability") is not None else item.get("confidence") or 0.4,
+                    "score": item.get("score"),
+                    "reason": "lightweight_fallback",
+                    "reasons": ["warm cache building"],
+                })
+            return {"ok": True, "source": "lightweight_fallback", "degraded": True, "warm": False, "stale": False, "fallback_reason": "warmup_in_progress", "items": items, "count": len(items), "timestamp": int(time.time() * 1000), "ts": int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
+
+        payload = self.fish_from_ocean(vp.as_dict())
+        payload.update({"fallback_reason": None, "latency_ms": round((time.time() - started) * 1000, 2)})
+        return payload
 
     def bait_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         ocean = self.shared_ocean_payload(vp.as_dict())
         scored = self.bait_service.score(ocean, vp)
         log.info("bait derived polygons=%s viewport=%s", len(scored.get("polygons") or []), vp.as_bbox())
-        return {
+        payload = {
             "ok": True,
             "source": scored.get("source", "shared_ocean"),
             "degraded": bool(scored.get("degraded")) or bool(ocean.get("degraded", {}).get("chlorophyll")),
@@ -107,14 +203,18 @@ class GfsEngine(GFSService):
             "timestamp": ocean.get("timestamp"),
             "ts": ocean.get("ts"),
             "sources": ocean.get("sources"),
+            "warm": self._warm_ready,
+            "stale": False,
         }
+        self._cache.set(self._cache_key("bait", vp), scored)
+        return payload
 
     def boats_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         ocean = self.shared_ocean_payload(vp.as_dict())
         boats = self.boat_service.agents(ocean, vp, count=12)
         log.info("boats derived count=%s viewport=%s", len(boats), vp.as_bbox())
-        return {
+        payload = {
             "ok": True,
             "source": "shared_ocean",
             "degraded": bool(ocean.get("degraded")),
@@ -123,13 +223,17 @@ class GfsEngine(GFSService):
             "timestamp": ocean.get("timestamp"),
             "ts": ocean.get("ts"),
             "sources": ocean.get("sources"),
+            "warm": self._warm_ready,
+            "stale": False,
         }
+        self._cache.set(self._cache_key("boats", vp), payload)
+        return payload
 
     def frame_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         weather = self._safe_weather_payload(vp)
         clouds = self.cloud_tiles_payload(vp.as_dict())
-        ocean = self.ocean_service.build_shared_state(vp, weather)
+        ocean = self.shared_ocean_payload(vp.as_dict())
         fish_items = self.fish_service.score_markers(ocean, vp)
         bait = self.bait_service.score(ocean, vp)
         boats = self.boat_service.agents(ocean, vp, count=12)
@@ -150,7 +254,17 @@ class GfsEngine(GFSService):
                 "sources": ocean.get("sources"),
                 "degraded": ocean.get("degraded"),
                 "counts": {"fish": len(fish_items), "bait": len(bait.get("polygons") or []), "boats": len(boats)},
+                "warm": self._warm_ready,
             },
+        }
+
+    def warm_status(self) -> dict[str, Any]:
+        return {
+            "ready": self._warm_ready,
+            "started": self._warm_started,
+            "error": self._warm_error,
+            "warmed_at": self._warm_at,
+            "cache": self._cache.stats(),
         }
 
     def websocket_status_payload(self) -> dict[str, Any]:
@@ -163,4 +277,5 @@ class GfsEngine(GFSService):
             "degraded_details": degraded_details,
             "sources": ocean.get("sources"),
             "cycle": ocean.get("cycle"),
+            "warm": self.warm_status(),
         }

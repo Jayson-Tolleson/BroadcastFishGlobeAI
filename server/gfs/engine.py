@@ -104,8 +104,13 @@ class GfsEngine(GFSService):
         try:
             vp = self._default_warm_viewport()
             weather, ocean, fish, bait, boats = self._build_shared_products(vp)
+            csv_locations = self._csv_locations(vp.as_dict())
             self._cache.set(self._cache_key("ocean", vp), ocean)
-            self._cache.set(self._cache_key("locations", vp), {"items": fish, "count": len(fish)})
+            self._cache.set(
+                self._cache_key("locations", vp),
+                {"items": csv_locations.get("items") or [], "count": int(csv_locations.get("count") or 0), "ts": csv_locations.get("ts")},
+            )
+            self._cache.set(self._cache_key("fish", vp), {"items": fish, "count": len(fish), "ts": ocean.get("ts")})
             self._cache.set(self._cache_key("bait", vp), bait)
             self._cache.set(self._cache_key("boats", vp), {"boats": boats, "count": len(boats)})
             self._warm_ready = True

@@ -348,6 +348,13 @@ function bboxSignature(b) {
   return `${b.west.toFixed(1)}:${b.south.toFixed(1)}:${b.east.toFixed(1)}:${b.north.toFixed(1)}:${Math.round(range / 50000)}:${b.sourceStride || 1}`;
 }
 
+function normalizeFramePayload(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (payload.ok !== true) return null;
+  if (!payload.ocean || String(payload.ocean.source || '') !== 'shared_ocean') return null;
+  return payload;
+}
+
 async function refreshData(reason = 'manual') {
   const viewport = getCanonicalViewport();
   const signature = bboxSignature(viewport);
@@ -380,39 +387,40 @@ async function refreshData(reason = 'manual') {
       fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true }),
     ]);
     if (frame && ocean) frame.ocean = ocean;
+    const normalizedFrame = normalizeFramePayload(frame);
     if (!ocean) gfsState.setStaleHold('ocean payload unavailable; holding prior ocean metadata');
-    if (!frame) { gfsState.debugHoldReason = 'frame missing; held previous visuals'; return dataState.latest; }
+    if (!normalizedFrame) { gfsState.debugHoldReason = 'frame missing/invalid; held previous visuals'; return dataState.latest; }
     if (seq !== dataState.requestSeq) return dataState.latest;
 
-    dataState.latest.weather = frame.weather || null;
-    dataState.latest.clouds = frame.clouds || null;
-    dataState.latest.baitBase = frame.baitBase || null;
-    dataState.latest.baitAdvanced = preferStableBaitAdvanced(frame.baitAdvanced || null, dataState.latest.baitAdvanced || null);
-    frame.baitAdvanced = dataState.latest.baitAdvanced;
-    dataState.latest.boats = frame.boats || { boats: [] };
-    dataState.latest.recursiveGrid = frame.recursiveGrid || null;
-    frame.render_reason = (reason === 'boot' || reason === 'manual') ? 'steady' : reason;
-    dataState.latest.frame = frame;
+    dataState.latest.weather = normalizedFrame.weather || null;
+    dataState.latest.clouds = normalizedFrame.clouds || null;
+    dataState.latest.baitBase = normalizedFrame.baitBase || null;
+    dataState.latest.baitAdvanced = preferStableBaitAdvanced(normalizedFrame.baitAdvanced || null, dataState.latest.baitAdvanced || null);
+    normalizedFrame.baitAdvanced = dataState.latest.baitAdvanced;
+    dataState.latest.boats = normalizedFrame.boats || { boats: [] };
+    dataState.latest.recursiveGrid = normalizedFrame.recursiveGrid || null;
+    normalizedFrame.render_reason = (reason === 'boot' || reason === 'manual') ? 'steady' : reason;
+    dataState.latest.frame = normalizedFrame;
 
     window.__gfsLastBbox = bboxToQuery(viewport);
-    window.__gfsLastFrame = frame;
+    window.__gfsLastFrame = normalizedFrame;
     window.currentBBox = window.__gfsLastBbox;
     window.__gfsRecursiveGrid = { latest: dataState.latest.recursiveGrid, bbox: bboxToQuery(viewport) };
     gfsState.debugHoldReason = '';
-    gfsState.setFrame(frame, viewport);
+    gfsState.setFrame(normalizedFrame, viewport);
     const debugEl = document.getElementById('debugPrompt');
     renderDebugPanel(debugEl, gfsState);
-    await layerRuntime.engine?.setData?.(frame || null);
+    await layerRuntime.engine?.setData?.(normalizedFrame || null);
     console.info('[gfs data] refreshed', {
       reason,
       signature,
-      frame: Boolean(frame),
+      frame: Boolean(normalizedFrame),
       weather: Boolean(dataState.latest.weather),
       clouds: Boolean(dataState.latest.clouds),
       baitBase: Boolean(dataState.latest.baitBase),
       baitAdvanced: Boolean(dataState.latest.baitAdvanced),
       boats: Array.isArray(dataState.latest.boats?.boats) ? dataState.latest.boats.boats.length : 0,
-      sigmaClouds: Array.isArray(frame?.sigmaClouds) ? frame.sigmaClouds.length : 0,
+      sigmaClouds: Array.isArray(normalizedFrame?.sigmaClouds) ? normalizedFrame.sigmaClouds.length : 0,
     });
     if (reason === 'boot' || reason === 'steady' || reason === 'manual') {
       refreshDeferredBaitAdvanced(viewport, reason).catch((err) => console.info('[gfs bait advanced] deferred fetch skipped', { message: err?.message || String(err) }));

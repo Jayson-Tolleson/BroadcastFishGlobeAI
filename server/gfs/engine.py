@@ -44,6 +44,11 @@ class GfsEngine(GFSService):
         self._gfs_ws_last_open_ts: int | None = None
         self._weather_refresh_inflight = False
         self._weather_refresh_last_ts = 0.0
+        self._prewarm_duration_ms: float | None = None
+        self._last_ocean_latency_ms: float | None = None
+        self._last_frame_latency_ms: float | None = None
+        self._last_ocean_cache_state: str | None = None
+        self._last_frame_cache_state: str | None = None
 
     def parse_intent(self, args: Any) -> ParsedIntent:
         vp = canonicalize_viewport({
@@ -158,7 +163,8 @@ class GfsEngine(GFSService):
             self._warm_ready = True
             self._warm_error = None
             self._warm_at = int(time.time() * 1000)
-            log.info("gfs prewarm complete latency_ms=%.2f", (time.time() - started) * 1000)
+            self._prewarm_duration_ms = (time.time() - started) * 1000
+            log.info("gfs prewarm complete latency_ms=%.2f", self._prewarm_duration_ms)
         except Exception as exc:
             self._warm_error = str(exc)
             log.warning("gfs prewarm failed: %s", exc)
@@ -170,6 +176,8 @@ class GfsEngine(GFSService):
         cached = self._cache.get(key)
         if cached:
             out = {**cached, "warm": self._warm_ready, "stale": False, "cache": "fresh"}
+            self._last_ocean_latency_ms = (time.time() - started) * 1000
+            self._last_ocean_cache_state = "hit"
             log.info("[gfs-perf] ocean cache=hit viewport=%s latency_ms=%.2f", vp.as_bbox(), (time.time() - started) * 1000)
             return out
         weather_started = time.time()
@@ -180,6 +188,8 @@ class GfsEngine(GFSService):
         ocean_ms = (time.time() - ocean_started) * 1000
         ocean.update({"warm": self._warm_ready, "stale": False, "cache": "miss"})
         self._cache.set(key, ocean)
+        self._last_ocean_latency_ms = (time.time() - started) * 1000
+        self._last_ocean_cache_state = "miss"
         log.info(
             "[gfs-perf] ocean cache=miss viewport=%s weather_ms=%.2f ocean_build_ms=%.2f latency_ms=%.2f",
             vp.as_bbox(),
@@ -191,6 +201,23 @@ class GfsEngine(GFSService):
 
     def fish_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
+        cached = self._cache.get(self._cache_key("fish", vp))
+        if cached:
+            return {
+                "ok": True,
+                "source": "shared_ocean_cache",
+                "degraded": False,
+                "items": cached.get("items") or [],
+                "count": len(cached.get("items") or []),
+                "timestamp": int(time.time() * 1000),
+                "ts": cached.get("ts") or int(time.time() * 1000),
+                "sources": (self._cache.get(self._cache_key("ocean", vp)) or {}).get("sources"),
+                "warm": self._warm_ready,
+                "stale": False,
+                "entity_type": "fish",
+                "derived": True,
+                "cache": "hit",
+            }
         ocean = self.shared_ocean_payload(vp.as_dict())
         items = self.fish_service.score_markers(ocean, vp)
         log.info("fish derived count=%s viewport=%s", len(items), vp.as_bbox())
@@ -207,6 +234,7 @@ class GfsEngine(GFSService):
             "stale": False,
             "entity_type": "fish",
             "derived": True,
+            "cache": "miss",
         }
         self._cache.set(self._cache_key("fish", vp), {"items": items, "count": len(items), "ts": payload["ts"]})
         return payload
@@ -288,6 +316,25 @@ class GfsEngine(GFSService):
 
     def bait_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
+        cached = self._cache.get(self._cache_key("bait", vp))
+        if isinstance(cached, dict) and (cached.get("polygons") is not None or cached.get("bait_score") is not None):
+            return {
+                "ok": True,
+                "source": cached.get("source", "shared_ocean_cache"),
+                "degraded": bool(cached.get("degraded")),
+                "bbox": vp.as_bbox(),
+                "count": cached.get("count", 0),
+                "bait": {"status": "ready", "source": cached.get("source", "shared_ocean_cache"), "polygons": cached.get("polygons") or []},
+                "bait_score": cached.get("bait_score") or [],
+                "timestamp": int(time.time() * 1000),
+                "ts": cached.get("ts") or int(time.time() * 1000),
+                "sources": (self._cache.get(self._cache_key("ocean", vp)) or {}).get("sources"),
+                "warm": self._warm_ready,
+                "stale": False,
+                "entity_type": "bait",
+                "derived": True,
+                "cache": "hit",
+            }
         ocean = self.shared_ocean_payload(vp.as_dict())
         scored = self.bait_service.score(ocean, vp)
         log.info("bait derived polygons=%s viewport=%s", len(scored.get("polygons") or []), vp.as_bbox())
@@ -306,12 +353,30 @@ class GfsEngine(GFSService):
             "stale": False,
             "entity_type": "bait",
             "derived": True,
+            "cache": "miss",
         }
         self._cache.set(self._cache_key("bait", vp), scored)
         return payload
 
     def boats_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
+        cached = self._cache.get(self._cache_key("boats", vp))
+        if isinstance(cached, dict) and isinstance(cached.get("boats"), list):
+            return {
+                "ok": True,
+                "source": "shared_ocean_cache",
+                "degraded": False,
+                "boats": cached.get("boats") or [],
+                "count": len(cached.get("boats") or []),
+                "timestamp": int(time.time() * 1000),
+                "ts": cached.get("ts") or int(time.time() * 1000),
+                "sources": (self._cache.get(self._cache_key("ocean", vp)) or {}).get("sources"),
+                "warm": self._warm_ready,
+                "stale": False,
+                "entity_type": "boat",
+                "derived": True,
+                "cache": "hit",
+            }
         ocean = self.shared_ocean_payload(vp.as_dict())
         boats = self.boat_service.agents(ocean, vp, count=12)
         log.info("boats derived count=%s viewport=%s", len(boats), vp.as_bbox())
@@ -328,6 +393,7 @@ class GfsEngine(GFSService):
             "stale": False,
             "entity_type": "boat",
             "derived": True,
+            "cache": "miss",
         }
         self._cache.set(self._cache_key("boats", vp), payload)
         return payload
@@ -349,13 +415,15 @@ class GfsEngine(GFSService):
         ocean = self.shared_ocean_payload(vp.as_dict())
         ocean_ms = (time.time() - ocean_started) * 1000
         fish_started = time.time()
-        fish_items = self.fish_service.score_markers(ocean, vp)
+        fish_payload = self.fish_from_ocean(vp.as_dict())
+        fish_items = fish_payload.get("items") or []
         fish_ms = (time.time() - fish_started) * 1000
         bait_started = time.time()
-        bait = self.bait_service.score(ocean, vp)
+        bait = self.bait_from_ocean(vp.as_dict())
         bait_ms = (time.time() - bait_started) * 1000
         boats_started = time.time()
-        boats = self.boat_service.agents(ocean, vp, count=12)
+        boats_payload = self.boats_from_ocean(vp.as_dict())
+        boats = boats_payload.get("boats") or []
         boats_ms = (time.time() - boats_started) * 1000
         log.info("frame refresh viewport=%s fish=%s bait=%s boats=%s", vp.as_bbox(), len(fish_items), len(bait.get("polygons") or []), len(boats))
         log.info(
@@ -369,15 +437,17 @@ class GfsEngine(GFSService):
             boats_ms,
             (time.time() - started) * 1000,
         )
+        self._last_frame_latency_ms = (time.time() - started) * 1000
+        self._last_frame_cache_state = f"ocean:{self._last_ocean_cache_state}|fish:{fish_payload.get('cache')}|bait:{bait.get('cache')}|boats:{boats_payload.get('cache')}"
         return {
             "ok": True,
             "bbox": vp.as_bbox(),
             "weather": weather,
             "clouds": clouds,
             "ocean": ocean,
-            "fish": {"items": fish_items, "count": len(fish_items), "source": "shared_ocean"},
-            "baitBase": {"ok": True, "source": bait.get("source", "shared_ocean"), "degraded": bait.get("degraded", False), "bait_score": bait.get("bait_score") or [], "bait": {"status": "ready", "source": bait.get("source", "shared_ocean"), "polygons": bait.get("polygons") or []}},
-            "baitAdvanced": {"ok": True, "source": bait.get("source", "shared_ocean"), "degraded": bait.get("degraded", False), "bait_score": bait.get("bait_score") or [], "bait": {"status": "ready", "source": bait.get("source", "shared_ocean"), "polygons": bait.get("polygons") or []}},
+            "fish": {"items": fish_items, "count": len(fish_items), "source": fish_payload.get("source", "shared_ocean"), "cache": fish_payload.get("cache")},
+            "baitBase": {"ok": True, "source": bait.get("source", "shared_ocean"), "degraded": bait.get("degraded", False), "bait_score": bait.get("bait_score") or [], "bait": {"status": "ready", "source": bait.get("source", "shared_ocean"), "polygons": (bait.get("bait") or {}).get("polygons") or bait.get("polygons") or []}, "cache": bait.get("cache")},
+            "baitAdvanced": {"ok": True, "source": bait.get("source", "shared_ocean"), "degraded": bait.get("degraded", False), "bait_score": bait.get("bait_score") or [], "bait": {"status": "ready", "source": bait.get("source", "shared_ocean"), "polygons": (bait.get("bait") or {}).get("polygons") or bait.get("polygons") or []}, "cache": bait.get("cache")},
             "boats": {"boats": boats, "count": len(boats), "source": "shared_ocean"},
             "recursiveGrid": {"bbox": vp.as_bbox(), "polygons": {"boater": [{"coordinates": poly["coordinates"]} for poly in (bait.get("polygons") or [])]}},
             "debug": {
@@ -475,6 +545,14 @@ class GfsEngine(GFSService):
                 "currents_source": (ocean.get("sources") or {}).get("currents"),
                 "degraded": bool((ocean.get("degraded") or {}).get("currents")),
             },
+        }
+        payload["performance"] = {
+            "prewarm_duration_ms": self._prewarm_duration_ms,
+            "last_ocean_latency_ms": self._last_ocean_latency_ms,
+            "last_ocean_cache_state": self._last_ocean_cache_state,
+            "last_frame_latency_ms": self._last_frame_latency_ms,
+            "last_frame_cache_state": self._last_frame_cache_state,
+            "cache_stats": self._cache.stats(),
         }
         return payload
 

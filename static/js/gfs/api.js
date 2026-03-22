@@ -56,6 +56,20 @@ function normalizeFishPayload(payload) {
   };
 }
 
+function normalizeOceanPayload(payload) {
+  if (payload && typeof payload === 'object' && String(payload.source || '') === 'shared_ocean') return payload;
+  warn('ocean payload contract mismatch', { source: payload?.source });
+  return {
+    ok: false,
+    source: 'shared_ocean',
+    degraded: true,
+    fields: {},
+    cache: 'invalid',
+    error: 'ocean_contract_mismatch',
+    contract_mismatch: true,
+  };
+}
+
 function normalizeOptions(opts = {}) {
   if (opts instanceof AbortSignal) return { signal: opts };
   if (!opts || typeof opts !== 'object') return {};
@@ -326,7 +340,8 @@ function viewportQuery(viewport = {}) {
 
 export async function fetchOceanState(viewport, options = {}) {
   const merged = { timeoutMs: 8000, abortPrevious: true, ...options };
-  return getJsonSafe(`/gfs/api/ocean?${viewportQuery(viewport)}`, null, merged);
+  const payload = await getJsonSafe(`/gfs/api/ocean?${viewportQuery(viewport)}`, null, merged);
+  return normalizeOceanPayload(payload);
 }
 
 export async function fetchLocations(viewport, options = {}) {

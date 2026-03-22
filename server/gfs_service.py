@@ -76,6 +76,7 @@ INGEST_FALLBACK_CYCLE_DEPTH = 4
 INGEST_PREFERRED_FORECAST_HOUR = 0
 INGEST_CACHE_MIN_BYTES = 2000
 INGEST_MIN_INTERVAL_SECONDS = 600
+INGEST_FAILED_CYCLE_COOLDOWN_SECONDS = 120
 WEATHER_REFRESH_TTL_SECONDS = 45
 SCENE_REFRESH_TTL_SECONDS = 30
 SCENE_DOWNSAMPLE_STRIDE = 1
@@ -143,7 +144,7 @@ def clamp_forecast_hour(fhr: int, min_hour: int = 0, max_hour: int = 384) -> int
 
 
 class FetchResult:
-    def __init__(self, ok: bool, path: Path | None = None, cycle: str = "", forecast_hour: int = 0, valid_time: str = "", error: str = "", url: str = "") -> None:
+    def __init__(self, ok: bool, path: Path | None = None, cycle: str = "", forecast_hour: int = 0, valid_time: str = "", error: str = "", url: str = "", cache_key: str = "") -> None:
         self.ok = ok
         self.path = path
         self.cycle = cycle
@@ -151,6 +152,7 @@ class FetchResult:
         self.valid_time = valid_time
         self.error = error
         self.url = url
+        self.cache_key = cache_key
 
 
 class GFSNomadsClient:
@@ -163,6 +165,7 @@ class GFSNomadsClient:
         self.retries = retries
         self.http = requests.Session()
         self.http.headers.update({"User-Agent": DEFAULT_UA})
+        self._failed_keys: dict[str, dict[str, Any]] = {}
 
     def build_file_name(self, cycle_hour: int, forecast_hour: int) -> str:
         return f"gfs.t{int(cycle_hour):02d}z.pgrb2.0p25.f{int(forecast_hour):03d}"
@@ -191,6 +194,80 @@ class GFSNomadsClient:
     def _cache_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}.grib2"
+
+    def describe_grib_file(self, path: Path | None) -> dict[str, Any]:
+        if path is None:
+            return {"path": None, "exists": False, "is_file": False, "size": 0, "mtime": None}
+        p = Path(path)
+        exists = p.exists()
+        is_file = p.is_file() if exists else False
+        size = p.stat().st_size if is_file else 0
+        mtime = p.stat().st_mtime if is_file else None
+        return {"path": str(p.resolve()), "exists": exists, "is_file": is_file, "size": int(size), "mtime": mtime}
+
+    def validate_grib_cache_entry(self, path: Path, min_bytes: int = INGEST_CACHE_MIN_BYTES) -> tuple[bool, str]:
+        info = self.describe_grib_file(path)
+        if not info["exists"]:
+            return False, "missing"
+        if not info["is_file"]:
+            return False, "not_file"
+        if int(info["size"]) < int(min_bytes):
+            return False, f"too_small:{info['size']}"
+        try:
+            with path.open("rb") as fh:
+                head = fh.read(16)
+            if not head:
+                return False, "empty_read"
+        except Exception as exc:
+            return False, f"unreadable:{exc}"
+        return True, "ok"
+
+    def _cleanup_cfgrib_sidecars(self, path: Path) -> None:
+        patterns = [
+            f"{path.name}*.idx",
+            f"{path.name}*.index",
+            f"{path.name}*.tmp",
+            f".{path.name}*.idx",
+        ]
+        for pat in patterns:
+            for sidecar in path.parent.glob(pat):
+                try:
+                    sidecar.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def quarantine_cache_entry(self, path: Path, reason: str) -> tuple[bool, str]:
+        ts = int(time.time())
+        q_path = path.with_suffix(f"{path.suffix}.quarantine.{ts}")
+        try:
+            self._cleanup_cfgrib_sidecars(path)
+            path.replace(q_path)
+            log.warning("[gfs-cache] quarantined grib path=%s quarantine=%s reason=%s", path, q_path, reason)
+            return True, str(q_path)
+        except Exception as exc:
+            try:
+                path.unlink(missing_ok=True)
+                log.warning("[gfs-cache] quarantine rename failed; deleted bad grib path=%s reason=%s err=%s", path, reason, exc)
+                return False, str(path)
+            except Exception as rm_exc:
+                log.warning("[gfs-cache] unable to quarantine/delete bad grib path=%s reason=%s err=%s rm_err=%s", path, reason, exc, rm_exc)
+                return False, str(path)
+
+    def invalidate_cache_entry(self, path: Path, reason: str) -> tuple[bool, str]:
+        return self.quarantine_cache_entry(path, reason)
+
+    def should_retry_failed_cycle(self, cache_key: str, cooldown_s: int = INGEST_FAILED_CYCLE_COOLDOWN_SECONDS) -> bool:
+        rec = self._failed_keys.get(cache_key) or {}
+        ts = float(rec.get("ts") or 0.0)
+        if ts <= 0:
+            return True
+        return (time.time() - ts) >= float(cooldown_s)
+
+    def mark_failed_cycle(self, cache_key: str, reason: str) -> None:
+        self._failed_keys[cache_key] = {"ts": time.time(), "reason": reason}
+
+    def clear_failed_cycle(self, cache_key: str) -> None:
+        self._failed_keys.pop(cache_key, None)
 
     def fetch_subset(self, url: str, out_path: Path) -> Path:
         tmp = out_path.with_suffix(".tmp")
@@ -222,12 +299,25 @@ class GFSNomadsClient:
             url = self.build_filter_url(date_str, cycle_hour, fhr, bbox, variables, levels)
             cache_key = f"{date_str}:{cycle_hour}:{fhr}:{json.dumps(self.normalize_bbox_for_nomads(bbox), sort_keys=True)}:{','.join(sorted(variables))}:{','.join(sorted(levels))}"
             path = self._cache_path(cache_key)
-            if path.exists() and (time.time() - path.stat().st_mtime) < DEFAULT_GFS_CACHE_TTL_SECONDS:
-                return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url)
+            can_retry = self.should_retry_failed_cycle(cache_key)
+            if path.exists() and (time.time() - path.stat().st_mtime) < DEFAULT_GFS_CACHE_TTL_SECONDS and can_retry:
+                ok, reason = self.validate_grib_cache_entry(path, min_bytes=INGEST_CACHE_MIN_BYTES)
+                if ok:
+                    return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url, cache_key=cache_key)
+                self.invalidate_cache_entry(path, f"cache_validation_failed:{reason}")
+            if not can_retry:
+                rec = self._failed_keys.get(cache_key) or {}
+                return FetchResult(False, error=f"recent_decode_failure_cooldown:{rec.get('reason') or 'unknown'}", cache_key=cache_key)
             try:
                 self.fetch_subset(url, path)
-                return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url)
+                ok, reason = self.validate_grib_cache_entry(path, min_bytes=INGEST_CACHE_MIN_BYTES)
+                if not ok:
+                    self.invalidate_cache_entry(path, f"post_download_validation_failed:{reason}")
+                    raise RuntimeError(f"download validation failed: {reason}")
+                self.clear_failed_cycle(cache_key)
+                return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url, cache_key=cache_key)
             except Exception as exc:
+                self.mark_failed_cycle(cache_key, str(exc))
                 continue
         return FetchResult(False, error="no available nomads subset")
 
@@ -844,15 +934,34 @@ class GFSService:
             "meanSea": self.open_mean_sea_dataset,
         }
         for name, fn in openers.items():
+            info = self.gfs_client.describe_grib_file(grib_path)
+            log.info(
+                "[gfs-decode] cfgrib open precheck group=%s backend=cfgrib path=%s exists=%s size=%s mtime=%s pid=%s tid=%s",
+                name,
+                info.get("path"),
+                info.get("exists"),
+                info.get("size"),
+                info.get("mtime"),
+                os.getpid(),
+                threading.get_ident(),
+            )
             try:
                 ds = fn(grib_path)
                 if ds is not None and len(getattr(ds, "data_vars", {})) > 0:
                     groups[name] = ds
-                    print(f"[gfs] cfgrib group opened: {name} vars={list(ds.data_vars.keys())[:8]}")
+                    log.info("[gfs-decode] cfgrib group opened group=%s vars=%s", name, list(ds.data_vars.keys())[:8])
                 elif ds is not None:
-                    print(f"[gfs] cfgrib group empty: {name}")
+                    log.info("[gfs-decode] cfgrib group empty group=%s", name)
             except Exception as exc:
-                print(f"[gfs] cfgrib group failed: {name}: {exc}")
+                post = self.gfs_client.describe_grib_file(grib_path)
+                log.warning(
+                    "[gfs-decode] cfgrib group failed group=%s path=%s exists_post=%s size_post=%s err=%r",
+                    name,
+                    post.get("path"),
+                    post.get("exists"),
+                    post.get("size"),
+                    exc,
+                )
         return groups
 
     def _open_all_valid_groups_pygrib(self, grib_path: Path) -> dict[str, Any]:
@@ -860,6 +969,16 @@ class GFSService:
         if pygrib is None or xr is None:
             return {}
         groups: dict[str, dict[str, Any]] = {}
+        info = self.gfs_client.describe_grib_file(grib_path)
+        log.info(
+            "[gfs-decode] pygrib fallback precheck path=%s exists=%s size=%s mtime=%s pid=%s tid=%s",
+            info.get("path"),
+            info.get("exists"),
+            info.get("size"),
+            info.get("mtime"),
+            os.getpid(),
+            threading.get_ident(),
+        )
         try:
             with pygrib.open(str(grib_path)) as grbs:
                 for msg in grbs:
@@ -886,14 +1005,27 @@ class GFSService:
             for gname, vars_map in groups.items():
                 if vars_map:
                     out[gname] = xr.Dataset(vars_map)
-                    print(f"[gfs] pygrib group opened: {gname} vars={list(vars_map.keys())[:8]}")
+                    log.info("[gfs-decode] pygrib group opened group=%s vars=%s", gname, list(vars_map.keys())[:8])
             return out
         except Exception as exc:
-            print(f"[gfs] pygrib fallback failed: {exc}")
+            post = self.gfs_client.describe_grib_file(grib_path)
+            log.warning(
+                "[gfs-decode] pygrib fallback failed path=%s exists_post=%s size_post=%s err=%r",
+                post.get("path"),
+                post.get("exists"),
+                post.get("size"),
+                exc,
+            )
             return {}
 
     def open_all_valid_groups(self, grib_path: Path) -> tuple[dict[str, Any], str]:
-        """Open available GRIB groups with cfgrib primary and pygrib fallback."""
+        """Open available GRIB groups with cfgrib primary and pygrib fallback.
+
+        Decision flow:
+        1) Validate/open via cfgrib group filters.
+        2) If cfgrib produced zero valid groups, try pygrib fallback.
+        3) Return empty + \"none\" only if both decoders fail.
+        """
         groups = self._open_all_valid_groups_cfgrib(grib_path)
         if groups:
             loaded = ", ".join([k for k in ["surface", "2m", "10m", "isobaric", "meanSea"] if (k in groups or (k == "isobaric" and "isobaricInhPa" in groups))])
@@ -948,8 +1080,12 @@ class GFSService:
         self.state.model_analysis_time = self._model_analysis_time_from_cycle(fetch.cycle) or self.state.model_analysis_time
         self.state.model_source_url = fetch.url or self.state.model_source_url
         self.state.model_cache_path = str(fetch.path) if fetch.path else self.state.model_cache_path
+        info = self.gfs_client.describe_grib_file(fetch.path) if fetch.path else {"exists": False, "size": None}
+        self.state.model_cache_exists = bool(info.get("exists"))
+        self.state.model_cache_size_bytes = int(info.get("size")) if info.get("size") is not None else None
         self.state.degraded_mode = mode != "live"
         self.state.using_last_known_good = mode == "last_known_good"
+        self.state.decode_failure_reason = None if mode in {"live", "last_known_good"} else self.state.decode_failure_reason
         if self.state.decode_backend == "none":
             self.state.data_source_mode = "heuristic"
         elif self.state.decode_backend == "cfgrib":
@@ -959,6 +1095,37 @@ class GFSService:
         available, missing = self._collect_available_fields(groups)
         self.state.fields_available = available
         self.state.fields_missing = missing
+
+    def _validate_grib_for_decode(self, path: Path | None, *, reason_prefix: str) -> tuple[bool, str]:
+        if path is None:
+            return False, f"{reason_prefix}:missing_path"
+        ok, reason = self.gfs_client.validate_grib_cache_entry(path, min_bytes=INGEST_CACHE_MIN_BYTES)
+        info = self.gfs_client.describe_grib_file(path)
+        log.info(
+            "[gfs-ingest] cache validation reason_prefix=%s path=%s exists=%s size=%s mtime=%s result=%s detail=%s",
+            reason_prefix,
+            info.get("path"),
+            info.get("exists"),
+            info.get("size"),
+            info.get("mtime"),
+            ok,
+            reason,
+        )
+        return ok, reason
+
+    def _quarantine_bad_grib(self, path: Path | None, *, reason: str) -> None:
+        if path is None:
+            return
+        moved, q_path = self.gfs_client.quarantine_cache_entry(path, reason)
+        self.state.ingest_quarantine_count += 1
+        self.state.ingest_last_quarantine_path = q_path
+        self.state.ingest_last_quarantine_reason = reason
+        self.state.decode_failure_reason = reason
+        self.state.decode_last_attempt_path = str(path)
+        if moved:
+            log.warning("[gfs-ingest] quarantined decode-failed grib path=%s reason=%s", path, reason)
+        else:
+            log.warning("[gfs-ingest] invalidated decode-failed grib path=%s reason=%s", path, reason)
 
     def ingest_latest_model_fields(self, bbox: dict[str, float]) -> dict[str, Any]:
         """Attempt real NOMADS->GRIB2 ingestion and retain last-known-good state on failure."""
@@ -978,7 +1145,8 @@ class GFSService:
                 lkg = self.state.last_good_model_state or {}
                 lkg_path_raw = lkg.get("fetch", {}).get("path")
                 lkg_path = Path(lkg_path_raw) if lkg_path_raw else None
-                if lkg_path and lkg_path.exists():
+                ok_lkg, reason_lkg = self._validate_grib_for_decode(lkg_path, reason_prefix="last_known_good")
+                if ok_lkg and lkg_path and lkg_path.exists():
                     lkg_groups, lkg_backend = self.open_all_valid_groups(lkg_path)
                     if lkg_groups:
                         self.state.decode_backend = lkg_backend
@@ -994,26 +1162,36 @@ class GFSService:
                         )
                         self._update_ingest_state_success(lkg_fetch, lkg_groups, mode="last_known_good")
                         return {"mode": "last_known_good", "fetch": lkg_fetch, "groups": lkg_groups, "bbox": lkg.get("bbox") or bbox}
+                    self._quarantine_bad_grib(lkg_path, reason=f"last_known_good_decode_failed:{lkg_backend}")
+                elif lkg_path and lkg_path.exists():
+                    self._quarantine_bad_grib(lkg_path, reason=f"last_known_good_invalid:{reason_lkg}")
             try:
                 fetch = self.gfs_client.fetch_latest_available_subset(now, bbox, DEFAULT_REQUIRED_VARIABLES, DEFAULT_REQUIRED_LEVELS)
                 if not fetch.ok or not fetch.path:
                     raise RuntimeError(fetch.error or "nomads fetch failed")
-                print(f"[gfs-ingest] selected cycle={fetch.cycle} fhr={fetch.forecast_hour} url={fetch.url}")
-                if fetch.path.stat().st_size < INGEST_CACHE_MIN_BYTES:
-                    raise RuntimeError("downloaded GRIB2 too small")
-                print(f"[gfs-ingest] cache file ready path={fetch.path} size={fetch.path.stat().st_size}")
+                log.info("[gfs-ingest] selected cycle=%s fhr=%s url=%s", fetch.cycle, fetch.forecast_hour, fetch.url)
+                ok_cache, reason_cache = self._validate_grib_for_decode(fetch.path, reason_prefix="active_fetch")
+                if not ok_cache:
+                    self._quarantine_bad_grib(fetch.path, reason=f"active_cache_invalid:{reason_cache}")
+                    raise RuntimeError(f"downloaded GRIB2 validation failed: {reason_cache}")
+                self.state.decode_last_attempt_path = str(fetch.path)
+                info = self.gfs_client.describe_grib_file(fetch.path)
+                log.info("[gfs-ingest] cache file ready path=%s exists=%s size=%s", info.get("path"), info.get("exists"), info.get("size"))
 
                 try:
                     groups, decode_backend = self.open_all_valid_groups(fetch.path)
                 except Exception as e:
-                    print(f"[gfs] gfs decode failed: {e}")
+                    log.warning("[gfs-ingest] decoder raised hard failure path=%s err=%r", fetch.path, e)
                     raise RuntimeError("gfs decode failed") from e
                 self.state.decode_backend = decode_backend
                 self.state.data_source_mode = "primary" if decode_backend == "cfgrib" else "fallback" if decode_backend == "pygrib" else "heuristic"
                 if not groups:
+                    if fetch.cache_key:
+                        self.gfs_client.mark_failed_cycle(fetch.cache_key, "no_groups_decoded")
+                    self._quarantine_bad_grib(fetch.path, reason="cfgrib_and_pygrib_total_failure")
                     raise RuntimeError("no GRIB groups decoded")
 
-                print(f"[gfs-ingest] decoded groups={list(groups.keys())} backend={decode_backend}")
+                log.info("[gfs-ingest] decoded groups=%s backend=%s", list(groups.keys()), decode_backend)
                 self.state.last_good_model_state = {
                     "fetch": {
                         "cycle": fetch.cycle,
@@ -1025,15 +1203,17 @@ class GFSService:
                     "bbox": bbox,
                     "saved_at": now_ms,
                 }
+                self.state.decode_failure_reason = None
                 self._update_ingest_state_success(fetch, groups, mode="live")
                 return {"mode": "live", "fetch": fetch, "groups": groups, "bbox": bbox}
             except Exception as exc:
-                print(f"[gfs-ingest] live ingest failed: {exc}")
+                log.warning("[gfs-ingest] live ingest failed err=%s", exc)
                 self.state.ingest_error = str(exc)
                 lkg = self.state.last_good_model_state or {}
                 lkg_path_raw = lkg.get("fetch", {}).get("path")
                 lkg_path = Path(lkg_path_raw) if lkg_path_raw else None
-                if lkg_path and lkg_path.exists():
+                ok_lkg, reason_lkg = self._validate_grib_for_decode(lkg_path, reason_prefix="fallback_last_known_good")
+                if ok_lkg and lkg_path and lkg_path.exists():
                     lkg_groups, lkg_backend = self.open_all_valid_groups(lkg_path)
                     if lkg_groups:
                         self.state.decode_backend = lkg_backend
@@ -1047,14 +1227,18 @@ class GFSService:
                             error="",
                             url=str(lkg.get("fetch", {}).get("url") or ""),
                         )
-                        print("[gfs-ingest] using last-known-good GRIB2 file")
+                        log.info("[gfs-ingest] using last-known-good GRIB2 file path=%s", lkg_path)
                         self._update_ingest_state_success(lkg_fetch, lkg_groups, mode="last_known_good", error=str(exc))
                         return {"mode": "last_known_good", "fetch": lkg_fetch, "groups": lkg_groups, "bbox": lkg.get("bbox") or bbox, "error": str(exc)}
+                    self._quarantine_bad_grib(lkg_path, reason=f"fallback_last_known_good_decode_failed:{lkg_backend}")
+                elif lkg_path and lkg_path.exists():
+                    self._quarantine_bad_grib(lkg_path, reason=f"fallback_last_known_good_invalid:{reason_lkg}")
                 self.state.ingest_status = "failed"
                 self.state.degraded_mode = True
                 self.state.using_last_known_good = False
                 self.state.decode_backend = "none"
                 self.state.data_source_mode = "heuristic"
+                self.state.decode_failure_reason = str(exc)
                 raise
 
     def _utc_now(self) -> datetime:
@@ -3861,11 +4045,18 @@ class GFSService:
                 "analysis_time": self.state.model_analysis_time,
                 "source_url": self.state.model_source_url,
                 "cache_path": self.state.model_cache_path,
+                "cache_exists": self.state.model_cache_exists,
+                "cache_size_bytes": self.state.model_cache_size_bytes,
                 "source_format": self.state.model_source_format,
                 "fields_available": list(self.state.fields_available or []),
                 "fields_missing": list(self.state.fields_missing or []),
                 "decode_backend": self.state.decode_backend,
                 "data_source_mode": self.state.data_source_mode,
+                "decode_failure_reason": self.state.decode_failure_reason,
+                "decode_last_attempt_path": self.state.decode_last_attempt_path,
+                "quarantine_count": self.state.ingest_quarantine_count,
+                "last_quarantine_path": self.state.ingest_last_quarantine_path,
+                "last_quarantine_reason": self.state.ingest_last_quarantine_reason,
             },
             "ts": self._now_ms(),
         }
@@ -3886,6 +4077,7 @@ class GFSService:
                 "fallback_cycle_depth": INGEST_FALLBACK_CYCLE_DEPTH,
                 "preferred_forecast_hour": INGEST_PREFERRED_FORECAST_HOUR,
                 "cache_min_bytes": INGEST_CACHE_MIN_BYTES,
+                "failed_cycle_cooldown_seconds": INGEST_FAILED_CYCLE_COOLDOWN_SECONDS,
                 "source_format": "grib2",
             },
             "ts": self._now_ms(),

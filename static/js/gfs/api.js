@@ -260,3 +260,9 @@ export function clearInflightRequests() {
   }
   abortControllers.clear();
 }
+
+
+export async function fetchOceanState(bbox, options = {}) {
+  const q = encodeURIComponent(String(bbox || "-180,-80,180,80"));
+  return getJsonSafe(`/gfs/api/ocean?bbox=${q}`, null, options);
+}

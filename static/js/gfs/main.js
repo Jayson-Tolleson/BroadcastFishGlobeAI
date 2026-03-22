@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -9,6 +9,8 @@ import { RendererLayer } from './layers/renderer_layer.js';
 import { renderCloudZones } from './cloud-zones.js';
 import { renderRainZones } from './rain-zones.js';
 import { renderBaitZones } from './bait-zones.js';
+import { createGfsState } from './state.js';
+import { renderDebugPanel } from './hud/debug_panel.js';
 
 const statusEl = document.getElementById('status');
 const globeEl = document.getElementById('globe');
@@ -20,6 +22,8 @@ let selectedLocation = null;
 let liveStatePollId = null;
 const missingLiveLocationIds = new Set();
 const GFS_DEBUG = Boolean(window.__GFS_DEBUG);
+
+const gfsState = createGfsState();
 
 const layerRuntime = {
   engine: null,
@@ -368,6 +372,8 @@ async function refreshData(reason = 'manual') {
     const bboxQ = encodeURIComponent(bboxToQuery(viewport));
     const vpQ = viewportToQuery(viewport);
     const frame = await getJsonSafe(`/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=full`, null, { signal: controller.signal });
+    const ocean = await fetchOceanState(bboxToQuery(viewport), { signal: controller.signal, abortPrevious: true });
+    if (frame && ocean) frame.ocean = ocean;
     if (!frame) return dataState.latest;
     if (seq !== dataState.requestSeq) return dataState.latest;
 
@@ -385,6 +391,9 @@ async function refreshData(reason = 'manual') {
     window.__gfsLastFrame = frame;
     window.currentBBox = window.__gfsLastBbox;
     window.__gfsRecursiveGrid = { latest: dataState.latest.recursiveGrid, bbox: bboxToQuery(viewport) };
+    gfsState.setFrame(frame);
+    const debugEl = document.getElementById('debugPrompt');
+    renderDebugPanel(debugEl, gfsState);
     layerRuntime.engine?.setData?.(frame || null);
     console.info('[gfs data] refreshed', {
       reason,
@@ -516,6 +525,7 @@ function createGfsSocket() {
       backoffMs = 1000;
       clearTimers();
       startHeartbeat();
+      gfsState.setWs(true, 'open');
       console.info('[gfs/ws] connected');
     };
     ws.onmessage = (ev) => {
@@ -524,6 +534,7 @@ function createGfsSocket() {
     };
     ws.onerror = () => console.warn('[gfs/ws] socket error');
     ws.onclose = () => {
+      gfsState.setWs(false, 'close');
       connecting = false;
       clearTimers();
       if (!manualClose) scheduleReconnect();

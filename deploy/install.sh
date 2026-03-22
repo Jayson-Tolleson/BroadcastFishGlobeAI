@@ -285,7 +285,7 @@ preflight_runtime() {
   [[ -x "$VENV_DIR/bin/python" ]] || fail "venv python missing: $VENV_DIR/bin/python"
   runuser -u "$INSTALL_USER" -- "$VENV_DIR/bin/python" -c "import hypercorn" || fail "hypercorn import failed in venv"
   runuser -u "$INSTALL_USER" -- "$VENV_DIR/bin/python" -c "import quart" || fail "quart import failed in venv"
-  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && '$VENV_DIR/bin/python' -c 'from server.app_factory import create_app; app=create_app(); print('preflight_ok')'" || fail "app import/create_app preflight failed"
+  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && '$VENV_DIR/bin/python' -c \"from server.app_factory import create_app; app=create_app(); assert app is not None; print('preflight_ok')\"" || fail "app import/create_app preflight failed"
 }
 
 phase7_services() {

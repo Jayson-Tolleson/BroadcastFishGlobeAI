@@ -152,8 +152,8 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         log.info("/gfs/api/locations viewport=%s source=%s warm=%s stale=%s count=%s latency_ms=%s", vp.as_dict(), payload.get("source"), payload.get("warm"), payload.get("stale"), payload.get("count"), payload.get("latency_ms"))
         items = payload.get("items") if isinstance(payload, dict) else []
         locations = [{
-            "id": item.get("id") or "loc",
-            "location_key": item.get("id") or "loc",
+            "id": item.get("id") or item.get("location_key") or "loc",
+            "location_key": item.get("location_key") or item.get("id") or "loc",
             "name": item.get("name") or "Fishing location",
             "lat": item.get("lat"),
             "lon": item.get("lon"),
@@ -175,9 +175,10 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         return str(value or "").strip()
 
     def _find_fish_item(location_key: str) -> dict[str, Any] | None:
-        payload = gfs().fish_from_ocean(None)
+        payload = gfs().locations_fast(None, budget_ms=1800)
         for item in payload.get("items") or []:
-            if _coerce_key(item.get("id")) == _coerce_key(location_key):
+            item_keys = {_coerce_key(item.get("id")), _coerce_key(item.get("location_key"))}
+            if _coerce_key(location_key) in item_keys:
                 return item
         return None
 
@@ -186,8 +187,8 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         media_payload = media().location_media(location_key)
         return {
             "ok": True,
-            "id": item.get("id") or location_key,
-            "location_key": item.get("id") or location_key,
+            "id": item.get("id") or item.get("location_key") or location_key,
+            "location_key": item.get("location_key") or item.get("id") or location_key,
             "name": item.get("name") or media_payload.get("label") or location_key,
             "lat": item.get("lat"),
             "lon": item.get("lon"),
@@ -229,7 +230,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
             payload = media().location_media(location_key)
             live = payload.get("live") or {"active": False, "stream_url": "", "updated_at": None}
             fish = _find_fish_item(location_key) or {}
-            return jsonify({"ok": True, "id": fish.get("id") or location_key, "location_key": fish.get("id") or location_key, "name": fish.get("name") or payload.get("label") or location_key, "lat": fish.get("lat"), "lon": fish.get("lon"), "active": bool(live.get("active")), "stream_url": live.get("stream_url") or "", "updated_at": live.get("updated_at"), "live": live, "ts": payload.get("ts") or int(time.time() * 1000)})
+            return jsonify({"ok": True, "id": fish.get("id") or fish.get("location_key") or location_key, "location_key": fish.get("location_key") or fish.get("id") or location_key, "name": fish.get("name") or payload.get("label") or location_key, "lat": fish.get("lat"), "lon": fish.get("lon"), "active": bool(live.get("active")), "stream_url": live.get("stream_url") or "", "updated_at": live.get("updated_at"), "live": live, "ts": payload.get("ts") or int(time.time() * 1000)})
         data = await request.get_json() or {}
         active = bool(data.get("active"))
         url = data.get("stream_url", "")

@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations, fetchFish } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -474,43 +474,36 @@ function createGfsSocket() {
   let ws = null;
   let reconnectTimer = null;
   let pingTimer = null;
-  let watchdogTimer = null;
   let backoffMs = 1000;
+  const MIN_BACKOFF_MS = 1000;
+  const MAX_BACKOFF_MS = 20000;
   let manualClose = false;
   let connecting = false;
-  let lastMessageAt = 0;
 
   const clearTimers = () => {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (pingTimer) clearInterval(pingTimer);
-    if (watchdogTimer) clearInterval(watchdogTimer);
     reconnectTimer = null;
     pingTimer = null;
-    watchdogTimer = null;
   };
 
   const scheduleReconnect = () => {
     if (manualClose || reconnectTimer) return;
+    const jitter = 0.85 + (Math.random() * 0.3);
+    const delay = Math.round(backoffMs * jitter);
+    console.info('[gfs/ws] reconnect scheduled', { delayMs: delay, nextBackoffMs: Math.min(MAX_BACKOFF_MS, backoffMs * 2) });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
-    }, backoffMs);
-    backoffMs = Math.min(15000, backoffMs * 2);
+    }, delay);
+    backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
   };
 
   const startHeartbeat = () => {
-    lastMessageAt = Date.now();
     pingTimer = setInterval(() => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
     }, 20000);
-
-    watchdogTimer = setInterval(() => {
-      const stale = Date.now() - lastMessageAt > 30000;
-      if (stale && ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.close(4000, 'inactivity timeout'); } catch (_) {}
-      }
-    }, 5000);
   };
 
   const handleMessage = (msg) => {
@@ -524,21 +517,20 @@ function createGfsSocket() {
   };
 
   const connect = () => {
-    if (manualClose || connecting || (ws && ws.readyState === WebSocket.OPEN)) return;
+    if (manualClose || connecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
     connecting = true;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws/gfs`);
 
     ws.onopen = () => {
       connecting = false;
-      backoffMs = 1000;
+      backoffMs = MIN_BACKOFF_MS;
       clearTimers();
       startHeartbeat();
       gfsState.setWs(true, 'open');
       console.info('[gfs/ws] connected');
     };
     ws.onmessage = (ev) => {
-      lastMessageAt = Date.now();
       try {
         const msg = JSON.parse(ev.data);
         if (msg?.type === 'status') gfsState.setWs(true, 'status');
@@ -547,10 +539,11 @@ function createGfsSocket() {
       } catch (_) {}
     };
     ws.onerror = (err) => { gfsState.setWs(false, 'error'); console.warn('[gfs/ws] socket error', err); };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       gfsState.setWs(false, 'close');
       connecting = false;
       clearTimers();
+      console.info('[gfs/ws] closed', { code: ev?.code, reason: ev?.reason || '', wasClean: Boolean(ev?.wasClean) });
       if (!manualClose) scheduleReconnect();
     };
   };
@@ -709,26 +702,7 @@ async function boot() {
   const bootViewport = getCanonicalViewport();
   let payload = await fetchLocations(bootViewport, { timeoutMs: 2200, abortPrevious: false });
   gfsState.setCache('locations', payload);
-  if (!payload?.locations?.length) {
-    const fishPayload = await fetchFish(bootViewport, { timeoutMs: 2500, abortPrevious: false });
-    const fallbackLocations = Array.isArray(fishPayload?.items)
-      ? fishPayload.items.map((item) => ({
-          id: item?.id || item?.location_key || item?.name || 'loc',
-          location_key: item?.location_key || item?.id || item?.name || 'loc',
-          name: item?.name || item?.location_key || 'Fishing location',
-          lat: item?.lat,
-          lon: item?.lon,
-          probability: item?.probability ?? item?.confidence,
-          confidence: item?.confidence ?? item?.probability,
-          meta: item?.meta || {},
-          environment: item?.environment || {},
-          species: item?.species || [],
-          score: item?.score,
-        }))
-      : [];
-    payload = { ...(payload || {}), locations: fallbackLocations, source: payload?.source || 'fish_fallback', degraded: true, stale: true };
-    gfsState.setStaleHold('locations timed out; using fish fallback');
-  }
+  if (!payload?.locations?.length) gfsState.setStaleHold('locations unavailable; showing overlays without markers');
   const locations = payload?.locations || [];
   renderMarkers({ locations, globeEl, maps3d, onSelect: (loc) => { gfsSocket.connect(); hud.open(loc); } });
 

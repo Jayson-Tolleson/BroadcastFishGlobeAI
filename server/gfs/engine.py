@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -148,43 +149,77 @@ class GfsEngine(GFSService):
         self._cache.set(self._cache_key("locations", vp), {"items": items, "count": len(items), "ts": payload["ts"]})
         return payload
 
+    @staticmethod
+    def _lon_in_viewport(lon: float, west: float, east: float) -> bool:
+        # Handle anti-meridian viewports as wrapped ranges.
+        if west <= east:
+            return west <= lon <= east
+        return lon >= west or lon <= east
+
+    def _csv_locations(self, bbox: dict[str, float] | None) -> dict[str, Any]:
+        vp = canonicalize_viewport(bbox)
+        raw = self.fish_payload()
+        items: list[dict[str, Any]] = []
+        for item in (raw.get("items") or []):
+            if not isinstance(item, dict):
+                continue
+            lat = item.get("lat")
+            lon = item.get("lon")
+            try:
+                lat_f = float(lat)
+                lon_f = float(lon)
+            except Exception:
+                continue
+            if not math.isfinite(lat_f) or not math.isfinite(lon_f):
+                continue
+            if lat_f < vp.south or lat_f > vp.north:
+                continue
+            if not self._lon_in_viewport(lon_f, vp.west, vp.east):
+                continue
+            confidence = item.get("confidence")
+            probability = item.get("probability")
+            normalized_confidence = confidence if confidence is not None else probability if probability is not None else 0.5
+            normalized_probability = probability if probability is not None else confidence if confidence is not None else 0.5
+            loc_id = item.get("id") or item.get("location_key") or item.get("name") or "loc"
+            items.append({
+                "id": loc_id,
+                "location_key": item.get("location_key") or loc_id,
+                "name": item.get("name") or "Fishing location",
+                "lat": lat_f,
+                "lon": lon_f,
+                "fish_index": item.get("fish_index") if item.get("fish_index") is not None else normalized_confidence,
+                "confidence": normalized_confidence,
+                "probability": normalized_probability,
+                "score": item.get("score"),
+                "reason": "fish_csv",
+                "reasons": ["fishloclist.csv"],
+                "meta": item.get("meta") if isinstance(item.get("meta"), dict) else {},
+            })
+        return {
+            "ok": bool(raw.get("ok", True)),
+            "source": "fish_csv",
+            "degraded": bool(raw.get("error")),
+            "warm": self._warm_ready,
+            "stale": False,
+            "fallback_reason": "csv_error" if raw.get("error") else None,
+            "items": items,
+            "count": len(items),
+            "timestamp": int(time.time() * 1000),
+            "ts": raw.get("ts") or int(time.time() * 1000),
+            "error": raw.get("error"),
+        }
+
     def locations_fast(self, bbox: dict[str, float] | None, budget_ms: int = 1800) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         started = time.time()
         key = self._cache_key("locations", vp)
         cached = self._cache.get(key)
         if cached:
-            return {"ok": True, "source": "shared_ocean_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
+            return {"ok": True, "source": "fish_csv_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
 
-        if not self._warm_started:
-            threading.Thread(target=self.prewarm_startup, daemon=True).start()
-
-        if not self._warm_ready:
-            last_good = self._cache.get_last_good(key)
-            if last_good:
-                return {"ok": True, "source": "locations_last_good", "degraded": True, "warm": False, "stale": True, "fallback_reason": "warm_not_ready", "items": last_good.get("items") or [], "count": len(last_good.get("items") or []), "timestamp": int(time.time() * 1000), "ts": last_good.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
-            # lightweight fallback path
-            lightweight = self.fish_payload()
-            items = []
-            for item in (lightweight.get("items") or [])[:16]:
-                if not isinstance(item, dict):
-                    continue
-                items.append({
-                    "id": item.get("id") or item.get("location_key") or item.get("name") or "loc",
-                    "name": item.get("name") or "Fishing location",
-                    "lat": item.get("lat"),
-                    "lon": item.get("lon"),
-                    "fish_index": item.get("fish_index") if item.get("fish_index") is not None else item.get("confidence"),
-                    "confidence": item.get("confidence") if item.get("confidence") is not None else item.get("probability") or 0.4,
-                    "probability": item.get("probability") if item.get("probability") is not None else item.get("confidence") or 0.4,
-                    "score": item.get("score"),
-                    "reason": "lightweight_fallback",
-                    "reasons": ["warm cache building"],
-                })
-            return {"ok": True, "source": "lightweight_fallback", "degraded": True, "warm": False, "stale": False, "fallback_reason": "warmup_in_progress", "items": items, "count": len(items), "timestamp": int(time.time() * 1000), "ts": int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2)}
-
-        payload = self.fish_from_ocean(vp.as_dict())
-        payload.update({"fallback_reason": None, "latency_ms": round((time.time() - started) * 1000, 2)})
+        payload = self._csv_locations(vp.as_dict())
+        self._cache.set(key, {"items": payload.get("items") or [], "count": payload.get("count") or 0, "ts": payload.get("ts")})
+        payload.update({"latency_ms": round((time.time() - started) * 1000, 2)})
         return payload
 
     def bait_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:

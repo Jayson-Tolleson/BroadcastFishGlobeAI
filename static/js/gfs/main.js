@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations, getGfsWebSocketUrl } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -518,8 +518,9 @@ function createGfsSocket() {
   const connect = () => {
     if (manualClose || connecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
     connecting = true;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/ws/gfs`);
+    const wsUrl = getGfsWebSocketUrl();
+    console.info('[gfs/ws] connecting', { url: wsUrl });
+    ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       connecting = false;

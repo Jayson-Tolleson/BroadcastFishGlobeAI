@@ -38,6 +38,10 @@ class GfsEngine(GFSService):
         self._warm_ready = False
         self._warm_error: str | None = None
         self._warm_at: int | None = None
+        self._gfs_ws_registered = False
+        self._gfs_ws_active_clients = 0
+        self._gfs_ws_last_exception: str | None = None
+        self._gfs_ws_last_open_ts: int | None = None
 
     def parse_intent(self, args: Any) -> ParsedIntent:
         vp = canonicalize_viewport({
@@ -328,9 +332,28 @@ class GfsEngine(GFSService):
             "warm": self.warm_status(),
         }
 
+    def mark_gfs_ws_registered(self, registered: bool = True) -> None:
+        self._gfs_ws_registered = bool(registered)
+
+    def mark_gfs_ws_open(self) -> None:
+        self._gfs_ws_active_clients = max(0, int(self._gfs_ws_active_clients) + 1)
+        self._gfs_ws_last_open_ts = int(time.time() * 1000)
+
+    def mark_gfs_ws_close(self) -> None:
+        self._gfs_ws_active_clients = max(0, int(self._gfs_ws_active_clients) - 1)
+
+    def mark_gfs_ws_exception(self, exc: Exception | str) -> None:
+        self._gfs_ws_last_exception = str(exc)
+
     def health_payload(self) -> dict[str, Any]:
         payload = super().health_payload()
         csv = self.fish_payload()
+        payload["websocket"] = {
+            "gfs_route_registered": bool(self._gfs_ws_registered),
+            "gfs_active_clients": int(self._gfs_ws_active_clients),
+            "gfs_last_exception": self._gfs_ws_last_exception,
+            "gfs_last_open_ts": self._gfs_ws_last_open_ts,
+        }
         try:
             ocean = self.shared_ocean_payload(None)
         except Exception as exc:

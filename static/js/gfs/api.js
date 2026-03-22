@@ -355,5 +355,10 @@ export async function fetchFish(viewport, options = {}) {
   return normalizeFishPayload(payload);
 }
 
+export function getGfsWebSocketUrl() {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${window.location.host}/ws/gfs`;
+}
+
 // compatibility thin aliases
 export const getOceanState = fetchOceanState;

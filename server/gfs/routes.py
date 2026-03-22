@@ -15,8 +15,30 @@ log = logging.getLogger("server.gfs.routes")
 
 
 async def handle_gfs_ws(engine_getter, ws_obj) -> None:
-    log.info("/ws/gfs connect")
-    await ws_obj.send_json({"type": "hello", "channel": "gfs", "ws": "connected"})
+    log.info("/ws/gfs route entry")
+    engine = None
+    try:
+        engine = engine_getter()
+        mark_open = getattr(engine, "mark_gfs_ws_open", None)
+        if callable(mark_open):
+            mark_open()
+    except Exception:
+        log.exception("/ws/gfs failed to resolve engine before handshake")
+    log.info("/ws/gfs handshake open")
+    try:
+        await ws_obj.send_json({"type": "hello", "channel": "gfs", "ws": "connected"})
+        log.info("/ws/gfs first hello sent")
+    except Exception as exc:
+        log.exception("/ws/gfs hello send failed")
+        if engine is not None:
+            mark_exc = getattr(engine, "mark_gfs_ws_exception", None)
+            if callable(mark_exc):
+                mark_exc(exc)
+        if engine is not None:
+            mark_close = getattr(engine, "mark_gfs_ws_close", None)
+            if callable(mark_close):
+                mark_close()
+        return
     while True:
         try:
             msg = await ws_obj.receive()
@@ -33,7 +55,7 @@ async def handle_gfs_ws(engine_getter, ws_obj) -> None:
             if msg_type == "ping":
                 await ws_obj.send_json({"type": "pong", "detail": "ping"})
             elif msg_type == "status":
-                status_payload = engine_getter().websocket_status_payload()
+                status_payload = (engine or engine_getter()).websocket_status_payload()
                 await ws_obj.send_json(status_payload)
                 log.info("/ws/gfs status served")
             elif msg_type in {"refresh", "refresh_nudge"}:
@@ -41,8 +63,16 @@ async def handle_gfs_ws(engine_getter, ws_obj) -> None:
             else:
                 await ws_obj.send_json({"type": "ack", "detail": msg_type})
         except Exception as exc:
-            log.warning("/ws/gfs exception: %s", exc)
+            log.exception("/ws/gfs exception")
+            if engine is not None:
+                mark_exc = getattr(engine, "mark_gfs_ws_exception", None)
+                if callable(mark_exc):
+                    mark_exc(exc)
             break
+    if engine is not None:
+        mark_close = getattr(engine, "mark_gfs_ws_close", None)
+        if callable(mark_close):
+            mark_close()
     log.info("/ws/gfs closed")
 
 

@@ -79,11 +79,16 @@ def create_quart_app() -> Quart:
     app.settings_obj = settings
     app.state_obj = state
     app.rtc_manager = rtc
+    registered_rules = {str(r.rule) for r in app.url_map.iter_rules()}
+    ws_gfs_registered = "/ws/gfs" in registered_rules
+    ws_gfs_legacy_registered = "/gfs/ws" in registered_rules
 
     logging.getLogger("server.startup").info(
-        "startup ready framework=quart static=%s templates=%s routes=/,/broadcast,/watch,/gfs ws=/ws/watch,/ws/broadcast,/ws/chat,/ws/gfs",
+        "startup ready framework=quart static=%s templates=%s routes=/,/broadcast,/watch,/gfs ws=/ws/watch,/ws/broadcast,/ws/chat,/ws/gfs ws_gfs_registered=%s ws_gfs_legacy_registered=%s",
         STATIC_DIR,
         TEMPLATES_DIR,
+        ws_gfs_registered,
+        ws_gfs_legacy_registered,
     )
     return app
 

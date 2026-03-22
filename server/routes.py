@@ -36,6 +36,13 @@ def register_routes(app: Quart, state: AppState, settings: Settings, rtc: RTCMan
     app.register_blueprint(create_broadcast_ai_blueprint())
     app.register_blueprint(create_lftr_ai_blueprint())
     app.register_blueprint(api_bp)
+    try:
+        current_app_engine = app.extensions.get("gfs_engine")
+        mark_registered = getattr(current_app_engine, "mark_gfs_ws_registered", None)
+        if callable(mark_registered):
+            mark_registered(True)
+    except Exception:
+        pass
 
     @app.websocket("/ws/gfs")
     async def ws_gfs():

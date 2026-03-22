@@ -26,13 +26,20 @@ class GFSState:
     model_source_url: str | None = None
     model_cache_path: str | None = None
     model_source_format: str = "grib2"
+    model_cache_size_bytes: int | None = None
+    model_cache_exists: bool = False
 
     fields_available: list[str] = field(default_factory=list)
     fields_missing: list[str] = field(default_factory=list)
     decode_backend: str = "none"
     data_source_mode: str = "heuristic"
+    decode_failure_reason: str | None = None
+    decode_last_attempt_path: str | None = None
     last_good_model_state: dict[str, Any] | None = None
     scalar_fields: dict[str, Any] = field(default_factory=dict)
+    ingest_quarantine_count: int = 0
+    ingest_last_quarantine_path: str | None = None
+    ingest_last_quarantine_reason: str | None = None
 
     fish_points: list[dict[str, Any]] = field(default_factory=list)
     tile_cache: dict[str, Any] = field(default_factory=dict)

@@ -1,58 +1,58 @@
 export class LayerEngine {
   constructor(){
-    this.layers = {}
-    this.lastTs = performance.now()
-    this.latestData = null
+    this.layers = {};
+    this.lastTs = performance.now();
+    this.latestData = null;
+    this.inflight = {};
   }
   register(name, layer){
-    this.layers[name] = { enabled:false, instance:layer }
-    if (this.latestData && typeof layer.onData === 'function') {
-      try { layer.onData(this.latestData) } catch (err) { console.error('[gfs layers] onData failed', name, err) }
-    }
+    this.layers[name] = { enabled:false, instance:layer };
+    layer.disable?.();
   }
-  setData(payload){
-    this.latestData = payload || null
-    Object.entries(this.layers).forEach(([name, layer]) => {
-      if (layer.enabled) {
-        try { layer.instance.onData?.(this.latestData) } catch (err) { console.error('[gfs layers] data sync failed', name, err) }
+  async setData(payload){
+    this.latestData = payload || null;
+    await Promise.all(Object.entries(this.layers).map(async ([name, layer]) => {
+      if (!layer.enabled) return;
+      if (this.inflight[name]) {
+        try { this.inflight[name].abort?.(); } catch (_) {}
       }
-    })
+      const token = { aborted: false, abort(){ this.aborted = true; } };
+      this.inflight[name] = token;
+      try { await layer.instance.refresh?.(this.latestData, token); } catch (err) { console.error('[gfs layers] refresh failed', name, err); }
+      finally { if (this.inflight[name] === token) this.inflight[name] = null; }
+    }));
   }
   setEnabled(name, enabled){
-    const layer = this.layers[name]
-    if(!layer){ console.warn('[gfs layers] missing layer:', name); return false }
-    if(layer.enabled === enabled) {
-      if(enabled && this.latestData) {
-        try { layer.instance.onData?.(this.latestData) } catch (err) { console.error('[gfs layers] onData failed', name, err) }
-      }
-      return true
+    const layer = this.layers[name];
+    if(!layer) return false;
+    if(layer.enabled === enabled) return true;
+    layer.enabled = enabled;
+    if (enabled) {
+      layer.instance.enable?.();
+      if (this.latestData) layer.instance.refresh?.(this.latestData);
+    } else {
+      layer.instance.disable?.();
     }
-    layer.enabled = enabled
-    try {
-      if(enabled){ 
-        layer.instance.show?.()
-        if (this.latestData) layer.instance.onData?.(this.latestData)
-      } else { 
-        layer.instance.hide?.() 
-      }
-    } catch (err) {
-      console.error('[gfs layers] toggle failed', name, err)
-    }
-    return true
+    return true;
   }
-  toggle(name){
-    const layer = this.layers[name]
-    if(!layer){ console.warn('[gfs layers] missing layer:', name); return false }
-    return this.setEnabled(name, !layer.enabled)
+  refresh(name){
+    const layer = this.layers[name];
+    if (!layer || !layer.enabled) return;
+    layer.instance.refresh?.(this.latestData);
+  }
+  destroy(){
+    Object.values(this.layers).forEach((layer) => {
+      try { layer.instance.destroy?.(); } catch (_) {}
+    });
   }
   update(){
-    const now = performance.now()
-    const dt = Math.max(0, (now - this.lastTs) / 1000)
-    this.lastTs = now
+    const now = performance.now();
+    const dt = Math.max(0, (now - this.lastTs) / 1000);
+    this.lastTs = now;
     Object.values(this.layers).forEach((layer) => {
       if(layer.enabled){
-        try { layer.instance.update?.(dt) } catch (err) { console.error('[gfs layers] update failed', err) }
+        try { layer.instance.update?.(dt, this.latestData); } catch (err) { console.error('[gfs layers] update failed', err); }
       }
-    })
+    });
   }
 }

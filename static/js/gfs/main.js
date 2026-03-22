@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -9,6 +9,8 @@ import { RendererLayer } from './layers/renderer_layer.js';
 import { renderCloudZones } from './cloud-zones.js';
 import { renderRainZones } from './rain-zones.js';
 import { renderBaitZones } from './bait-zones.js';
+import { createGfsState } from './state.js';
+import { renderDebugPanel } from './hud/debug_panel.js';
 
 const statusEl = document.getElementById('status');
 const globeEl = document.getElementById('globe');
@@ -20,6 +22,9 @@ let selectedLocation = null;
 let liveStatePollId = null;
 const missingLiveLocationIds = new Set();
 const GFS_DEBUG = Boolean(window.__GFS_DEBUG);
+
+const gfsState = createGfsState();
+const STEADY_EVENTS = ['gmp-centerchange', 'gmp-headingchange', 'gmp-rangechange', 'gmp-rollchange', 'gmp-tiltchange', 'gmp-camerapositionchange'];
 
 const layerRuntime = {
   engine: null,
@@ -35,14 +40,13 @@ function syncPillState(name, enabled) {
 
 
 function baitAdvancedReady(payload) {
-  return Boolean(
-    payload
-    && payload.bait
-    && payload.bait.status === 'ready'
-    && payload.bait.source === 'full_stack'
-    && Array.isArray(payload.bait.polygons)
-    && payload.bait.polygons.length > 0
-  );
+  if (!payload || !payload.bait) return false;
+  const polygons = payload.bait.polygons;
+  const hasPolygons = Array.isArray(polygons) && polygons.length > 0;
+  const hasField = Array.isArray(payload.bait_score) && payload.bait_score.length > 0;
+  const src = String(payload.bait.source || payload.source || '');
+  const hasSource = src.length > 0 && ['shared_ocean', 'full_stack'].includes(src) || src.length > 0;
+  return Boolean(payload.bait.status === 'ready' && hasSource && (hasPolygons || hasField));
 }
 
 function preferStableBaitAdvanced(nextPayload, fallbackPayload) {
@@ -105,6 +109,7 @@ function initLayerSystem() {
 }
 
 const dataState = {
+  lastRequestOutcome: 'ok',
   inFlight: false,
   requestSeq: 0,
   activeAbort: null,
@@ -180,9 +185,9 @@ function currentLiveOverlayRefs() {
 
 async function refreshSelectedLiveState() {
   if (!selectedLocation) return;
-  const locationId = encodeURIComponent(selectedLocation.id);
+  const locationId = String(selectedLocation.id);
   if (missingLiveLocationIds.has(selectedLocation.id)) return;
-  const payload = await getJsonSafe(`/gfs/api/location/${locationId}/live`, null);
+  const payload = await fetchLocationLive(locationId, { abortPrevious: true });
   if (!payload) return;
   if (payload?.error === 'location_not_found' || payload?.ok === false) {
     missingLiveLocationIds.add(selectedLocation.id);
@@ -368,7 +373,10 @@ async function refreshData(reason = 'manual') {
     const bboxQ = encodeURIComponent(bboxToQuery(viewport));
     const vpQ = viewportToQuery(viewport);
     const frame = await getJsonSafe(`/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=full`, null, { signal: controller.signal });
-    if (!frame) return dataState.latest;
+    const ocean = await fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true });
+    if (frame && ocean) frame.ocean = ocean;
+    if (!ocean) gfsState.setStaleHold('ocean payload unavailable; holding prior ocean metadata');
+    if (!frame) { gfsState.debugHoldReason = 'frame missing; held previous visuals'; return dataState.latest; }
     if (seq !== dataState.requestSeq) return dataState.latest;
 
     dataState.latest.weather = frame.weather || null;
@@ -385,7 +393,11 @@ async function refreshData(reason = 'manual') {
     window.__gfsLastFrame = frame;
     window.currentBBox = window.__gfsLastBbox;
     window.__gfsRecursiveGrid = { latest: dataState.latest.recursiveGrid, bbox: bboxToQuery(viewport) };
-    layerRuntime.engine?.setData?.(frame || null);
+    gfsState.debugHoldReason = '';
+    gfsState.setFrame(frame, viewport);
+    const debugEl = document.getElementById('debugPrompt');
+    renderDebugPanel(debugEl, gfsState);
+    await layerRuntime.engine?.setData?.(frame || null);
     console.info('[gfs data] refreshed', {
       reason,
       signature,
@@ -402,7 +414,14 @@ async function refreshData(reason = 'manual') {
     }
     return dataState.latest;
   } catch (err) {
-    if (err?.name !== 'AbortError') {
+    if (err?.name === 'AbortError') {
+      dataState.lastRequestOutcome = 'intentional_abort';
+    } else if (String(err?.message || '').toLowerCase().includes('timeout')) {
+      dataState.lastRequestOutcome = 'timeout_fallback';
+      gfsState.setStaleHold('refresh timeout; holding prior visuals');
+      console.warn('[gfs data] refresh timeout', err?.message || err);
+    } else {
+      dataState.lastRequestOutcome = 'error';
       console.warn('[gfs data] refresh failed', err?.message || err);
     }
     return dataState.latest;
@@ -417,7 +436,7 @@ async function refreshDeferredBaitAdvanced(viewport, reason = 'manual') {
   const bboxQ = encodeURIComponent(bboxToQuery(viewport));
   const vpQ = viewportToQuery(viewport);
   const payload = await getJsonSafe(`/gfs/api/bait-advanced?bbox=${bboxQ}&viewport=${vpQ}&quality=full`, null, { abortPrevious: true });
-  if (!payload) return null;
+  if (!payload) { gfsState.debugHoldReason = 'bait refresh unavailable; holding prior payload'; return null; }
   dataState.latest.baitAdvanced = preferStableBaitAdvanced(payload, dataState.latest.baitAdvanced || null);
   console.info('[gfs bait advanced] refreshed', { reason, polygons: Array.isArray(payload?.bait?.polygons) ? payload.bait.polygons.length : 0, status: payload?.bait?.status });
   return payload;
@@ -437,16 +456,12 @@ function installSteadyRefresh() {
     refreshData('steady');
   };
 
-  ['gmp-centerchange', 'gmp-headingchange', 'gmp-rangechange', 'gmp-rollchange', 'gmp-tiltchange', 'gmp-camerapositionchange'].forEach((evt) => {
-    globeEl.addEventListener(evt, onMove);
-  });
+  STEADY_EVENTS.forEach((evt) => globeEl.addEventListener(evt, onMove));
   globeEl.addEventListener('gmp-steadystate', onSteady);
   globeEl.addEventListener('gmp-steadychange', onSteady);
 
   return () => {
-    ['gmp-centerchange', 'gmp-headingchange', 'gmp-rangechange', 'gmp-rollchange', 'gmp-tiltchange', 'gmp-camerapositionchange'].forEach((evt) => {
-      globeEl.removeEventListener(evt, onMove);
-    });
+    STEADY_EVENTS.forEach((evt) => globeEl.removeEventListener(evt, onMove));
     globeEl.removeEventListener('gmp-steadystate', onSteady);
     globeEl.removeEventListener('gmp-steadychange', onSteady);
   };
@@ -456,44 +471,39 @@ function createGfsSocket() {
   let ws = null;
   let reconnectTimer = null;
   let pingTimer = null;
-  let watchdogTimer = null;
   let backoffMs = 1000;
+  const MIN_BACKOFF_MS = 1000;
+  const MAX_BACKOFF_MS = 20000;
   let manualClose = false;
   let connecting = false;
-  let lastMessageAt = 0;
 
   const clearTimers = () => {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (pingTimer) clearInterval(pingTimer);
-    if (watchdogTimer) clearInterval(watchdogTimer);
     reconnectTimer = null;
     pingTimer = null;
-    watchdogTimer = null;
   };
 
   const scheduleReconnect = () => {
     if (manualClose || reconnectTimer) return;
+    const jitter = 0.85 + (Math.random() * 0.3);
+    const delay = Math.round(backoffMs * jitter);
+    console.info('[gfs/ws] reconnect scheduled', { delayMs: delay, nextBackoffMs: Math.min(MAX_BACKOFF_MS, backoffMs * 2) });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
-    }, backoffMs);
-    backoffMs = Math.min(15000, backoffMs * 2);
+    }, delay);
+    backoffMs = Math.min(MAX_BACKOFF_MS, backoffMs * 2);
   };
 
   const startHeartbeat = () => {
-    lastMessageAt = Date.now();
     pingTimer = setInterval(() => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
     }, 20000);
-
-    watchdogTimer = setInterval(() => {
-      const stale = Date.now() - lastMessageAt > 30000;
-      if (stale && ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.close(4000, 'inactivity timeout'); } catch (_) {}
-      }
-    }, 5000);
   };
+
+  const setWsState = (connected, reason) => gfsState.setWs(Boolean(connected), reason);
 
   const handleMessage = (msg) => {
     if (!msg || typeof msg !== 'object') return;
@@ -506,26 +516,33 @@ function createGfsSocket() {
   };
 
   const connect = () => {
-    if (manualClose || connecting || (ws && ws.readyState === WebSocket.OPEN)) return;
+    if (manualClose || connecting || (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))) return;
     connecting = true;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws/gfs`);
 
     ws.onopen = () => {
       connecting = false;
-      backoffMs = 1000;
+      backoffMs = MIN_BACKOFF_MS;
       clearTimers();
       startHeartbeat();
+      setWsState(true, 'open');
       console.info('[gfs/ws] connected');
     };
     ws.onmessage = (ev) => {
-      lastMessageAt = Date.now();
-      try { handleMessage(JSON.parse(ev.data)); } catch (_) {}
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg?.type === 'status') setWsState(true, 'status');
+        if (msg?.type === 'hello') setWsState(true, 'hello');
+        handleMessage(msg);
+      } catch (_) {}
     };
-    ws.onerror = () => console.warn('[gfs/ws] socket error');
-    ws.onclose = () => {
+    ws.onerror = (err) => { setWsState(false, 'error'); console.warn('[gfs/ws] socket error', err); };
+    ws.onclose = (ev) => {
+      setWsState(false, 'close');
       connecting = false;
       clearTimers();
+      console.info('[gfs/ws] closed', { code: ev?.code, reason: ev?.reason || '', wasClean: Boolean(ev?.wasClean) });
       if (!manualClose) scheduleReconnect();
     };
   };
@@ -681,26 +698,10 @@ async function boot() {
 
   const { maps3d } = await libs();
   initLayerSystem();
-  let payload = await getJsonSafe('/gfs/api/locations', null);
-  if (!payload?.locations?.length) {
-    const fishPayload = await getJsonSafe('/gfs/api/fish', { items: [] });
-    const fallbackLocations = Array.isArray(fishPayload?.items)
-      ? fishPayload.items.map((item) => ({
-          id: item?.id || item?.location_key || item?.name || 'loc',
-          location_key: item?.location_key || item?.id || item?.name || 'loc',
-          name: item?.name || item?.location_key || 'Fishing location',
-          lat: item?.lat,
-          lon: item?.lon,
-          probability: item?.probability ?? item?.confidence,
-          confidence: item?.confidence ?? item?.probability,
-          meta: item?.meta || {},
-          environment: item?.environment || {},
-          species: item?.species || [],
-          score: item?.score,
-        }))
-      : [];
-    payload = { ...(payload || {}), locations: fallbackLocations };
-  }
+  const bootViewport = getCanonicalViewport();
+  let payload = await fetchLocations(bootViewport, { timeoutMs: 2200, abortPrevious: false });
+  gfsState.setCache('locations', payload);
+  if (!payload?.locations?.length) gfsState.setStaleHold('locations unavailable; showing overlays without markers');
   const locations = payload?.locations || [];
   renderMarkers({ locations, globeEl, maps3d, onSelect: (loc) => { gfsSocket.connect(); hud.open(loc); } });
 

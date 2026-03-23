@@ -295,6 +295,25 @@ class GfsEngine(GFSService):
             bait = item.get("bait") if isinstance(item.get("bait"), dict) else {}
             env_meta = item.get("environment_meta") if isinstance(item.get("environment_meta"), dict) else {}
             bait_applicable = marker_class in {"coastal", "offshore", "estuary"}
+            wavewatch_available = any(
+                isinstance(env.get(k), (int, float)) and math.isfinite(float(env.get(k)))
+                for k in ("wave_feet", "swell_height_ft", "swell_period_s", "swell_direction_deg")
+            )
+            intel_tier = "enhanced" if wavewatch_available else "basic"
+            intel_sources = ["gfs", "hycom"]
+            missing_inputs: list[str] = []
+            if isinstance(env.get("chlorophyll_mg_m3"), (int, float)) and math.isfinite(float(env.get("chlorophyll_mg_m3"))):
+                intel_sources.append("coastwatch")
+            else:
+                missing_inputs.append("coastwatch")
+            if isinstance(env.get("depth_m"), (int, float)) and math.isfinite(float(env.get("depth_m"))):
+                intel_sources.append("bathymetry")
+            else:
+                missing_inputs.append("bathymetry")
+            if wavewatch_available:
+                intel_sources.append("wavewatch")
+            else:
+                missing_inputs.append("wavewatch")
             items.append({
                 "id": loc_id,
                 "location_key": item.get("location_key") or loc_id,
@@ -337,6 +356,11 @@ class GfsEngine(GFSService):
                 "quick_snapshot": {
                     "marker_class": marker_class,
                     "bait_applicable": bait_applicable,
+                    "intel_tier": intel_tier,
+                    "intel_sources": intel_sources,
+                    "missing_inputs": missing_inputs,
+                    "intel_confidence": "high" if intel_tier == "enhanced" else "medium",
+                    "wavewatch_available": wavewatch_available,
                     "bait_score": bait.get("bait_score"),
                     "bait_intensity": bait.get("intensity"),
                     "weather": {
@@ -356,6 +380,11 @@ class GfsEngine(GFSService):
                         "depth_m": env.get("depth_m"),
                     } if bait_applicable else {},
                 },
+                "intel_tier": intel_tier,
+                "intel_sources": intel_sources,
+                "missing_inputs": missing_inputs,
+                "intel_confidence": "high" if intel_tier == "enhanced" else "medium",
+                "wavewatch_available": wavewatch_available,
             })
         return {
             "ok": bool(raw.get("ok", True)),

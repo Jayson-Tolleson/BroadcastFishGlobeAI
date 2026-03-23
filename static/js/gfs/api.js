@@ -19,8 +19,13 @@ function isExpectedEntity(payload, expectedType, expectedDerived) {
 }
 
 function normalizeLocationsPayload(payload) {
-  if (isExpectedEntity(payload, 'location', false)) return payload;
+  if (isExpectedEntity(payload, 'location', false)) {
+    const locations = Array.isArray(payload?.locations) ? payload.locations : [];
+    console.info('[gfs/api] normalize locations', { endpoint: '/gfs/api/locations', entity_type: payload.entity_type, derived: payload.derived, received: locations.length, accepted: locations.length });
+    return payload;
+  }
   warn('locations payload contract mismatch', {
+    endpoint: '/gfs/api/locations',
     entity_type: payload?.entity_type,
     derived: payload?.derived,
     source: payload?.source,
@@ -38,8 +43,13 @@ function normalizeLocationsPayload(payload) {
 }
 
 function normalizeFishPayload(payload) {
-  if (isExpectedEntity(payload, 'fish', true)) return payload;
+  if (isExpectedEntity(payload, 'fish', true)) {
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    console.info('[gfs/api] normalize fish', { endpoint: '/gfs/api/fish', entity_type: payload.entity_type, derived: payload.derived, received: items.length, accepted: items.length });
+    return payload;
+  }
   warn('fish payload contract mismatch', {
+    endpoint: '/gfs/api/fish',
     entity_type: payload?.entity_type,
     derived: payload?.derived,
     source: payload?.source,
@@ -346,6 +356,7 @@ export async function fetchOceanState(viewport, options = {}) {
 
 export async function fetchLocations(viewport, options = {}) {
   const merged = { timeoutMs: 2500, abortPrevious: false, ...options };
+  console.info('[gfs/api] fetch', { endpoint: '/gfs/api/locations', viewport });
   const payload = await getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, merged);
   return normalizeLocationsPayload(payload);
 }
@@ -367,6 +378,7 @@ export async function fetchBoats(viewport, options = {}) {
 }
 
 export async function fetchFish(viewport, options = {}) {
+  console.info('[gfs/api] fetch', { endpoint: '/gfs/api/fish', viewport });
   const payload = await getJsonSafe(`/gfs/api/fish?${viewportQuery(viewport)}`, { items: [] }, options);
   return normalizeFishPayload(payload);
 }

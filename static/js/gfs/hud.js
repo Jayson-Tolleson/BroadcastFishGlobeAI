@@ -158,6 +158,53 @@ function fieldSample(payload, fieldName, lat, lon) {
   return bilinearSample(payload?.fields?.[fieldName], payload?.bbox, lat, lon);
 }
 
+function formatUnavailable(value, formatter) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 'Unavailable';
+  return formatter(n);
+}
+
+function normalizeEnvironment({ wx, ocean, boats, lat, lon, cloudPct, rainRate, windKt, windDir, currentKt, currentDir, swellFt }) {
+  const sampledSstK = fieldSample(ocean, 'sst_k', lat, lon);
+  const sampledChl = fieldSample(ocean, 'chlorophyll_mg_m3', lat, lon);
+  const sampledCurrentSpeed = fieldSample(ocean, 'current_speed', lat, lon);
+  const sampledCurrentU = fieldSample(ocean, 'current_u', lat, lon);
+  const sampledCurrentV = fieldSample(ocean, 'current_v', lat, lon);
+  const sampledDepth = fieldSample(ocean, 'depth_m', lat, lon);
+  const sampledWaveHeightM = fieldSample(ocean, 'wave_height_m', lat, lon);
+  const sampledWavePeriodS = Number(interpolateBoatScalar(boats?.boats, lat, lon, (entry) => entry?.waves?.primary?.periodS, 120, 4));
+  const sampledWindU = fieldSample(wx, 'wind_u', lat, lon);
+  const sampledWindV = fieldSample(wx, 'wind_v', lat, lon);
+  const currentDirFromVector = Number.isFinite(sampledCurrentU) && Number.isFinite(sampledCurrentV)
+    ? ((Math.atan2(sampledCurrentU, sampledCurrentV) * 180 / Math.PI) + 360) % 360
+    : NaN;
+  const windDirFromVector = Number.isFinite(sampledWindU) && Number.isFinite(sampledWindV)
+    ? ((Math.atan2(sampledWindU, sampledWindV) * 180 / Math.PI) + 360) % 360
+    : NaN;
+  const windSpeedFromVectorKt = Number.isFinite(sampledWindU) && Number.isFinite(sampledWindV)
+    ? Math.hypot(sampledWindU, sampledWindV) * 1.94384
+    : NaN;
+  const seaSurfaceTempF = Number.isFinite(sampledSstK) ? (((sampledSstK - 273.15) * 9) / 5) + 32 : NaN;
+  return {
+    sea_surface_temp: seaSurfaceTempF,
+    chlorophyll: sampledChl,
+    current_speed: Number.isFinite(currentKt) ? currentKt : sampledCurrentSpeed,
+    current_direction: Number.isFinite(currentDir) ? currentDir : currentDirFromVector,
+    wave_height: Number.isFinite(swellFt) ? swellFt : (Number.isFinite(sampledWaveHeightM) ? sampledWaveHeightM * 3.28084 : NaN),
+    wave_period: sampledWavePeriodS,
+    depth: sampledDepth,
+    wind_speed: Number.isFinite(windKt) ? windKt : windSpeedFromVectorKt,
+    wind_direction: Number.isFinite(windDir) ? windDir : windDirFromVector,
+    cloud_cover: cloudPct,
+    rain_rate: rainRate,
+    source_flags: {
+      weather: wx?.source || 'unknown',
+      ocean: ocean?.source || 'unknown',
+      degraded: Boolean(ocean?.degraded || wx?.degraded_mode),
+    },
+  };
+}
+
 function scoreText(score) {
   if (score >= 80) return 'High';
   if (score >= 62) return 'Good';
@@ -247,7 +294,7 @@ function listToHtml(items) {
   return items.map((item) => `<li>${item}</li>`).join('');
 }
 
-function deriveIntel({ loc, wx, bait, clouds, boats, localOverlay, reports, videos, profile }) {
+function deriveIntel({ loc, wx, bait, clouds, boats, ocean, localOverlay, reports, videos, profile }) {
   const lat = Number(loc?.lat);
   const lon = Number(loc?.lon);
   const nearestBait = nearestPoint(bait?.bait_score, lat, lon, 8);
@@ -285,6 +332,9 @@ function deriveIntel({ loc, wx, bait, clouds, boats, localOverlay, reports, vide
   const swell2 = boat?.waves?.secondary || null;
   const swell3 = boat?.waves?.tertiary || null;
   const reportHints = summarizeReports(reports);
+  const environment = normalizeEnvironment({
+    wx, ocean, boats, lat, lon, cloudPct, rainRate, windKt, windDir, currentKt, currentDir, swellFt,
+  });
 
   const structureEdge = clamp(38 + (frontCount * 11) + (convCount * 6));
   const weatherPenalty = clamp((Number.isFinite(windKt) ? windKt * 1.7 : 16) + (Number.isFinite(swellFt) ? swellFt * 8.5 : 18) + (Number.isFinite(rainRate) ? rainRate * 180 : 0), 0, 100);
@@ -382,6 +432,7 @@ function deriveIntel({ loc, wx, bait, clouds, boats, localOverlay, reports, vide
       classificationMethod: profile?.classification_method || null,
       coastDistanceNm: Number(profile?.coast_distance_deg) * 60,
     },
+    environment,
   };
 }
 
@@ -444,7 +495,10 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
 
   async function refresh() {
     if (!selected) return;
-    const loc = await getJsonSafe(`/gfs/api/location/${encodeURIComponent(selected.id)}`, null);
+    const isDerivedFish = selected?.entity_type === 'fish' || selected?.derived === true || selected?.marker_kind === 'fish_intelligence';
+    const loc = isDerivedFish
+      ? { ...selected, reports: [], name: selected?.name || 'Fish intelligence point' }
+      : await getJsonSafe(`/gfs/api/location/${encodeURIComponent(selected.id)}`, null);
     if (!loc) {
       el.statusLine.textContent = 'Location intelligence unavailable';
       return;
@@ -453,31 +507,34 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
     el.title.textContent = loc.name || selected.name;
     el.coords.textContent = `${Number(loc.lat || selected.lat).toFixed(4)}, ${Number(loc.lon || selected.lon).toFixed(4)} • orb anchor`;
 
-    const frameBox = `${(loc.lon - 1.8).toFixed(4)},${(loc.lat - 1.8).toFixed(4)},${(loc.lon + 1.8).toFixed(4)},${(loc.lat + 1.8).toFixed(4)}`;
+    const frameBox = `${(Number(loc.lon) - 1.8).toFixed(4)},${(Number(loc.lat) - 1.8).toFixed(4)},${(Number(loc.lon) + 1.8).toFixed(4)},${(Number(loc.lat) + 1.8).toFixed(4)}`;
 
     let [frame, vids, node] = await Promise.all([
       getJsonSafe(`/gfs/api/frame?bbox=${frameBox}&quality=full`, null),
       loadLocationVideos(selected.id),
-      getJsonSafe(`/gfs/api/intelligence/node/${encodeURIComponent(selected.id)}`, null),
+      isDerivedFish ? Promise.resolve(null) : getJsonSafe(`/gfs/api/intelligence/node/${encodeURIComponent(selected.id)}`, null),
     ]);
 
     let wx = frame?.weather || null;
     let bait = frame?.baitAdvanced || null;
     let clouds = frame?.clouds || null;
     let boats = frame?.boats || null;
+    let ocean = frame?.ocean || null;
 
     const reports = [...(loc.reports || [])];
     const localOverlay = typeof getOverlaySummary === 'function' ? getOverlaySummary(loc) : null;
     const profile = node?.profile || null;
-    const intel = deriveIntel({ loc, wx, bait, clouds, boats, localOverlay, reports, videos: vids, profile });
+    const intel = deriveIntel({ loc, wx, bait, clouds, boats, ocean, localOverlay, reports, videos: vids, profile });
 
-    el.waterbody.textContent = profile?.waterbody ? `${profile.waterbody} • ${profile.headline_species}` : 'Habitat lens pending';
+    el.waterbody.textContent = profile?.waterbody
+      ? `${profile.waterbody} • ${profile.headline_species}`
+      : (isDerivedFish ? 'Derived fish intelligence point • shared-ocean model' : 'Habitat lens pending');
     el.positioning.textContent = [
       profile?.matched_zone ? `Zone ${profile.matched_zone}` : null,
       profile?.classification_method ? `Classifier ${profile.classification_method}` : null,
       Number.isFinite(Number(profile?.coast_distance_deg)) ? `Coast ${ (Number(profile.coast_distance_deg) * 60).toFixed(1) } nm` : null,
     ].filter(Boolean).join(' • ') || 'Marker wiring pending';
-    el.statusLine.textContent = `${scoreText(intel.opportunityScore)} setup • ${trendText(intel.opportunityScore, intel.baitState, intel.frontCount, intel.boilCount)} trend • ${safetyLabel(intel.safetyScore)} boating`;
+    el.statusLine.textContent = `${isDerivedFish ? 'Derived intelligence' : 'CSV truth marker'} • ${scoreText(intel.opportunityScore)} setup • ${trendText(intel.opportunityScore, intel.baitState, intel.frontCount, intel.boilCount)} trend • ${safetyLabel(intel.safetyScore)} boating`;
     el.opportunityScore.textContent = `${Math.round(intel.opportunityScore)}%`;
     updateMeter(el.opportunityFill, intel.opportunityScore);
     el.confidence.textContent = `${confidenceLabel(intel.confidenceScore)} confidence • ${Math.round(intel.confidenceScore)}%`;
@@ -512,8 +569,9 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
       updateMeter(fillEl, row?.score || 0);
     });
 
-    el.envNow.textContent = `Water ${safeFixed(Math.round(Number(intel.waterTempF) * 10) / 10, 1, '°F')} • Air ${safeFixed(Math.round(Number(intel.airTempF) * 10) / 10, 1, '°F')} • Current ${safeFixed(intel.currentKt, 1, ' kt')} @ ${safeFixed(intel.currentDir, 0, '°')}`;
-    el.envMore.textContent = `Wind ${safeFixed(intel.windKt, 1, ' kt')} @ ${safeFixed(intel.windDir, 0, '°')} • Swell ${safeFixed(intel.swellFt, 1, ' ft')} • Cloud ${safeFixed(intel.cloudPct, 0, '%')} • Rain ${safeFixed(intel.rainRate, 3, '')}`;
+    const env = intel.environment || {};
+    el.envNow.textContent = `SST ${formatUnavailable(env.sea_surface_temp, (v) => `${v.toFixed(1)}°F`)} • Chl ${formatUnavailable(env.chlorophyll, (v) => `${v.toFixed(2)} mg/m³`)} • Current ${formatUnavailable(env.current_speed, (v) => `${v.toFixed(2)} kt`)} @ ${formatUnavailable(env.current_direction, (v) => `${v.toFixed(0)}°`)}`;
+    el.envMore.textContent = `Wave ${formatUnavailable(env.wave_height, (v) => `${v.toFixed(1)} ft`)} • Period ${formatUnavailable(env.wave_period, (v) => `${v.toFixed(0)} s`)} • Depth ${formatUnavailable(env.depth, (v) => `${v.toFixed(0)} m`)} • Wind ${formatUnavailable(env.wind_speed, (v) => `${v.toFixed(1)} kt`)} @ ${formatUnavailable(env.wind_direction, (v) => `${v.toFixed(0)}°`)}`;
     const boatSolveText = Number.isFinite(intel.positioning?.boatDistanceNm)
       ? `Boat solve ${intel.positioning.boatDistanceNm.toFixed(1)} nm from orb`
       : 'Boat solve sparse — using regional ocean conditions';
@@ -523,6 +581,9 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
     el.envPosition.textContent = [
       boatSolveText,
       baitSolveText,
+      `Cloud ${formatUnavailable(env.cloud_cover, (v) => `${v.toFixed(0)}%`)}`,
+      `Rain ${formatUnavailable(env.rain_rate, (v) => `${v.toFixed(3)}`)}`,
+      `Sources wx:${env.source_flags?.weather || 'unknown'} ocean:${env.source_flags?.ocean || 'unknown'}${env.source_flags?.degraded ? ' (degraded)' : ''}`,
       Number.isFinite(intel.positioning?.boatLat) && Number.isFinite(intel.positioning?.boatLon) ? `Boat cell ${intel.positioning.boatLat.toFixed(3)}, ${intel.positioning.boatLon.toFixed(3)}` : null,
       Number.isFinite(intel.positioning?.baitLat) && Number.isFinite(intel.positioning?.baitLon) ? `Bait cell ${intel.positioning.baitLat.toFixed(3)}, ${intel.positioning.baitLon.toFixed(3)}` : null,
     ].filter(Boolean).join(' • ');

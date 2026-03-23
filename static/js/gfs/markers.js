@@ -156,25 +156,28 @@ function startPulseLoop(animatedOrbs) {
   };
 }
 
-export function renderMarkers({ locations, globeEl, maps3d, onSelect }) {
+export function renderMarkers({ locations, globeEl, maps3d, onSelect, markerKind = 'location_csv' }) {
   const active = [];
   const animatedOrbs = [];
   const altitudeMode = maps3d?.AltitudeMode?.RELATIVE_TO_GROUND || 'RELATIVE_TO_GROUND';
+  let accepted = 0;
+  let rendered = 0;
 
   for (const loc of locations) {
+    accepted += 1;
     const lat = parseCoordinate(loc?.lat);
     const lon = parseCoordinate(loc?.lon);
     if (lat === null || lon === null) {
-      console.warn('[gfs markers] skipped invalid location coordinates', { id: loc?.id, lat: loc?.lat, lon: loc?.lon });
+      console.warn('[gfs markers] skipped invalid coordinates', { markerKind, id: loc?.id, lat: loc?.lat, lon: loc?.lon });
       continue;
     }
 
-    const normalizedLoc = { ...loc, lat, lon };
+    const normalizedLoc = { ...loc, lat, lon, marker_kind: markerKind };
     let built;
     try {
       built = createFishMarker({ maps3d, loc: normalizedLoc, altitudeMode });
     } catch (err) {
-      console.error('[gfs markers] failed creating marker', { id: loc?.id, error: String(err) });
+      console.error('[gfs markers] failed creating marker', { markerKind, id: loc?.id, error: String(err) });
       continue;
     }
 
@@ -190,6 +193,7 @@ export function renderMarkers({ locations, globeEl, maps3d, onSelect }) {
 
     globeEl.append(built.marker);
     active.push(built.marker);
+    rendered += 1;
 
     const phaseSeed = `${normalizedLoc.id || normalizedLoc.name || ''}:${lat.toFixed(4)}:${lon.toFixed(4)}`;
     animatedOrbs.push({
@@ -204,6 +208,7 @@ export function renderMarkers({ locations, globeEl, maps3d, onSelect }) {
   }
 
   const stopPulse = startPulseLoop(animatedOrbs);
+  console.info('[gfs markers] render complete', { markerKind, accepted, rendered, suppressed: Math.max(0, accepted - rendered) });
 
   return () => {
     stopPulse();

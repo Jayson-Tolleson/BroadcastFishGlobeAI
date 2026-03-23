@@ -279,6 +279,16 @@ phase6_nginx() {
   systemctl restart nginx
   systemctl enable nginx
 }
+
+preflight_runtime() {
+  echo "===== PREFLIGHT — PYTHON RUNTIME CHECKS ====="
+  [[ -x "$VENV_DIR/bin/python" ]] || fail "venv python missing: $VENV_DIR/bin/python"
+  runuser -u "$INSTALL_USER" -- "$VENV_DIR/bin/python" -c "import hypercorn" || fail "hypercorn import failed in venv"
+  runuser -u "$INSTALL_USER" -- "$VENV_DIR/bin/python" -c "import quart" || fail "quart import failed in venv"
+  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && '$VENV_DIR/bin/python' -c \"from server.app_factory import create_app; app=create_app(); assert app is not None; print('preflight_ok')\"" || fail "app import/create_app preflight failed"
+  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && '$VENV_DIR/bin/python' -c \"from server.app_factory import create_app; app=create_app(); rules={str(r.rule) for r in app.url_map.iter_rules()}; assert '/ws/gfs' in rules; print('preflight_ws_gfs_ok')\"" || fail "gfs websocket route /ws/gfs missing in app url map"
+}
+
 phase7_services() {
   echo "===== PHASE 7 — SYSTEMD SERVICES ====="
   cp "$ROOT_DIR/deploy/systemd/broadcast.service" /etc/systemd/system/broadcast.service
@@ -287,7 +297,7 @@ phase7_services() {
   sed -i "s|\${CFG_DIR}|/etc/broadcast|g" /etc/systemd/system/broadcast.service
   sed -i "s|\${APP_DIR}|$APP_DIR|g" /etc/systemd/system/broadcast.service
 
-  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && . '$VENV_DIR/bin/activate' && python -c 'from server.app_factory import create_app; app=create_app(); print(app.url_map)'"
+  preflight_runtime
 
   systemctl daemon-reload
   systemctl enable broadcast

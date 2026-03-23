@@ -11,6 +11,9 @@ from typing import Any, Dict, Sequence
 from .gemini import generate_ai_reply, provider_name
 from .speech import synthesize_voice, transcribe_pcm16_chunk
 from .auth import auth_status_payload, resolve_gcp_auth_mode
+from .core import AICore, AIContext
+from .memory import AIMemory
+from .queue import AIJob, AIQueue, shared_ai_queue
 
 log = logging.getLogger("server.ai.pkg")
 _WARNED_STT_UNAVAILABLE = False
@@ -130,4 +133,10 @@ __all__ = [
     "transcribe_track",
     "stt_available",
     "ai_status",
+    "AICore",
+    "AIContext",
+    "AIMemory",
+    "AIJob",
+    "AIQueue",
+    "shared_ai_queue",
 ]

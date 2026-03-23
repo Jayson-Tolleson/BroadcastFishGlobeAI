@@ -270,7 +270,7 @@ function getCanonicalViewport() {
         south: Math.max(-89.9, fromBounds.south),
         east: Math.min(179.9, fromBounds.east),
         north: Math.min(89.9, fromBounds.north),
-        quality: 'coarse',
+        quality: 'full',
         camera: { center: c, range, source: 'visible_bounds' },
       });
     }
@@ -283,19 +283,14 @@ function getCanonicalViewport() {
     south: Math.max(-89.9, c.lat - latSpan / 2),
     east: Math.min(179.9, c.lon + lonSpan / 2),
     north: Math.min(89.9, c.lat + latSpan / 2),
-    quality: 'coarse',
+    quality: 'full',
     camera: { center: c, range, source: 'camera_heuristic' },
   });
 }
 
 
 function effectiveViewportStride(v) {
-  const span = Math.max(
-    Math.max(0.0001, v.east - v.west),
-    Math.max(0.0001, v.north - v.south),
-  );
-  if (span > 14) return 4;
-  if (span > 6) return 2;
+  void v;
   return 1;
 }
 
@@ -339,7 +334,7 @@ function sanitizeViewportForQuery(viewport) {
     south: Number(viewport.south),
     east: Number(viewport.east),
     north: Number(viewport.north),
-    quality: String(viewport.quality || 'coarse'),
+    quality: String(viewport.quality || 'full'),
     camera,
   };
 }
@@ -384,8 +379,8 @@ async function refreshData(reason = 'manual') {
   try {
     const bboxQ = encodeURIComponent(bboxToQuery(viewport));
     const vpQ = viewportToQuery(viewport);
-    const frameQuality = 'coarse';
-    const frameStride = Math.max(1, Number(viewport.sourceStride || 2));
+    const frameQuality = 'full';
+    const frameStride = 1;
     const frameUrl = `/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=${encodeURIComponent(frameQuality)}&stride=${encodeURIComponent(frameStride)}`;
     const [frame, ocean, locationsPayload] = await Promise.all([
       getJsonSafe(frameUrl, null, { signal: controller.signal, timeoutMs: 12000, abortPrevious: true }),

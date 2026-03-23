@@ -69,7 +69,7 @@ class GfsEngine(GFSService):
         return f"{kind}:{vp.west:.3f}:{vp.south:.3f}:{vp.east:.3f}:{vp.north:.3f}:{vp.quality}:{vp.stride}"
 
     def _default_warm_viewport(self):
-        return canonicalize_viewport({"west": -121.5, "south": 32.5, "east": -117.5, "north": 35.8, "quality": "coarse", "stride": 2})
+        return canonicalize_viewport({"west": -121.5, "south": 32.5, "east": -117.5, "north": 35.8, "quality": "full", "stride": 1})
 
     def _safe_weather_payload(self, vp) -> dict[str, Any]:
         started = time.time()

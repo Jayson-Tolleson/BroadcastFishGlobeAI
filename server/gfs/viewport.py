@@ -11,7 +11,7 @@ class CanonicalViewport:
     east: float
     north: float
     stride: int = 1
-    quality: str = "coarse"
+    quality: str = "full"
 
     def as_dict(self) -> dict[str, float | int | str]:
         return {
@@ -47,9 +47,9 @@ def snap_value(value: float, step: float) -> float:
 
 def _normalize_quality(value: Any) -> str:
     txt = str(value or "").strip().lower()
-    if txt in {"full", "fine"}:
-        return "full"
-    return "coarse"
+    if txt in {"coarse", "low", "fast"}:
+        return "coarse"
+    return "full"
 
 
 def canonicalize_viewport(raw: dict[str, Any] | None) -> CanonicalViewport:
@@ -66,10 +66,10 @@ def canonicalize_viewport(raw: dict[str, Any] | None) -> CanonicalViewport:
         north = south + 0.5
 
     span = max(east - west, north - south)
-    stride = _safe_int(raw.get("stride"), 0)
+    stride = _safe_int(raw.get("stride"), 1)
     if stride < 1:
-        stride = 4 if span > 14 else 2 if span > 6 else 1
-    stride = max(1, min(8, stride))
+        stride = 1
+    stride = max(1, min(4, stride))
     step = 0.25 * stride
 
     west = max(-179.9, snap_value(west, step))

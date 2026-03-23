@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations, fetchFish, getGfsWebSocketUrl } from './api.js';
+import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations, getGfsWebSocketUrl } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -33,7 +33,6 @@ const layerRuntime = {
 const markerRuntime = {
   maps3d: null,
   teardownLocations: null,
-  teardownFish: null,
 };
 
 function syncPillState(name, enabled) {
@@ -130,7 +129,6 @@ const dataState = {
     baitAdvanced: null,
     boats: null,
     locations: null,
-    fish: null,
   },
 };
 
@@ -389,11 +387,10 @@ async function refreshData(reason = 'manual') {
     const frameQuality = 'coarse';
     const frameStride = Math.max(1, Number(viewport.sourceStride || 2));
     const frameUrl = `/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=${encodeURIComponent(frameQuality)}&stride=${encodeURIComponent(frameStride)}`;
-    const [frame, ocean, locationsPayload, fishPayload] = await Promise.all([
+    const [frame, ocean, locationsPayload] = await Promise.all([
       getJsonSafe(frameUrl, null, { signal: controller.signal, timeoutMs: 12000, abortPrevious: true }),
       fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true }),
       fetchLocations(viewport, { signal: controller.signal, timeoutMs: 2600, abortPrevious: false }),
-      fetchFish(viewport, { signal: controller.signal, timeoutMs: 3200, abortPrevious: true }),
     ]);
     if (frame && ocean) frame.ocean = ocean;
     const normalizedFrame = normalizeFramePayload(frame);
@@ -409,7 +406,6 @@ async function refreshData(reason = 'manual') {
     dataState.latest.boats = normalizedFrame.boats || { boats: [] };
     dataState.latest.recursiveGrid = normalizedFrame.recursiveGrid || null;
     dataState.latest.locations = locationsPayload || { locations: [] };
-    dataState.latest.fish = fishPayload || { items: [] };
     gfsState.setCache('locations', locationsPayload || null);
     normalizedFrame.render_reason = (reason === 'boot' || reason === 'manual') ? 'steady' : reason;
     dataState.latest.frame = normalizedFrame;
@@ -435,7 +431,6 @@ async function refreshData(reason = 'manual') {
       boats: Array.isArray(dataState.latest.boats?.boats) ? dataState.latest.boats.boats.length : 0,
       sigmaClouds: Array.isArray(normalizedFrame?.sigmaClouds) ? normalizedFrame.sigmaClouds.length : 0,
       csvLocations: Array.isArray(dataState.latest.locations?.locations) ? dataState.latest.locations.locations.length : 0,
-      fishIntel: Array.isArray(dataState.latest.fish?.items) ? dataState.latest.fish.items.length : 0,
     });
     if (reason === 'boot' || reason === 'steady' || reason === 'manual') {
       refreshDeferredBaitAdvanced(viewport, reason).catch((err) => console.info('[gfs bait advanced] deferred fetch skipped', { message: err?.message || String(err) }));
@@ -459,16 +454,16 @@ async function refreshData(reason = 'manual') {
   }
 }
 
-function toHudMarker(item, markerKind) {
+function toHudMarker(item) {
   if (!item || !Number.isFinite(Number(item.lat)) || !Number.isFinite(Number(item.lon))) return null;
   return {
     ...item,
-    id: String(item.id || item.location_key || `${markerKind}-${Number(item.lat).toFixed(4)}-${Number(item.lon).toFixed(4)}`),
-    name: item.name || (markerKind === 'fish_intelligence' ? 'Fish intelligence point' : 'Fishing location'),
-    entity_type: markerKind === 'fish_intelligence' ? 'fish' : 'location',
-    derived: markerKind === 'fish_intelligence',
-    marker_kind: markerKind,
-    source: item.source || (markerKind === 'fish_intelligence' ? 'shared_ocean' : 'fish_csv'),
+    id: String(item.id || item.location_key || `location_csv-${Number(item.lat).toFixed(4)}-${Number(item.lon).toFixed(4)}`),
+    name: item.name || 'Fishing location',
+    entity_type: 'location',
+    derived: false,
+    marker_kind: 'location_csv',
+    source: item.source || 'fish_csv',
     reason: item.reason,
     reasons: item.reasons,
     score: item.score,
@@ -484,20 +479,15 @@ function renderMarkerSets(reason = 'manual') {
     return;
   }
   const rawLocations = Array.isArray(dataState.latest.locations?.locations) ? dataState.latest.locations.locations : [];
-  const rawFish = Array.isArray(dataState.latest.fish?.items) ? dataState.latest.fish.items : [];
-  const locationMarkers = rawLocations.map((item) => toHudMarker(item, 'location_csv')).filter(Boolean);
-  const fishMarkers = rawFish.map((item) => toHudMarker(item, 'fish_intelligence')).filter(Boolean);
+  const locationMarkers = rawLocations.map((item) => toHudMarker(item)).filter(Boolean);
   console.info('[gfs markers] normalize counts', {
     reason,
     locations_received: rawLocations.length,
     locations_accepted: locationMarkers.length,
-    fish_received: rawFish.length,
-    fish_accepted: fishMarkers.length,
+    marker_source: 'fishloclist.csv',
     locations_entity_type: dataState.latest.locations?.entity_type,
-    fish_entity_type: dataState.latest.fish?.entity_type,
   });
   if (markerRuntime.teardownLocations) markerRuntime.teardownLocations();
-  if (markerRuntime.teardownFish) markerRuntime.teardownFish();
   try {
     markerRuntime.teardownLocations = renderMarkers({
       locations: locationMarkers,
@@ -509,22 +499,11 @@ function renderMarkerSets(reason = 'manual') {
   } catch (err) {
     console.error('[gfs markers] location marker render failed', { reason, error: String(err) });
   }
-  try {
-    markerRuntime.teardownFish = renderMarkers({
-      locations: fishMarkers,
-      globeEl,
-      maps3d: markerRuntime.maps3d,
-      markerKind: 'fish_intelligence',
-      onSelect: (loc) => { gfsSocket.connect(); hud.open(loc); },
-    });
-  } catch (err) {
-    console.error('[gfs markers] fish marker render failed', { reason, error: String(err) });
-  }
-  if (!locationMarkers.length && !fishMarkers.length) {
+  if (!locationMarkers.length) {
     console.warn('[gfs markers] layer toggles may be enabled but zero markers rendered', {
       reason,
       locations_source: dataState.latest.locations?.source,
-      fish_source: dataState.latest.fish?.source,
+      suppression_reason: dataState.latest.locations?.contract_mismatch ? 'locations_contract_mismatch' : 'no_locations_in_viewport',
     });
   }
 }
@@ -804,8 +783,7 @@ async function boot() {
   await refreshData('boot');
 
   const locationCount = Array.isArray(dataState.latest.locations?.locations) ? dataState.latest.locations.locations.length : 0;
-  const fishCount = Array.isArray(dataState.latest.fish?.items) ? dataState.latest.fish.items.length : 0;
-  showStatus(`Ready • ${locationCount} CSV locations • ${fishCount} fish intel points`);
+  showStatus(`Ready • ${locationCount} CSV locations`);
   startLivePolling();
 
   window.addEventListener('beforeunload', teardownSteady, { once: true });

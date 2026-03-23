@@ -495,10 +495,7 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
 
   async function refresh() {
     if (!selected) return;
-    const isDerivedFish = selected?.entity_type === 'fish' || selected?.derived === true || selected?.marker_kind === 'fish_intelligence';
-    const loc = isDerivedFish
-      ? { ...selected, reports: [], name: selected?.name || 'Fish intelligence point' }
-      : await getJsonSafe(`/gfs/api/location/${encodeURIComponent(selected.id)}`, null);
+    const loc = await getJsonSafe(`/gfs/api/location/${encodeURIComponent(selected.id)}`, null);
     if (!loc) {
       el.statusLine.textContent = 'Location intelligence unavailable';
       return;
@@ -512,7 +509,7 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
     let [frame, vids, node] = await Promise.all([
       getJsonSafe(`/gfs/api/frame?bbox=${frameBox}&quality=full`, null),
       loadLocationVideos(selected.id),
-      isDerivedFish ? Promise.resolve(null) : getJsonSafe(`/gfs/api/intelligence/node/${encodeURIComponent(selected.id)}`, null),
+      getJsonSafe(`/gfs/api/intelligence/node/${encodeURIComponent(selected.id)}`, null),
     ]);
 
     let wx = frame?.weather || null;
@@ -528,13 +525,13 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
 
     el.waterbody.textContent = profile?.waterbody
       ? `${profile.waterbody} • ${profile.headline_species}`
-      : (isDerivedFish ? 'Derived fish intelligence point • shared-ocean model' : 'Habitat lens pending');
+      : 'Curated CSV location marker • fishloclist.csv';
     el.positioning.textContent = [
       profile?.matched_zone ? `Zone ${profile.matched_zone}` : null,
       profile?.classification_method ? `Classifier ${profile.classification_method}` : null,
       Number.isFinite(Number(profile?.coast_distance_deg)) ? `Coast ${ (Number(profile.coast_distance_deg) * 60).toFixed(1) } nm` : null,
     ].filter(Boolean).join(' • ') || 'Marker wiring pending';
-    el.statusLine.textContent = `${isDerivedFish ? 'Derived intelligence' : 'CSV truth marker'} • ${scoreText(intel.opportunityScore)} setup • ${trendText(intel.opportunityScore, intel.baitState, intel.frontCount, intel.boilCount)} trend • ${safetyLabel(intel.safetyScore)} boating`;
+    el.statusLine.textContent = `CSV truth marker • ${scoreText(intel.opportunityScore)} setup • ${trendText(intel.opportunityScore, intel.baitState, intel.frontCount, intel.boilCount)} trend • ${safetyLabel(intel.safetyScore)} boating`;
     el.opportunityScore.textContent = `${Math.round(intel.opportunityScore)}%`;
     updateMeter(el.opportunityFill, intel.opportunityScore);
     el.confidence.textContent = `${confidenceLabel(intel.confidenceScore)} confidence • ${Math.round(intel.confidenceScore)}%`;

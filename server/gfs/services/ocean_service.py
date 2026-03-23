@@ -50,16 +50,20 @@ class OceanService:
         currents_started = time.time()
         currents = self.rtofs.fetch(weather, viewport.as_dict())
         currents_status = dict(getattr(self.rtofs, "last_status", {}) or {})
+        currents_status["primary"] = "rtofs"
+        currents_status["fallback"] = "hycom"
         if currents is None:
             currents = self.hycom.fetch(weather, viewport.as_dict())
             currents_status["selected_source"] = currents.get("source") if isinstance(currents, dict) else "none"
-            currents_status["degraded"] = True
-            currents_status.setdefault("reason", "missing_weather_vectors")
+            currents_status["degraded"] = bool(currents is None) or bool((currents or {}).get("degraded"))
+            currents_status.setdefault("reason", "rtofs_unavailable")
         if currents is None:
             currents = self._ekman_from_weather(weather)
             currents_status["selected_source"] = currents.get("source")
             currents_status["degraded"] = True
             currents_status.setdefault("reason", "fallback_to_ekman")
+        else:
+            currents_status["selected_source"] = currents.get("source")
         log.info("currents source=%s degraded=%s", currents.get("source"), currents.get("degraded"))
         currents_ms = (time.time() - currents_started) * 1000
 

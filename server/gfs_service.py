@@ -12,6 +12,7 @@ import re
 import time
 import threading
 import logging
+import resource
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -765,9 +766,38 @@ class GFSService:
         self._decode_cache: Dict[str, Dict[str, Any]] = {}
         self._weather_payload_cache: Dict[str, Any] = {"ts": 0, "payload": None}
         self._weather_fast_cache: Dict[str, Any] = {"ts": 0, "payload": None}
+        self._weather_refresh_inflight = False
+        self._weather_refresh_last_started_ms = 0
+        self._weather_refresh_last_completed_ms = 0
+        self._weather_refresh_failures = 0
+        self._cloud_payload_cache: Dict[str, Any] = {"ts": 0, "payload": None}
+        self._cloud_refresh_lock = threading.Lock()
+        self._cloud_refresh_inflight = False
+        self._cloud_refresh_last_started_ms = 0
+        self._cloud_refresh_last_completed_ms = 0
+        self._cloud_refresh_failures = 0
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
+
+    def _rss_mb(self) -> float:
+        try:
+            rss_kb = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0.0)
+            if rss_kb <= 0:
+                return 0.0
+            # Linux reports ru_maxrss in KiB.
+            return round(rss_kb / 1024.0, 2)
+        except Exception:
+            return 0.0
+
+    def _perf_log(self, stage: str, started: float, **fields: Any) -> None:
+        payload = {
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "rss_mb": self._rss_mb(),
+        }
+        payload.update(fields)
+        joined = " ".join(f"{k}={payload[k]}" for k in sorted(payload))
+        log.info("[gfs-perf] %s %s", stage, joined)
 
     def _default_bbox(self) -> dict[str, float]:
         return {"west": -180.0, "south": -80.0, "east": 180.0, "north": 80.0}
@@ -2903,6 +2933,7 @@ class GFSService:
         return preferred
 
     def _derive_real_hazard_payloads(self, groups: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
         warned: set[str] = set()
         hazard_inputs = fields.get("hazard_inputs") if isinstance(fields.get("hazard_inputs"), dict) else {}
         precip = np.asarray(hazard_inputs.get("precip", fields["precip"]), dtype=float)
@@ -2948,13 +2979,23 @@ class GFSService:
         rain_polys = self.connected_components_or_simple_cell_polygons(rain_mask, lat2d, lon2d)
         hail_polys = self.connected_components_or_simple_cell_polygons(hail_mask, lat2d, lon2d)
         lightning_polys = self.connected_components_or_simple_cell_polygons(lightning_mask, lat2d, lon2d)
-        return {
+        out = {
             "rain": self.serialize_rain_payload(rain_polys),
             "hail": self.serialize_hail_payload(hail_polys),
             "lightning": self.serialize_lightning_payload(lightning_polys),
         }
+        self._perf_log(
+            "hazard_canonicalization",
+            started,
+            canonical_shape=f"{canonical_shape[0]}x{canonical_shape[1]}",
+            rain_polygons=len(rain_polys),
+            hail_polygons=len(hail_polys),
+            lightning_polygons=len(lightning_polys),
+        )
+        return out
 
     def generate_real_gfs_payload(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
         bbox = self._normalize_bbox(bbox)
         ingest = self.ingest_latest_model_fields(bbox)
         fetch = ingest["fetch"]
@@ -2994,6 +3035,16 @@ class GFSService:
                 "decode_backend": self.state.decode_backend,
                 "data_source_mode": self.state.data_source_mode,
             }
+            self._perf_log(
+                "weather_canonicalization",
+                started,
+                mode=mode,
+                grid_shape=str(payload.get("grid_shape")),
+                tile_count=len(payload.get("tiles") or []),
+                rain_count=int((payload.get("rain") or {}).get("count") or 0),
+                hail_count=int((payload.get("hail") or {}).get("count") or 0),
+                lightning_count=int((payload.get("lightning") or {}).get("count") or 0),
+            )
             return self._annotate_weather_payload(
                 payload,
                 bbox=bbox,
@@ -3115,6 +3166,52 @@ class GFSService:
             fb["data_source"] = "synthetic_fallback"
             return fb
 
+    def _refresh_weather_cache(self, refresh_bbox: dict[str, float], *, trigger: str = "unknown") -> None:
+        started = time.perf_counter()
+        self._weather_refresh_last_started_ms = self._now_ms()
+        try:
+            payload = self._generate_weather_payload_uncached(refresh_bbox)
+            now_ms = self._now_ms()
+            prev_ts = int((self._weather_payload_cache or {}).get("ts") or 0)
+            self._weather_payload_cache = {"ts": now_ms, "payload": payload}
+            self._weather_fast_cache = {"ts": now_ms, "payload": payload}
+            self._weather_refresh_last_completed_ms = now_ms
+            self._perf_log(
+                "weather_refresh",
+                started,
+                trigger=trigger,
+                payload_state=str(payload.get("payload_state") or "unknown"),
+                source=str(payload.get("source") or "unknown"),
+                failures=self._weather_refresh_failures,
+                cache_replaced=bool(prev_ts > 0),
+            )
+        except Exception as exc:
+            self._weather_refresh_failures += 1
+            self._perf_log("weather_refresh_failed", started, trigger=trigger, failures=self._weather_refresh_failures, error=str(exc))
+        finally:
+            self._weather_refresh_inflight = False
+            try:
+                self._weather_refresh_lock.release()
+            except RuntimeError:
+                pass
+
+    def _start_weather_refresh_async(self, refresh_bbox: dict[str, float], *, trigger: str = "unknown") -> bool:
+        now_ms = self._now_ms()
+        if self._weather_refresh_inflight:
+            return False
+        if (now_ms - int(self._weather_refresh_last_started_ms or 0)) < 12_000:
+            return False
+        if not self._weather_refresh_lock.acquire(blocking=False):
+            return False
+        self._weather_refresh_inflight = True
+        try:
+            threading.Thread(target=self._refresh_weather_cache, args=(refresh_bbox,), kwargs={"trigger": trigger}, daemon=True).start()
+            return True
+        except Exception:
+            self._weather_refresh_inflight = False
+            self._weather_refresh_lock.release()
+            raise
+
     def generate_weather_payload(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
         refresh_bbox = self._default_bbox()
         ttl_ms = max(10_000, WEATHER_REFRESH_TTL_SECONDS * 1000)
@@ -3124,26 +3221,17 @@ class GFSService:
         cached_ts = int(row.get("ts") or 0)
         if cached_payload and (now_ms - cached_ts) <= ttl_ms:
             return cached_payload
-
-        if not self._weather_refresh_lock.acquire(blocking=False):
-            if cached_payload:
-                return cached_payload
-            with self._weather_refresh_lock:
-                pass
-            row = self._weather_payload_cache or {}
-            if isinstance(row.get("payload"), dict):
-                return row["payload"]
-
-        try:
-            payload = self._generate_weather_payload_uncached(refresh_bbox)
-            self._weather_payload_cache = {"ts": self._now_ms(), "payload": payload}
-            return payload
-        except Exception:
-            if cached_payload:
-                return cached_payload
-            raise
-        finally:
-            self._weather_refresh_lock.release()
+        self._start_weather_refresh_async(refresh_bbox, trigger="generate_weather_payload")
+        if cached_payload:
+            out = dict(cached_payload)
+            out["stale"] = True
+            out["refresh_in_progress"] = bool(self._weather_refresh_inflight)
+            return out
+        fallback = self.generate_weather_payload_fast(bbox)
+        fallback = dict(fallback)
+        fallback["stale"] = True
+        fallback["refresh_in_progress"] = True
+        return fallback
 
     def generate_weather_payload_fast(self, bbox: dict[str, float] | None = None, *, max_stale_seconds: int = 21_600) -> dict[str, Any]:
         """Non-blocking weather payload path for latency-sensitive API handlers.
@@ -3158,6 +3246,8 @@ class GFSService:
         fast_payload = fast_row.get("payload") if isinstance(fast_row.get("payload"), dict) else None
         fast_ts = int(fast_row.get("ts") or 0)
         if fast_payload and fast_ts > 0 and (self._now_ms() - fast_ts) <= int(max_stale_seconds * 1000):
+            if (self._now_ms() - fast_ts) > max(10_000, WEATHER_REFRESH_TTL_SECONDS * 1000):
+                self._start_weather_refresh_async(self._default_bbox(), trigger="fast_cache_stale")
             return fast_payload
         row = self._weather_payload_cache or {}
         cached_payload = row.get("payload") if isinstance(row.get("payload"), dict) else None
@@ -3184,6 +3274,7 @@ class GFSService:
             "balloons": {"items": [], "count": 0},
         }
         self._weather_fast_cache = {"ts": self._now_ms(), "payload": fallback}
+        self._start_weather_refresh_async(self._default_bbox(), trigger="fast_fallback")
         return fallback
 
     def debug_real_gfs_cycle(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
@@ -3601,8 +3692,10 @@ class GFSService:
             "bbox_used": bbox,
         }
 
-    def cloud_tiles_payload(self, bbox: dict[str, float] | None = None) -> Dict[str, Any]:
-        bbox_norm = self._normalize_bbox(bbox)
+    def _build_cloud_tiles_payload(self, bbox_norm: dict[str, float]) -> Dict[str, Any]:
+        started = time.perf_counter()
+        cloud_started = time.perf_counter()
+        bbox_norm = self._normalize_bbox(bbox_norm)
         try:
             weather = self.generate_weather_payload(bbox_norm)
         except Exception as exc:
@@ -3640,16 +3733,100 @@ class GFSService:
                 payload.setdefault("precip_columns", self.derive_precip_columns_from_tiles(payload.get("items", []), max_items=260))
                 payload.setdefault("lightning_events", self.derive_lightning_events_from_tiles(payload.get("items", []), max_items=140))
 
+            self._perf_log(
+                "cloud_canonicalization",
+                cloud_started,
+                bbox=f"{round(bbox_norm['west'],2)},{round(bbox_norm['south'],2)},{round(bbox_norm['east'],2)},{round(bbox_norm['north'],2)}",
+                source=str(payload.get("source") or "unknown"),
+                payload_state=str(payload.get("payload_state") or "unknown"),
+                item_count=len(payload.get("items") or []),
+            )
+            scene_started = time.perf_counter()
             scene_payload = self.build_scene_payload(payload, bbox_norm)
             payload["status"] = scene_payload.get("status", {})
             payload["meta"] = scene_payload.get("meta", {})
             payload["scene"] = scene_payload.get("scene", {})
             payload["summary"] = scene_payload.get("summary", payload.get("summary") or {})
             payload["ok"] = bool(payload.get("ok", True) and payload["status"].get("ok", True))
+            self._perf_log(
+                "cloud_scene_assembly",
+                scene_started,
+                cloud_count=len((payload.get("scene") or {}).get("clouds") or []),
+                precip_count=len(payload.get("precip_columns") or []),
+                lightning_count=len(payload.get("lightning_events") or []),
+            )
+            self._perf_log("cloud_payload_total", started, ok=bool(payload.get("ok", True)))
             return payload
         except Exception as exc:
             log.exception("[gfs] scene payload assembly failed")
             return self._degraded_scene_payload(bbox_norm, str(exc))
+
+    def _refresh_cloud_cache(self, bbox_norm: dict[str, float], *, trigger: str = "unknown") -> None:
+        started = time.perf_counter()
+        self._cloud_refresh_last_started_ms = self._now_ms()
+        try:
+            payload = self._build_cloud_tiles_payload(bbox_norm)
+            now_ms = self._now_ms()
+            prev_ts = int((self._cloud_payload_cache or {}).get("ts") or 0)
+            self._cloud_payload_cache = {"ts": now_ms, "payload": payload}
+            self.state.scene_cache = payload
+            self.state.scene_cache_ts = now_ms
+            self._cloud_refresh_last_completed_ms = now_ms
+            self._perf_log(
+                "cloud_refresh",
+                started,
+                trigger=trigger,
+                ok=bool(payload.get("ok", False)),
+                failures=self._cloud_refresh_failures,
+                cache_replaced=bool(prev_ts > 0),
+            )
+        except Exception as exc:
+            self._cloud_refresh_failures += 1
+            self._perf_log("cloud_refresh_failed", started, trigger=trigger, failures=self._cloud_refresh_failures, error=str(exc))
+        finally:
+            self._cloud_refresh_inflight = False
+            try:
+                self._cloud_refresh_lock.release()
+            except RuntimeError:
+                pass
+
+    def _start_cloud_refresh_async(self, bbox_norm: dict[str, float], *, trigger: str = "unknown") -> bool:
+        now_ms = self._now_ms()
+        if self._cloud_refresh_inflight:
+            return False
+        if (now_ms - int(self._cloud_refresh_last_started_ms or 0)) < 10_000:
+            return False
+        if not self._cloud_refresh_lock.acquire(blocking=False):
+            return False
+        self._cloud_refresh_inflight = True
+        try:
+            threading.Thread(target=self._refresh_cloud_cache, args=(bbox_norm,), kwargs={"trigger": trigger}, daemon=True).start()
+            return True
+        except Exception:
+            self._cloud_refresh_inflight = False
+            self._cloud_refresh_lock.release()
+            raise
+
+    def cloud_tiles_payload(self, bbox: dict[str, float] | None = None) -> Dict[str, Any]:
+        bbox_norm = self._normalize_bbox(bbox)
+        ttl_ms = max(10_000, SCENE_REFRESH_TTL_SECONDS * 1000)
+        now_ms = self._now_ms()
+        row = self._cloud_payload_cache or {}
+        cached = row.get("payload") if isinstance(row.get("payload"), dict) else None
+        ts = int(row.get("ts") or 0)
+        if cached and (now_ms - ts) <= ttl_ms:
+            out = dict(cached)
+            out["refresh_in_progress"] = bool(self._cloud_refresh_inflight)
+            return out
+        self._start_cloud_refresh_async(bbox_norm, trigger="cloud_tiles_payload")
+        if cached:
+            out = dict(cached)
+            out["stale"] = True
+            out["refresh_in_progress"] = bool(self._cloud_refresh_inflight)
+            return out
+        fallback = self._degraded_scene_payload(bbox_norm, "cloud_refresh_pending")
+        fallback["refresh_in_progress"] = True
+        return fallback
 
 
     def _tile_bounds_xyz(self, z: int, x: int, y: int) -> dict[str, float]:
@@ -3871,32 +4048,25 @@ class GFSService:
             diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
             return row["payload"], diag
 
-        if not self._scene_refresh_lock.acquire(blocking=False):
-            if isinstance(row.get("payload"), dict):
-                diag["cache_hit"] = True
-                diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
-                return row["payload"], diag
-            with self._scene_refresh_lock:
-                pass
-            row = self.state.tile_cache.get(key) or {}
-            if isinstance(row.get("payload"), dict):
-                diag["cache_hit"] = True
-                diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
-                return row["payload"], diag
+        if isinstance(row.get("payload"), dict):
+            diag["cache_hit"] = True
+            diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
+            self._start_cloud_refresh_async(bbox, trigger="scene_cache_stale")
+            return row["payload"], diag
 
-        started = time.perf_counter()
-        try:
-            payload = self.cloud_tiles_payload(bbox)
-        except Exception as exc:
-            log.exception("[gfs] cached scene generation failed")
-            payload = self._degraded_scene_payload(bbox, str(exc))
-        finally:
-            self._scene_refresh_lock.release()
+        self._start_cloud_refresh_async(bbox, trigger="scene_cache_miss")
+        cloud_row = self._cloud_payload_cache or {}
+        if isinstance(cloud_row.get("payload"), dict):
+            payload = cloud_row["payload"]
+            diag["cache_hit"] = True
+            diag["cache_age_ms"] = now_ms - int(cloud_row.get("ts") or 0)
+        else:
+            started = time.perf_counter()
+            payload = self._degraded_scene_payload(bbox, "scene_refresh_pending")
+            diag["build_duration_ms"] = int((time.perf_counter() - started) * 1000)
+            return payload, diag
 
-        diag["build_duration_ms"] = int((time.perf_counter() - started) * 1000)
         self.state.tile_cache[key] = {"ts": now_ms, "payload": payload}
-        self.state.scene_cache = payload
-        self.state.scene_cache_ts = now_ms
         try:
             self._build_layer_feature_indexes(payload)
         except Exception:

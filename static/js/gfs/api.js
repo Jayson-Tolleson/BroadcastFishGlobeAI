@@ -19,6 +19,18 @@ function isExpectedEntity(payload, expectedType, expectedDerived) {
 }
 
 function normalizeLocationsPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return {
+      ok: false,
+      entity_type: 'location_markers',
+      derived: false,
+      source: 'unavailable',
+      locations: [],
+      count: 0,
+      error: 'locations_unavailable',
+      contract_mismatch: false,
+    };
+  }
   if (isExpectedEntity(payload, 'location_markers', false)) {
     const locations = Array.isArray(payload?.locations) ? payload.locations : [];
     console.info('[gfs/api] normalize locations', { endpoint: '/gfs/api/locations', entity_type: payload.entity_type, derived: payload.derived, received: locations.length, accepted: locations.length });
@@ -67,6 +79,17 @@ function normalizeFishPayload(payload) {
 }
 
 export function normalizeOceanPayload(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return {
+      ok: false,
+      source: 'shared_ocean',
+      degraded: true,
+      fields: {},
+      cache: 'missing',
+      error: 'ocean_unavailable',
+      contract_mismatch: false,
+    };
+  }
   if (payload && typeof payload === 'object' && String(payload.source || '') === 'shared_ocean') return payload;
   warn('ocean payload contract mismatch', { source: payload?.source });
   return {
@@ -389,7 +412,7 @@ export async function fetchOceanState(viewport, options = {}) {
 export async function fetchLocations(viewport, options = {}) {
   const merged = { timeoutMs: 2500, abortPrevious: false, ...options };
   console.info('[gfs/api] fetch', { endpoint: '/gfs/api/locations', viewport });
-  const payload = await getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, locations: [] }, merged);
+  const payload = await getJsonSafe(`/gfs/api/locations?${viewportQuery(viewport)}`, { ok: false, entity_type: 'location_markers', derived: false, source: 'unavailable', locations: [] }, merged);
   return normalizeLocationsPayload(payload);
 }
 

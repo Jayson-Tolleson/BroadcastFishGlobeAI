@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchLocationLive, fetchLocations, getGfsWebSocketUrl, normalizeOceanPayload } from './api.js';
+import { getJsonSafe, uploadSafe, fetchLocationLive, fetchLocations, fetchOceanState, getGfsWebSocketUrl, normalizeOceanPayload } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -129,17 +129,21 @@ const dataState = {
     baitBase: null,
     baitAdvanced: null,
     boats: null,
+    ocean: null,
     locations: null,
   },
 };
 
 const viewportRefresh = {
   restDebounceMs: 400,
-  refreshMs: 15000,
+  frameRefreshMs: 15000,
+  oceanRefreshMs: 60000,
   restTimer: 0,
-  refreshTimer: 0,
+  frameRefreshTimer: 0,
+  oceanRefreshTimer: 0,
   isMoving: false,
   lastIdleSignature: '',
+  lastOceanSignature: '',
 };
 
 window.__gfsDataInduction = {
@@ -403,7 +407,7 @@ async function refreshData(reason = 'manual') {
         renderMarkerSets('steady');
       })
       .catch((err) => console.info('[gfs locations] deferred fetch failed', err?.message || err));
-    const ocean = normalizeOceanPayload(frame?.ocean);
+    const ocean = normalizeOceanPayload(dataState.latest.ocean || frame?.ocean || null);
     const locationsPayload = dataState.latest.locations || { locations: [] };
     console.info('[gfs markers] endpoint hit', {
       endpoint: '/gfs/api/locations',
@@ -412,7 +416,7 @@ async function refreshData(reason = 'manual') {
       contract_mismatch: Boolean(locationsPayload?.contract_mismatch),
       rejection_reason: locationsPayload?.contract_mismatch ? 'locations_contract_mismatch' : null,
     });
-    if (frame && ocean) frame.ocean = ocean;
+    if (frame) frame.ocean = ocean;
     const normalizedFrame = normalizeFramePayload(frame);
     if (!ocean) gfsState.setStaleHold('ocean payload unavailable; holding prior ocean metadata');
     if (!normalizedFrame) { gfsState.debugHoldReason = 'frame missing/invalid; held previous visuals'; return dataState.latest; }
@@ -424,6 +428,7 @@ async function refreshData(reason = 'manual') {
     dataState.latest.baitAdvanced = preferStableBaitAdvanced(normalizedFrame.baitAdvanced || null, dataState.latest.baitAdvanced || null);
     normalizedFrame.baitAdvanced = dataState.latest.baitAdvanced;
     dataState.latest.boats = normalizedFrame.boats || { boats: [] };
+    dataState.latest.ocean = ocean || dataState.latest.ocean || null;
     dataState.latest.recursiveGrid = normalizedFrame.recursiveGrid || null;
     dataState.latest.locations = locationsPayload || { locations: [] };
     gfsState.setCache('locations', locationsPayload || null);
@@ -471,6 +476,46 @@ async function refreshData(reason = 'manual') {
   } finally {
     if (dataState.activeAbort === controller) dataState.activeAbort = null;
     if (generation === dataState.latestGeneration) dataState.inFlight = false;
+  }
+}
+
+let oceanGeneration = 0;
+let oceanInFlight = false;
+async function refreshOceanData(reason = 'steady') {
+  if (oceanInFlight) return dataState.latest.ocean || null;
+  const viewport = getCanonicalViewport();
+  const signature = bboxSignature(viewport);
+  if (signature === viewportRefresh.lastOceanSignature && reason !== 'boot' && reason !== 'steady') return dataState.latest.ocean || null;
+  viewportRefresh.lastOceanSignature = signature;
+  oceanInFlight = true;
+  const myGen = ++oceanGeneration;
+  try {
+    const payload = await fetchOceanState(viewport, { timeoutMs: 4500, abortPrevious: true });
+    if (myGen !== oceanGeneration) return dataState.latest.ocean || null;
+    if (payload && payload.contract_mismatch) {
+      console.warn('[gfs ocean] contract mismatch', { reason, source: payload?.source });
+      return dataState.latest.ocean || null;
+    }
+    if (payload && payload.ok !== false) {
+      dataState.latest.ocean = payload;
+      if (dataState.latest.frame) {
+        dataState.latest.frame.ocean = payload;
+        gfsState.setFrame(dataState.latest.frame, viewport);
+      }
+      console.info('[gfs ocean] refreshed', { reason, degraded: payload?.degraded, source_status: payload?.source_status });
+    }
+    return dataState.latest.ocean || null;
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      console.info('[gfs ocean] request aborted');
+    } else if (String(err?.message || '').toLowerCase().includes('timeout')) {
+      console.warn('[gfs ocean] request timeout');
+    } else {
+      console.warn('[gfs ocean] request failed', err?.message || err);
+    }
+    return dataState.latest.ocean || null;
+  } finally {
+    if (myGen === oceanGeneration) oceanInFlight = false;
   }
 }
 
@@ -545,16 +590,24 @@ function installSteadyRefresh() {
     viewportRefresh.restTimer = 0;
   };
   const clearRefreshTimer = () => {
-    if (!viewportRefresh.refreshTimer) return;
-    clearInterval(viewportRefresh.refreshTimer);
-    viewportRefresh.refreshTimer = 0;
+    if (viewportRefresh.frameRefreshTimer) {
+      clearInterval(viewportRefresh.frameRefreshTimer);
+      viewportRefresh.frameRefreshTimer = 0;
+    }
+    if (viewportRefresh.oceanRefreshTimer) {
+      clearInterval(viewportRefresh.oceanRefreshTimer);
+      viewportRefresh.oceanRefreshTimer = 0;
+    }
   };
   const scheduleIdleRefresh = () => {
-    clearRefreshTimer();
-    viewportRefresh.refreshTimer = setInterval(() => {
+    if (!viewportRefresh.frameRefreshTimer) viewportRefresh.frameRefreshTimer = setInterval(() => {
       if (viewportRefresh.isMoving || dataState.inFlight) return;
       refreshData('steady');
-    }, viewportRefresh.refreshMs);
+    }, viewportRefresh.frameRefreshMs);
+    if (!viewportRefresh.oceanRefreshTimer) viewportRefresh.oceanRefreshTimer = setInterval(() => {
+      if (viewportRefresh.isMoving || oceanInFlight) return;
+      refreshOceanData('steady');
+    }, viewportRefresh.oceanRefreshMs);
   };
   const triggerRestFetch = () => {
     if (viewportRefresh.isMoving) return;
@@ -562,6 +615,7 @@ function installSteadyRefresh() {
     if (signature === viewportRefresh.lastIdleSignature && !dataState.inFlight) return;
     viewportRefresh.lastIdleSignature = signature;
     refreshData('steady');
+    refreshOceanData('steady');
     scheduleIdleRefresh();
   };
   const onMove = () => {
@@ -821,6 +875,7 @@ async function boot() {
   const teardownHoverHud = installHoverHud();
 
   await refreshData('boot');
+  await refreshOceanData('boot');
 
   const locationCount = Array.isArray(dataState.latest.locations?.locations) ? dataState.latest.locations.locations.length : 0;
   showStatus(`Ready • ${locationCount} CSV locations`);

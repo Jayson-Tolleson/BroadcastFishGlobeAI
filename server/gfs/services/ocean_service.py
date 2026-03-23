@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any
 
 from server.gfs.canonical import build_canonical_grid, vector_speed
@@ -20,9 +21,31 @@ class OceanService:
         self.waves = WavewatchWavesProvider()
         self.depth = BathymetryProvider()
         self._chl_last_good: list[list[float]] | None = None
+        self.provider_budgets_ms = {
+            "hycom": 2400,
+            "coastwatch": 2000,
+            "wavewatch": 1600,
+            "bathymetry": 600,
+        }
 
     def _empty_grid(self, rows: int, cols: int) -> list[list[float]]:
         return [[float("nan") for _ in range(cols)] for _ in range(rows)]
+
+    def _run_with_budget(self, name: str, fn, default):
+        budget_ms = int(self.provider_budgets_ms.get(name, 1500))
+        started = time.time()
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(fn)
+            try:
+                out = fut.result(timeout=max(0.1, budget_ms / 1000.0))
+                return out, (time.time() - started) * 1000, False
+            except FutureTimeout:
+                fut.cancel()
+                log.warning("[gfs/ocean] provider timeout name=%s budget_ms=%s", name, budget_ms)
+                return default, (time.time() - started) * 1000, True
+            except Exception as exc:
+                log.warning("[gfs/ocean] provider failed name=%s err=%s", name, exc)
+                return default, (time.time() - started) * 1000, True
 
     def build_shared_state(self, viewport, weather: dict[str, Any]) -> dict[str, Any]:
         started = time.time()
@@ -30,8 +53,11 @@ class OceanService:
         log.info("canonical grid rows=%s cols=%s cell_deg=%s", grid.rows, grid.cols, grid.cell_deg)
         log.info("[gfs/source-policy] currents=hycom chlorophyll=coastwatch waves=wavewatch bathymetry=bathymetry weather=ncss")
 
-        currents_started = time.time()
-        currents = self.hycom.fetch(weather, viewport.as_dict())
+        currents, currents_ms, currents_timed_out = self._run_with_budget(
+            "hycom",
+            lambda: self.hycom.fetch(weather, viewport.as_dict()),
+            None,
+        )
         currents_status = {"primary": "hycom", "selected_source": (currents or {}).get("source") if isinstance(currents, dict) else "none"}
         if currents is None:
             currents = {"u": self._empty_grid(grid.rows, grid.cols), "v": self._empty_grid(grid.rows, grid.cols), "source": "hycom", "degraded": True, "ok": False, "source_status": "unavailable"}
@@ -42,10 +68,14 @@ class OceanService:
             currents["ok"] = True
             currents.setdefault("source_status", "available")
         log.info("currents source=%s source_status=%s degraded=%s", currents.get("source"), currents.get("source_status"), currents.get("degraded"))
-        currents_ms = (time.time() - currents_started) * 1000
+        if currents_timed_out:
+            currents_status["reason"] = "hycom_timeout_or_error"
 
-        chl_started = time.time()
-        chlorophyll = self.chl.fetch(weather, viewport.as_dict())
+        chlorophyll, chl_ms, chl_timed_out = self._run_with_budget(
+            "coastwatch",
+            lambda: self.chl.fetch(weather, viewport.as_dict()),
+            None,
+        )
         chl_source = "coastwatch"
         if chlorophyll is None and self._chl_last_good is not None:
             chlorophyll = self._chl_last_good
@@ -63,10 +93,15 @@ class OceanService:
         if chlorophyll and chl_source == "coastwatch":
             self._chl_last_good = chlorophyll
         log.info("chlorophyll source=%s source_status=%s", chl_source, chl_source_status)
-        chl_ms = (time.time() - chl_started) * 1000
+        if chl_timed_out and chl_source == "coastwatch":
+            chl_source = "timeout"
+            chl_source_status = "timeout"
 
-        waves_started = time.time()
-        waves = self.waves.fetch(weather, viewport.as_dict())
+        waves, waves_ms, waves_timed_out = self._run_with_budget(
+            "wavewatch",
+            lambda: self.waves.fetch(weather, viewport.as_dict()),
+            None,
+        )
         wave_ok = isinstance(waves, dict) and isinstance(waves.get("height_m"), list)
         if not wave_ok:
             waves = {"height_m": self._empty_grid(grid.rows, grid.cols), "period_s": self._empty_grid(grid.rows, grid.cols), "direction_deg": self._empty_grid(grid.rows, grid.cols), "source": "wavewatch", "source_status": "unavailable", "ok": False}
@@ -74,10 +109,13 @@ class OceanService:
             waves.setdefault("source", "wavewatch")
             waves.setdefault("source_status", "available")
             waves["ok"] = True
-        waves_ms = (time.time() - waves_started) * 1000
-        depth_started = time.time()
-        depth_grid, depth_degraded = self.depth.fetch(grid.rows, grid.cols, viewport.as_dict())
-        depth_ms = (time.time() - depth_started) * 1000
+        if waves_timed_out:
+            waves["source_status"] = "timeout"
+        (depth_grid, depth_degraded), depth_ms, depth_timed_out = self._run_with_budget(
+            "bathymetry",
+            lambda: self.depth.fetch(grid.rows, grid.cols, viewport.as_dict()),
+            (self._empty_grid(grid.rows, grid.cols), True),
+        )
         sst = self._empty_grid(grid.rows, grid.cols)
 
         speed: list[list[float]] = []
@@ -112,10 +150,22 @@ class OceanService:
                 "currents": bool(currents.get("degraded")),
                 "waves": not bool(waves.get("ok")),
                 "chlorophyll": chl_source != "coastwatch",
-                "depth": bool(depth_degraded),
+                "depth": bool(depth_degraded or depth_timed_out),
             },
             "diagnostics": {
                 "currents": currents_status,
+                "provider_ms": {
+                    "hycom": round(currents_ms, 2),
+                    "coastwatch": round(chl_ms, 2),
+                    "wavewatch": round(waves_ms, 2),
+                    "bathymetry": round(depth_ms, 2),
+                },
+                "provider_timeouts": {
+                    "hycom": bool(currents_timed_out),
+                    "coastwatch": bool(chl_timed_out),
+                    "wavewatch": bool(waves_timed_out),
+                    "bathymetry": bool(depth_timed_out),
+                },
             },
             "fields": {
                 "current_u": currents.get("u") or [],

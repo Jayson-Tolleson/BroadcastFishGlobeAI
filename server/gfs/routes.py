@@ -9,9 +9,28 @@ import time
 
 from quart import Blueprint, current_app, request, jsonify, send_file, websocket
 
-from server.gfs.viewport import parse_viewport_args
+from server.gfs.viewport import parse_viewport_args, canonicalize_viewport
 
 log = logging.getLogger("server.gfs.routes")
+
+
+def _ocean_stride_for_viewport(vp, args) -> int:
+    span = max(abs(float(vp.east) - float(vp.west)), abs(float(vp.north) - float(vp.south)))
+    range_hint = None
+    raw_viewport = args.get("viewport") if hasattr(args, "get") else None
+    if isinstance(raw_viewport, str) and raw_viewport.strip():
+        try:
+            obj = json.loads(raw_viewport)
+            range_hint = float(((obj.get("camera") or {}).get("range")))
+        except Exception:
+            range_hint = None
+    if span <= 8 and (range_hint is None or range_hint <= 900000):
+        return 1
+    if span <= 20 and (range_hint is None or range_hint <= 2200000):
+        return 2
+    if span <= 45:
+        return 3
+    return 4
 
 
 def _route_debug_start(route: str, vp, raw_query: str) -> float:
@@ -174,10 +193,13 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_ocean():
         started = time.time()
         vp = parse_viewport_args(request.args)
-        log.info("/gfs/api/ocean viewport=%s", vp.as_dict())
-        payload = gfs().shared_ocean_payload(vp.as_dict())
+        ocean_stride = _ocean_stride_for_viewport(vp, request.args)
+        ocean_vp = canonicalize_viewport({**vp.as_dict(), "stride": ocean_stride})
+        log.info("/gfs/api/ocean viewport=%s ocean_stride=%s", vp.as_dict(), ocean_stride)
+        payload = gfs().shared_ocean_payload(ocean_vp.as_dict())
         payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
-        log.info("/gfs/api/ocean latency_ms=%s", payload.get("latency_ms"))
+        payload["ocean_stride"] = ocean_stride
+        log.info("/gfs/api/ocean latency_ms=%s stride=%s degraded=%s", payload.get("latency_ms"), ocean_stride, payload.get("degraded"))
         return jsonify(payload)
 
     @bp.route("/api/weather")

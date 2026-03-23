@@ -186,13 +186,14 @@ class GfsEngine(GFSService):
 
     def _compact_cloud_payload_from_weather(self, weather: dict[str, Any], vp) -> dict[str, Any]:
         fields = weather.get("fields") if isinstance(weather.get("fields"), dict) else {}
-        low = self._to_2d_grid(fields.get("cloud_low"))
-        mid = self._to_2d_grid(fields.get("cloud_mid"))
-        high = self._to_2d_grid(fields.get("cloud_high"))
-        total = self._to_2d_grid(fields.get("cloud_total"))
-        wind_u = self._to_2d_grid(fields.get("wind_u"))
-        wind_v = self._to_2d_grid(fields.get("wind_v"))
-        grid_ref = total or low or mid or high
+        low = self._to_2d_grid(fields.get("cloud_low") or fields.get("cld_low") or fields.get("low_cloud") or fields.get("tcc_low"))
+        mid = self._to_2d_grid(fields.get("cloud_mid") or fields.get("cld_mid") or fields.get("mid_cloud") or fields.get("tcc_mid"))
+        high = self._to_2d_grid(fields.get("cloud_high") or fields.get("cld_high") or fields.get("high_cloud") or fields.get("tcc_high"))
+        total = self._to_2d_grid(fields.get("cloud_total") or fields.get("tcc") or fields.get("cloud_cover") or fields.get("total_cloud"))
+        wind_u = self._to_2d_grid(fields.get("wind_u") or fields.get("u10") or fields.get("ugrd"))
+        wind_v = self._to_2d_grid(fields.get("wind_v") or fields.get("v10") or fields.get("vgrd"))
+        precip = self._to_2d_grid(fields.get("precip_rate") or fields.get("prate"))
+        grid_ref = total or low or mid or high or precip or wind_u or wind_v
         ny = len(grid_ref)
         nx = len(grid_ref[0]) if ny and isinstance(grid_ref[0], list) else 0
         lats = [vp.south + ((i + 0.5) / max(1, ny)) * (vp.north - vp.south) for i in range(ny)] if ny else []
@@ -219,7 +220,7 @@ class GfsEngine(GFSService):
             },
             "count": ny * nx,
         }
-        log.info("[gfs clouds] compact payload built cells=%s payload_state=%s", payload["count"], payload.get("payload_state"))
+        log.info("[gfs clouds] compact payload built cells=%s ny=%s nx=%s payload_state=%s", payload["count"], ny, nx, payload.get("payload_state"))
         return payload
 
     def prewarm_startup(self) -> None:

@@ -832,7 +832,7 @@ class GFSService:
         out["heuristic"] = bool(heuristic)
         out["quality_note"] = quality_note
         out["confidence"] = confidence
-        out.setdefault("data_source", "live_gfs_0p25" if payload_state in {"live", "cached"} else "synthetic_fallback")
+        out.setdefault("data_source", "live_gfs_0p25" if payload_state in {"live", "cached"} else "unavailable")
         out.setdefault("used_fallback", payload_state not in {"live", "cached"})
         out.setdefault("fallback_reason", None)
         out.setdefault("canonical_shape", out.get("grid_shape"))
@@ -2627,7 +2627,7 @@ class GFSService:
             yy = np.linspace(-90.0, 90.0, canonical_ds_shape[0])
             xx = np.linspace(-180.0, 180.0, canonical_ds_shape[1])
             lat2d, lon2d = np.meshgrid(yy, xx, indexing="ij")
-            log.warning("[gfs] lat/lon shape mismatch; using canonical synthetic grid for processing only")
+            log.warning("[gfs] lat/lon shape mismatch; using canonical placeholder grid for processing only")
         low = self._downsample_2d(low_live, SCENE_DOWNSAMPLE_STRIDE)
         mid = self._downsample_2d(mid_live, SCENE_DOWNSAMPLE_STRIDE)
         high = self._downsample_2d(high_live, SCENE_DOWNSAMPLE_STRIDE)
@@ -3060,51 +3060,11 @@ class GFSService:
             gc.collect()
 
     def generate_fallback_payload(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
-        bbox = self._normalize_bbox(bbox)
-        cloud = self._legacy_cloud_tiles_payload()
-        cloud.update({
-            "source": "fallback_proxy",
-            "payload_state": "synthetic",
-            "cycle": cloud.get("cycle"),
-            "forecast_hour": cloud.get("forecast_hour"),
-            "valid_time": cloud.get("valid_time"),
-            "bbox_used": bbox,
-            "quality_note": "Synthetic fallback generated from heuristic cloud-state proxies; not direct observational truth.",
-            "confidence": "low",
-        })
-        cloud["rain"] = {"items": [], "count": 0}
-        cloud["hail"] = {"items": [], "count": 0}
-        cloud["lightning"] = {"items": [], "count": 0}
-        cloud["balloons"] = {"items": [], "count": 0}
-        cloud["decode_backend"] = "none"
-        cloud["data_source_mode"] = "heuristic"
-        cloud["fallback_offset_degrees"] = SYNTHETIC_FALLBACK_OFFSET_DEGREES
-        cloud["layer_sources"] = {"clouds": "synthetic_fallback", "rain": "synthetic_fallback", "hail": "synthetic_fallback", "lightning": "synthetic_fallback", "wind": "synthetic_fallback"}
-        try:
-            for item in cloud.get("items") or cloud.get("tiles") or []:
-                if isinstance(item, dict):
-                    if "lat" in item:
-                        item["lat"] = float(item.get("lat", 0.0)) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-                    if "lon" in item:
-                        item["lon"] = float(item.get("lon", 0.0)) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-                    b = item.get("bounds")
-                    if isinstance(b, dict):
-                        for k in ("north", "south", "lat_center"):
-                            if k in b:
-                                b[k] = float(b[k]) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-                        for k in ("east", "west", "lon_center"):
-                            if k in b:
-                                b[k] = float(b[k]) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-        except Exception:
-            log.exception("[gfs] failed applying synthetic fallback offset")
-        return self._annotate_weather_payload(
-            cloud,
-            bbox=bbox,
-            source="fallback_proxy",
-            payload_state="synthetic",
-            heuristic=True,
-            quality_note=cloud["quality_note"],
-            confidence="low",
+        # Compatibility shim: historical callers should now receive explicit
+        # unavailability rather than fabricated weather.
+        return self._weather_unavailable_payload(
+            self._normalize_bbox(bbox),
+            reason="legacy_fallback_disabled",
         )
 
 
@@ -3231,7 +3191,7 @@ class GFSService:
         Order:
         1) in-memory fast cache (stale-while-refresh)
         2) in-memory live weather cache
-        3) explicit unavailable payload (no synthetic fallback)
+        3) explicit unavailable payload (no fabricated fallback)
         """
         bbox_norm = self._normalize_bbox(bbox)
         fast_row = self._weather_fast_cache or {}
@@ -3299,7 +3259,7 @@ class GFSService:
     def compare_fallback_vs_real(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
         """Manual comparison helper between fallback and real precipitation/cloud outputs."""
         real = self.generate_weather_payload(bbox)
-        fb = self.generate_fallback_payload(bbox)
+        fb = self._weather_unavailable_payload(self._normalize_bbox(bbox), reason="compare_fallback_disabled")
         return {
             "real_source": real.get("source"),
             "real_tiles": len(real.get("tiles") or real.get("items") or []),
@@ -3574,25 +3534,25 @@ class GFSService:
         if fish_error:
             warnings.append("fish_source_unavailable")
 
-        heuristic_flag = bool(weather.get("heuristic", True) or weather.get("payload_state") != "live")
+        heuristic_flag = bool(weather.get("heuristic", False) or weather.get("payload_state") != "live")
         status = {
             "ok": len(errors) == 0,
-            "mode": str(weather.get("payload_state") or "synthetic"),
+            "mode": str(weather.get("payload_state") or "unavailable"),
             "warnings": warnings,
             "errors": errors,
             "upstream_available": weather.get("source") == "gfs_nomads",
             "partial": bool(warnings),
             "generated_at": self._now_ms(),
             "request_bounds": bbox,
-            "fallback_active": str(weather.get("payload_state") or "synthetic") != "live",
+            "fallback_active": str(weather.get("payload_state") or "unavailable") != "live",
             "heuristic_dominant": heuristic_flag,
             "decode_backend": weather.get("decode_backend") or self.state.decode_backend,
             "data_source_mode": weather.get("data_source_mode") or self.state.data_source_mode,
         }
         meta = {
             "schema_version": "atmo-scene-v1",
-            "source_name": str(weather.get("source") or "fallback_proxy"),
-            "source_type": "model" if weather.get("source") == "gfs_nomads" else "heuristic",
+            "source_name": str(weather.get("source") or "ncss_weather"),
+            "source_type": "model" if weather.get("source") == "gfs_nomads" else "unavailable",
             "analysis_time": weather.get("cycle"),
             "valid_time": weather.get("valid_time"),
             "generated_at": self._now_ms(),
@@ -3607,7 +3567,7 @@ class GFSService:
             },
             "heuristic_flags": {
                 "scene_features_estimated": True,
-                "fallback_payload": str(weather.get("payload_state") or "synthetic") != "live",
+                "fallback_payload": str(weather.get("payload_state") or "unavailable") != "live",
                 "cloud_geometry_derived": True,
                 "precip_columns_derived": True,
                 "lightning_events_inferred": True,
@@ -3677,7 +3637,7 @@ class GFSService:
             "items": [],
             "precip_columns": [],
             "lightning_events": [],
-            "source": "fallback_proxy",
+            "source": "ncss_weather",
             "payload_state": "degraded",
             "heuristic": True,
             "quality_note": "Degraded scene payload due to internal derivation failure.",
@@ -3717,10 +3677,10 @@ class GFSService:
                 payload = self._annotate_weather_payload(
                     weather,
                     bbox=bbox_norm,
-                    source=str(weather.get("source") or "fallback_proxy"),
-                    payload_state=str(weather.get("payload_state") or "synthetic"),
-                    heuristic=bool(weather.get("heuristic", True)),
-                    quality_note=str(weather.get("quality_note") or "Synthetic weather fallback in use."),
+                    source=str(weather.get("source") or "ncss_weather"),
+                    payload_state=str(weather.get("payload_state") or "unavailable"),
+                    heuristic=bool(weather.get("heuristic", False)),
+                    quality_note=str(weather.get("quality_note") or "Weather unavailable; using explicit degraded scene payload."),
                     confidence=str(weather.get("confidence") or "low"),
                 )
                 payload.setdefault("precip_columns", self.derive_precip_columns_from_tiles(payload.get("items", []), max_items=260))

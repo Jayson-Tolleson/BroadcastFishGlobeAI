@@ -467,7 +467,7 @@ function toHudMarker(item) {
     ...item,
     id: String(item.id || item.location_key || `location_csv-${Number(item.lat).toFixed(4)}-${Number(item.lon).toFixed(4)}`),
     name: item.name || 'Fishing location',
-    entity_type: 'location',
+    entity_type: 'location_markers',
     derived: false,
     marker_kind: 'location_csv',
     source: item.source || 'fish_csv',

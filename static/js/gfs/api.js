@@ -19,7 +19,7 @@ function isExpectedEntity(payload, expectedType, expectedDerived) {
 }
 
 function normalizeLocationsPayload(payload) {
-  if (isExpectedEntity(payload, 'location', false)) {
+  if (isExpectedEntity(payload, 'location_markers', false)) {
     const locations = Array.isArray(payload?.locations) ? payload.locations : [];
     console.info('[gfs/api] normalize locations', { endpoint: '/gfs/api/locations', entity_type: payload.entity_type, derived: payload.derived, received: locations.length, accepted: locations.length });
     return payload;
@@ -32,7 +32,7 @@ function normalizeLocationsPayload(payload) {
   });
   return {
     ok: false,
-    entity_type: 'location',
+    entity_type: 'location_markers',
     derived: false,
     source: payload?.source || 'unknown',
     locations: [],
@@ -43,7 +43,7 @@ function normalizeLocationsPayload(payload) {
 }
 
 function normalizeFishPayload(payload) {
-  if (isExpectedEntity(payload, 'fish', true)) {
+  if (isExpectedEntity(payload, 'fish_intelligence', true)) {
     const items = Array.isArray(payload?.items) ? payload.items : [];
     console.info('[gfs/api] normalize fish', { endpoint: '/gfs/api/fish', entity_type: payload.entity_type, derived: payload.derived, received: items.length, accepted: items.length });
     return payload;
@@ -56,7 +56,7 @@ function normalizeFishPayload(payload) {
   });
   return {
     ok: false,
-    entity_type: 'fish',
+    entity_type: 'fish_intelligence',
     derived: true,
     source: payload?.source || 'unknown',
     items: [],

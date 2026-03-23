@@ -16,7 +16,7 @@ export class LayerEngine {
       boats: Array.isArray(payload?.boats?.boats) ? payload.boats.boats.length : 0,
       bait_polygons: Array.isArray(payload?.baitAdvanced?.bait?.polygons) ? payload.baitAdvanced.bait.polygons.length : 0,
     });
-    if (payload?.locations && payload?.entity_type === 'fish') {
+    if (payload?.locations && payload?.entity_type === 'fish_intelligence') {
       console.warn('[gfs layers] rejected mixed payload: fish entity carrying locations collection', { entity_type: payload?.entity_type, derived: payload?.derived });
       payload = { ...payload, locations: [] };
     }

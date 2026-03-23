@@ -4,6 +4,7 @@ import logging
 import math
 import threading
 import time
+import csv
 from dataclasses import dataclass
 from typing import Any
 
@@ -194,7 +195,7 @@ class GfsEngine(GFSService):
                 "sources": (self._cache.get(self._cache_key("ocean", vp)) or {}).get("sources"),
                 "warm": self._warm_ready,
                 "stale": False,
-                "entity_type": "fish",
+                "entity_type": "fish_intelligence",
                 "derived": True,
                 "cache": "hit",
             }
@@ -212,7 +213,7 @@ class GfsEngine(GFSService):
             "sources": ocean.get("sources"),
             "warm": self._warm_ready,
             "stale": False,
-            "entity_type": "fish",
+            "entity_type": "fish_intelligence",
             "derived": True,
             "cache": "miss",
         }
@@ -247,7 +248,7 @@ class GfsEngine(GFSService):
 
     def _csv_locations(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
-        points, err = self.load_fish()
+        points, err = self._read_csv_markers()
         items: list[dict[str, Any]] = []
         for item in points:
             if not isinstance(item, dict):
@@ -415,9 +416,55 @@ class GfsEngine(GFSService):
             "timestamp": int(time.time() * 1000),
             "ts": int(time.time() * 1000),
             "error": err,
-            "entity_type": "location",
+            "entity_type": "location_markers",
             "derived": False,
         }
+
+    def _read_csv_markers(self) -> tuple[list[dict[str, Any]], str | None]:
+        csv_path = self._fish_csv_path()
+        if not csv_path.exists():
+            return [], f"missing fish CSV: {csv_path}"
+        points: list[dict[str, Any]] = []
+        try:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                for i, row in enumerate(reader):
+                    if not row:
+                        continue
+                    lat_raw = row.get("lat") or row.get("latitude") or row.get("Lat") or row.get("Latitude")
+                    lon_raw = row.get("lon") or row.get("lng") or row.get("longitude") or row.get("Lon") or row.get("Longitude")
+                    if lat_raw is None or lon_raw is None:
+                        continue
+                    try:
+                        lat = float(str(lat_raw).strip())
+                        lon = float(str(lon_raw).strip())
+                    except Exception:
+                        continue
+                    name = (row.get("name") or row.get("location") or row.get("label") or f"Location {i + 1}").strip()
+                    location_key = self._normalize_location_key((row.get("location_key") or name or str(i + 1)))
+                    point = {
+                        "id": (row.get("id") or row.get("locationId") or str(i + 1)).strip(),
+                        "location_key": location_key or f"loc-{i+1}",
+                        "name": name,
+                        "lat": lat,
+                        "lon": lon,
+                        "meta": {
+                            k: v
+                            for k, v in row.items()
+                            if k
+                            not in {
+                                "lat", "latitude", "Lat", "Latitude",
+                                "lon", "lng", "longitude", "Lon", "Longitude",
+                                "name", "location", "label", "id", "locationId", "location_key",
+                            }
+                        },
+                    }
+                    # Attach sampled environment from locked real-source stack.
+                    point.update(self._build_bait_intel(point, self._now_ms()))
+                    points.append(point)
+            return points, None
+        except Exception as exc:
+            return [], f"failed to parse fish CSV: {exc}"
 
     def locations_fast(self, bbox: dict[str, float] | None, budget_ms: int = 1800) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
@@ -425,7 +472,7 @@ class GfsEngine(GFSService):
         key = self._cache_key("locations", vp)
         cached = self._cache.get(key)
         if cached:
-            return {"ok": True, "source": "fish_csv_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2), "entity_type": "location", "derived": False}
+            return {"ok": True, "source": "fish_csv_cache", "degraded": False, "warm": self._warm_ready, "stale": False, "fallback_reason": None, "items": cached.get("items") or [], "count": len(cached.get("items") or []), "timestamp": int(time.time() * 1000), "ts": cached.get("ts") or int(time.time() * 1000), "latency_ms": round((time.time() - started) * 1000, 2), "entity_type": "location_markers", "derived": False}
 
         payload = self._csv_locations(vp.as_dict())
         self._cache.set(key, {"items": payload.get("items") or [], "count": payload.get("count") or 0, "ts": payload.get("ts")})
@@ -524,7 +571,7 @@ class GfsEngine(GFSService):
         weather_ms = (time.time() - weather_started) * 1000
         clouds_started = time.time()
         payload_state = str(weather.get("payload_state") or "").lower()
-        if payload_state in {"synthetic", "degraded"}:
+        if payload_state in {"unavailable", "degraded"}:
             clouds = {"cloud_layers": [], "convective": {}, "stale": True, "source": "fast_degraded"}
         else:
             clouds = self.cloud_tiles_payload(vp.as_dict())
@@ -614,7 +661,7 @@ class GfsEngine(GFSService):
 
     def health_payload(self) -> dict[str, Any]:
         payload = super().health_payload()
-        csv = self.fish_payload()
+        csv, csv_err = self.load_fish()
         payload["websocket"] = {
             "gfs_route_registered": bool(self._gfs_ws_registered),
             "gfs_active_clients": int(self._gfs_ws_active_clients),
@@ -648,15 +695,15 @@ class GfsEngine(GFSService):
         }
         payload["entities"] = {
             "locations": {
-                "entity_type": "location",
+                "entity_type": "location_markers",
                 "source": "fishloclist.csv",
                 "derived": False,
-                "ok": bool(csv.get("ok")),
-                "count": int(csv.get("count") or 0),
-                "error": csv.get("error"),
+                "ok": csv_err is None,
+                "count": int(len(csv) if isinstance(csv, list) else 0),
+                "error": csv_err,
             },
             "fish_intelligence": {
-                "entity_type": "fish",
+                "entity_type": "fish_intelligence",
                 "source": "shared_ocean",
                 "derived": True,
                 "ok": bool((ocean.get("fields") or {}).get("current_u")),
@@ -677,7 +724,7 @@ class GfsEngine(GFSService):
     def diagnostics_payload(self) -> dict[str, Any]:
         out = super().diagnostics_payload()
         out["contract"] = {
-            "locations_endpoint": {"path": "/gfs/api/locations", "entity_type": "location", "derived": False, "source": "fishloclist.csv"},
-            "fish_endpoint": {"path": "/gfs/api/fish", "entity_type": "fish", "derived": True, "source": "shared_ocean"},
+            "locations_endpoint": {"path": "/gfs/api/locations", "entity_type": "location_markers", "derived": False, "source": "fishloclist.csv"},
+            "fish_endpoint": {"path": "/gfs/api/fish", "entity_type": "fish_intelligence", "derived": True, "source": "shared_ocean"},
         }
         return out

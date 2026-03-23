@@ -175,6 +175,8 @@ function normalizeEnvironment({ wx, ocean, boats, lat, lon, cloudPct, rainRate, 
   const sampledWavePeriodS = Number(interpolateBoatScalar(boats?.boats, lat, lon, (entry) => entry?.waves?.primary?.periodS, 120, 4));
   const sampledWindU = fieldSample(wx, 'wind_u', lat, lon);
   const sampledWindV = fieldSample(wx, 'wind_v', lat, lon);
+  const sampledPressurePa = fieldSample(wx, 'pressure_msl', lat, lon);
+  const sampledGustKt = fieldSample(wx, 'wind_gust', lat, lon);
   const currentDirFromVector = Number.isFinite(sampledCurrentU) && Number.isFinite(sampledCurrentV)
     ? ((Math.atan2(sampledCurrentU, sampledCurrentV) * 180 / Math.PI) + 360) % 360
     : NaN;
@@ -197,6 +199,8 @@ function normalizeEnvironment({ wx, ocean, boats, lat, lon, cloudPct, rainRate, 
     wind_direction: Number.isFinite(windDir) ? windDir : windDirFromVector,
     cloud_cover: cloudPct,
     rain_rate: rainRate,
+    pressure_mb: Number.isFinite(sampledPressurePa) ? sampledPressurePa / 100 : NaN,
+    wind_gust_kt: Number.isFinite(sampledGustKt) ? sampledGustKt * 1.94384 : NaN,
     source_flags: {
       weather: wx?.source || 'unknown',
       ocean: ocean?.source || 'unknown',
@@ -276,6 +280,39 @@ function recommendTackle(speciesRows, reportHints, baitState, profile) {
   return reportHints.anchovy ? 'Anchovy / small jig / light leader' : 'Small live bait / anchovy / sabiki at active periods';
 }
 
+function speciesPoolForClass(markerClass = 'coastal') {
+  if (markerClass === 'inland') {
+    return [
+      { key: 'trout', label: 'Trout', temp_center_f: 58, temp_half_span_f: 9, structure_bias: 0.18, current_bias: 0.08, bait_bias: 0.14, hint_boost: 6 },
+      { key: 'largemouth_bass', label: 'Largemouth Bass', temp_center_f: 68, temp_half_span_f: 11, structure_bias: 0.26, current_bias: 0.04, bait_bias: 0.12, hint_boost: 4 },
+      { key: 'catfish', label: 'Catfish', temp_center_f: 72, temp_half_span_f: 13, structure_bias: 0.2, current_bias: 0.02, bait_bias: 0.08, hint_boost: 4 },
+      { key: 'panfish', label: 'Panfish', temp_center_f: 66, temp_half_span_f: 12, structure_bias: 0.14, current_bias: 0.03, bait_bias: 0.1, hint_boost: 2 },
+    ];
+  }
+  if (markerClass === 'offshore') {
+    return [
+      { key: 'tuna', label: 'Tuna', temp_center_f: 68, temp_half_span_f: 9, structure_bias: 0.08, current_bias: 0.2, bait_bias: 0.32, hint_boost: 8 },
+      { key: 'yellowtail', label: 'Yellowtail', temp_center_f: 65, temp_half_span_f: 10, structure_bias: 0.14, current_bias: 0.16, bait_bias: 0.26, hint_boost: 6 },
+      { key: 'dorado', label: 'Dorado', temp_center_f: 72, temp_half_span_f: 9, structure_bias: 0.06, current_bias: 0.14, bait_bias: 0.22, hint_boost: 4 },
+      { key: 'wahoo', label: 'Wahoo', temp_center_f: 73, temp_half_span_f: 8, structure_bias: 0.05, current_bias: 0.18, bait_bias: 0.2, hint_boost: 3 },
+    ];
+  }
+  if (markerClass === 'estuary') {
+    return [
+      { key: 'halibut', label: 'Halibut', temp_center_f: 62, temp_half_span_f: 10, structure_bias: 0.24, current_bias: 0.08, bait_bias: 0.2, hint_boost: 5 },
+      { key: 'striped_bass', label: 'Striped Bass', temp_center_f: 64, temp_half_span_f: 11, structure_bias: 0.2, current_bias: 0.1, bait_bias: 0.18, hint_boost: 5 },
+      { key: 'corbina', label: 'Corbina', temp_center_f: 67, temp_half_span_f: 11, structure_bias: 0.17, current_bias: 0.05, bait_bias: 0.16, hint_boost: 3 },
+      { key: 'calico_bass', label: 'Calico Bass', temp_center_f: 64, temp_half_span_f: 10, structure_bias: 0.18, current_bias: 0.08, bait_bias: 0.16, hint_boost: 3 },
+    ];
+  }
+  return [
+    { key: 'mackerel', label: 'Mackerel', temp_center_f: 63, temp_half_span_f: 12, structure_bias: 0.1, current_bias: 0.12, bait_bias: 0.24, hint_boost: 2 },
+    { key: 'bass', label: 'Bass', temp_center_f: 62, temp_half_span_f: 10, structure_bias: 0.24, current_bias: 0.08, bait_bias: 0.18, hint_boost: 2 },
+    { key: 'halibut', label: 'Halibut', temp_center_f: 62, temp_half_span_f: 9, structure_bias: 0.26, current_bias: 0.06, bait_bias: 0.2, hint_boost: 2 },
+    { key: 'shark', label: 'Shark', temp_center_f: 64, temp_half_span_f: 14, structure_bias: 0.1, current_bias: 0.1, bait_bias: 0.18, hint_boost: 0 },
+  ];
+}
+
 function moonBiasText() {
   const day = Math.floor(Date.now() / 86400000) % 29;
   if (day < 7) return 'New-to-first-quarter push';
@@ -297,9 +334,11 @@ function listToHtml(items) {
 function deriveIntel({ loc, wx, bait, clouds, boats, ocean, localOverlay, reports, videos, profile }) {
   const lat = Number(loc?.lat);
   const lon = Number(loc?.lon);
+  const markerClass = String(loc?.marker_class || profile?.waterbody_class || 'coastal');
+  const baitApplicable = Boolean(loc?.bait_applicable ?? !['inland'].includes(markerClass));
   const nearestBait = nearestPoint(bait?.bait_score, lat, lon, 8);
-  const baitProbRaw = (Number(nearestBait?.probability ?? bait?.confidence?.overall ?? 0) || 0) * 100;
-  const baitProb = clamp(Math.max(baitProbRaw, Number.isFinite(Number(bait?.confidence?.overall)) ? Number(bait.confidence.overall) * 100 : 20));
+  const baitProbRaw = (Number(nearestBait?.probability ?? bait?.confidence?.overall ?? NaN));
+  const baitProb = baitApplicable && Number.isFinite(baitProbRaw) ? clamp(baitProbRaw * 100) : NaN;
   const frontCount = Array.isArray(bait?.front_lines) ? bait.front_lines.length : 0;
   const boilCount = Array.isArray(bait?.boil_probability_polygons) ? bait.boil_probability_polygons.length : 0;
   const convCount = Array.isArray(bait?.convergence_polygons) ? bait.convergence_polygons.length : 0;
@@ -351,23 +390,18 @@ function deriveIntel({ loc, wx, bait, clouds, boats, ocean, localOverlay, report
 
   const activeSpecies = Array.isArray(profile?.species) && profile.species.length
     ? profile.species.slice(0, 4)
-    : [
-        { key: 'mackerel', label: 'Mackerel', temp_center_f: 63, temp_half_span_f: 12, structure_bias: 0.1, current_bias: 0.12, bait_bias: 0.28, hint_boost: 0 },
-        { key: 'bass', label: 'Bass', temp_center_f: 62, temp_half_span_f: 10, structure_bias: 0.26, current_bias: 0.08, bait_bias: 0.22, hint_boost: 0 },
-        { key: 'halibut', label: 'Halibut', temp_center_f: 62, temp_half_span_f: 9, structure_bias: 0.28, current_bias: 0.06, bait_bias: 0.22, hint_boost: 0 },
-        { key: 'shark', label: 'Shark', temp_center_f: 64, temp_half_span_f: 14, structure_bias: 0.1, current_bias: 0.10, bait_bias: 0.24, hint_boost: 0 },
-      ];
+    : speciesPoolForClass(markerClass);
 
   const speciesRows = activeSpecies.map((spec) => {
     const tempWindow = speciesTempWindow(waterTempF, spec.temp_center_f || 64, spec.temp_half_span_f || 12) * 28;
     const currentSupport = Math.min(Number.isFinite(currentKt) ? currentKt : 0, 3) * (spec.current_bias || 0.1) * 18;
     const structureSupport = structureEdge * (spec.structure_bias || 0.15);
-    const baitSupport = baitProb * (spec.bait_bias || 0.22);
+    const baitSupport = (Number.isFinite(baitProb) ? baitProb : 0) * (spec.bait_bias || 0.22);
     const score = clamp(tempWindow + currentSupport + structureSupport + baitSupport + Number(spec.hint_boost || 0));
     return { key: spec.key, label: spec.label, score };
   });
 
-  const predatorScore = clamp((Math.max(...speciesRows.map((row) => row.score), 0) * 0.62) + (baitProb * 0.24) + (structureEdge * 0.14));
+  const predatorScore = clamp((Math.max(...speciesRows.map((row) => row.score), 0) * 0.62) + ((Number.isFinite(baitProb) ? baitProb : 0) * 0.24) + (structureEdge * 0.14));
   const opportunityScore = clamp((baitProb * 0.33) + (predatorScore * 0.34) + (safetyScore * 0.18) + (confidenceScore * 0.15));
   const trend = trendText(opportunityScore, baitState, frontCount, boilCount);
 
@@ -403,6 +437,8 @@ function deriveIntel({ loc, wx, bait, clouds, boats, ocean, localOverlay, report
     convCount,
     boilCount,
     baitState,
+    baitApplicable,
+    markerClass,
     currentKt,
     currentDir,
     windKt,
@@ -493,6 +529,30 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
     el.panel.setAttribute('aria-hidden', 'true');
   };
 
+  function renderImmediateFromMarker(marker) {
+    el.title.textContent = marker?.name || 'Fishing location';
+    const lat = Number(marker?.lat);
+    const lon = Number(marker?.lon);
+    el.coords.textContent = Number.isFinite(lat) && Number.isFinite(lon)
+      ? `${lat.toFixed(4)}, ${lon.toFixed(4)} • orb anchor`
+      : 'Coordinates unavailable';
+    const quick = marker?.quick_snapshot || {};
+    const qWeather = marker?.quick_weather || quick?.weather || {};
+    const qOcean = marker?.quick_ocean || quick?.ocean || {};
+    const markerClass = marker?.marker_class || quick?.marker_class || 'coastal';
+    const baitApplicable = Boolean(marker?.bait_applicable ?? quick?.bait_applicable ?? markerClass !== 'inland');
+    el.waterbody.textContent = `Curated CSV location marker • ${markerClass}`;
+    el.statusLine.textContent = 'Loading detailed intelligence…';
+    el.baitSummary.textContent = baitApplicable
+      ? `${safeFixed(quick?.bait_score, 0, '%')} • ${quick?.bait_intensity || 'warming'}`
+      : 'Not applicable (inland/weather-primary)';
+    el.envNow.textContent = markerClass === 'inland'
+      ? `Air ${formatUnavailable(qWeather?.air_temp_c, (v) => `${(((v * 9) / 5) + 32).toFixed(1)}°F`)} • Wind ${formatUnavailable(qWeather?.wind_speed_kt, (v) => `${v.toFixed(1)} kt`)} • Cloud ${formatUnavailable(qWeather?.cloud_cover_pct, (v) => `${v.toFixed(0)}%`)}`
+      : `SST ${formatUnavailable(qOcean?.sst_c, (v) => `${(((v * 9) / 5) + 32).toFixed(1)}°F`)} • Current ${formatUnavailable(qOcean?.current_speed_kt, (v) => `${v.toFixed(2)} kt`)} • Wave ${formatUnavailable(qOcean?.wave_height_ft, (v) => `${v.toFixed(1)} ft`)}`;
+    el.envMore.textContent = `Pressure ${formatUnavailable(qWeather?.pressure_mb, (v) => `${v.toFixed(1)} mb`)} • Wind dir ${formatUnavailable(qWeather?.wind_direction_deg, (v) => `${v.toFixed(0)}°`)} • Source ${qWeather?.source_tier || qOcean?.source_tier || 'Unavailable'}`;
+    el.envPosition.textContent = 'Detailed environment loading…';
+  }
+
   async function refresh() {
     if (!selected) return;
     const loc = await getJsonSafe(`/gfs/api/location/${encodeURIComponent(selected.id)}`, null);
@@ -538,17 +598,21 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
     el.trend.textContent = `${intel.trend} window`;
     el.safetyLine.textContent = `Safety ${Math.round(intel.safetyScore)}% • ${safetyLabel(intel.safetyScore)} • valid ${localOverlay?.validTime || wx?.valid_time || clouds?.valid_time || bait?.valid_time || 'n/a'}`;
 
-    el.baitSummary.textContent = `${Math.round(intel.baitScore)}% • ${intel.baitState}`;
-    updateMeter(el.baitFill, intel.baitScore);
+    el.baitSummary.textContent = intel.baitApplicable
+      ? `${Math.round(Number(intel.baitScore) || 0)}% • ${intel.baitState}`
+      : 'Not applicable (inland/weather-primary)';
+    updateMeter(el.baitFill, intel.baitApplicable ? (Number(intel.baitScore) || 0) : 0);
     el.baitDrivers.innerHTML = listToHtml([
       profile?.summary || null,
       profile?.classification_reason || null,
+      intel.markerClass ? `Marker class ${intel.markerClass}` : null,
       intel.frontCount > 0 ? `Temp breaks live in the box (${intel.frontCount})` : null,
       intel.convCount > 0 ? `Convergence support pockets (${intel.convCount})` : null,
       Number.isFinite(intel.currentKt) ? `Current pulse ${intel.currentKt.toFixed(1)} kt` : null,
       Number.isFinite(intel.cloudPct) ? `Cloud cover ${intel.cloudPct.toFixed(0)}% at orb` : null,
       Number.isFinite(intel.positioning?.baitDistanceNm) ? `Nearest bait solve is ${intel.positioning.baitDistanceNm.toFixed(1)} nm off the orb` : null,
-      bait?.bait?.meta?.valid_cells ? `${bait.bait.meta.valid_cells} active ocean cells in solve` : null,
+      (intel.baitApplicable && bait?.bait?.meta?.valid_cells) ? `${bait.bait.meta.valid_cells} active ocean cells in solve` : null,
+      !intel.baitApplicable ? 'Bait model intentionally omitted for inland/non-SST location' : null,
     ].filter(Boolean));
     el.baitMovement.textContent = Number.isFinite(intel.currentKt)
       ? `Drifting ${safeFixed(intel.currentDir, 0, '°')} at ${safeFixed(intel.currentKt, 1, ' kt')} • bait state ${intel.baitState}`
@@ -567,8 +631,14 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
     });
 
     const env = intel.environment || {};
-    el.envNow.textContent = `SST ${formatUnavailable(env.sea_surface_temp, (v) => `${v.toFixed(1)}°F`)} • Chl ${formatUnavailable(env.chlorophyll, (v) => `${v.toFixed(2)} mg/m³`)} • Current ${formatUnavailable(env.current_speed, (v) => `${v.toFixed(2)} kt`)} @ ${formatUnavailable(env.current_direction, (v) => `${v.toFixed(0)}°`)}`;
-    el.envMore.textContent = `Wave ${formatUnavailable(env.wave_height, (v) => `${v.toFixed(1)} ft`)} • Period ${formatUnavailable(env.wave_period, (v) => `${v.toFixed(0)} s`)} • Depth ${formatUnavailable(env.depth, (v) => `${v.toFixed(0)} m`)} • Wind ${formatUnavailable(env.wind_speed, (v) => `${v.toFixed(1)} kt`)} @ ${formatUnavailable(env.wind_direction, (v) => `${v.toFixed(0)}°`)}`;
+    const isInland = intel.markerClass === 'inland';
+    if (isInland) {
+      el.envNow.textContent = `Air ${formatUnavailable(intel.airTempF, (v) => `${v.toFixed(1)}°F`)} • Wind ${formatUnavailable(env.wind_speed, (v) => `${v.toFixed(1)} kt`)} @ ${formatUnavailable(env.wind_direction, (v) => `${v.toFixed(0)}°`)} • Cloud ${formatUnavailable(env.cloud_cover, (v) => `${v.toFixed(0)}%`)}`;
+      el.envMore.textContent = `Pressure ${formatUnavailable(env.pressure_mb, (v) => `${v.toFixed(1)} mb`)} • Gust ${formatUnavailable(env.wind_gust_kt, (v) => `${v.toFixed(1)} kt`)} • Rain ${formatUnavailable(env.rain_rate, (v) => `${v.toFixed(3)}`)} • Ocean fields omitted for inland marker`;
+    } else {
+      el.envNow.textContent = `SST ${formatUnavailable(env.sea_surface_temp, (v) => `${v.toFixed(1)}°F`)} • Chl ${formatUnavailable(env.chlorophyll, (v) => `${v.toFixed(2)} mg/m³`)} • Current ${formatUnavailable(env.current_speed, (v) => `${v.toFixed(2)} kt`)} @ ${formatUnavailable(env.current_direction, (v) => `${v.toFixed(0)}°`)}`;
+      el.envMore.textContent = `Wave ${formatUnavailable(env.wave_height, (v) => `${v.toFixed(1)} ft`)} • Period ${formatUnavailable(env.wave_period, (v) => `${v.toFixed(0)} s`)} • Depth ${formatUnavailable(env.depth, (v) => `${v.toFixed(0)} m`)} • Wind ${formatUnavailable(env.wind_speed, (v) => `${v.toFixed(1)} kt`)} @ ${formatUnavailable(env.wind_direction, (v) => `${v.toFixed(0)}°`)}`;
+    }
     const boatSolveText = Number.isFinite(intel.positioning?.boatDistanceNm)
       ? `Boat solve ${intel.positioning.boatDistanceNm.toFixed(1)} nm from orb`
       : 'Boat solve sparse — using regional ocean conditions';
@@ -630,7 +700,10 @@ export function createHud({ root, onStartLive, onStopLive, onSelectLocation, get
       if (onSelectLocation) onSelectLocation(location);
       el.panel.classList.remove('closed');
       el.panel.setAttribute('aria-hidden', 'false');
-      await refresh();
+      renderImmediateFromMarker(location || {});
+      refresh().catch((err) => {
+        console.warn('[gfs hud] async enrichment failed', err?.message || err);
+      });
     },
     selected: () => selected,
     updateHover(point, sample, baitInfo) {

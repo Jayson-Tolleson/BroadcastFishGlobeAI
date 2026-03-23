@@ -90,6 +90,12 @@ def _normalize_location_item(item: dict[str, Any]) -> dict[str, Any]:
         "confidence": item.get("confidence"),
         "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
         "score": item.get("score"),
+        "marker_class": item.get("marker_class") or "coastal",
+        "bait_applicable": bool(item.get("bait_applicable")),
+        "species_profile_seed": item.get("species_profile_seed"),
+        "quick_weather": item.get("quick_weather") if isinstance(item.get("quick_weather"), dict) else {},
+        "quick_ocean": item.get("quick_ocean") if isinstance(item.get("quick_ocean"), dict) else {},
+        "quick_snapshot": item.get("quick_snapshot") if isinstance(item.get("quick_snapshot"), dict) else {},
     }
 
 

@@ -246,6 +246,25 @@ class GfsEngine(GFSService):
             return west <= lon <= east
         return lon >= west or lon <= east
 
+    @staticmethod
+    def _marker_class(item: dict[str, Any], lat: float, lon: float) -> str:
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        text = " ".join(str(meta.get(k) or "") for k in meta.keys()).lower()
+        text += " " + str(item.get("name") or "").lower()
+        inland_tokens = ("lake", "river", "reservoir", "creek", "dam", "trout", "catfish", "bass")
+        estuary_tokens = ("estuary", "bay", "delta", "lagoon", "brackish")
+        offshore_tokens = ("offshore", "tuna", "yellowtail", "dorado", "pelagic")
+        if any(tok in text for tok in inland_tokens):
+            return "inland"
+        if any(tok in text for tok in estuary_tokens):
+            return "estuary"
+        if any(tok in text for tok in offshore_tokens):
+            return "offshore"
+        # Longitude/latitude heuristic fallback for US-centric CSV.
+        if lat > 35.0 and lon < -118.3:
+            return "inland"
+        return "coastal"
+
     def _csv_locations(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         raw = self.fish_payload()
@@ -271,6 +290,11 @@ class GfsEngine(GFSService):
             normalized_confidence = confidence if confidence is not None else probability if probability is not None else 0.5
             normalized_probability = probability if probability is not None else confidence if confidence is not None else 0.5
             loc_id = item.get("id") or item.get("location_key") or item.get("name") or "loc"
+            marker_class = self._marker_class(item, lat_f, lon_f)
+            env = item.get("environment") if isinstance(item.get("environment"), dict) else {}
+            bait = item.get("bait") if isinstance(item.get("bait"), dict) else {}
+            env_meta = item.get("environment_meta") if isinstance(item.get("environment_meta"), dict) else {}
+            bait_applicable = marker_class in {"coastal", "offshore", "estuary"}
             items.append({
                 "id": loc_id,
                 "location_key": item.get("location_key") or loc_id,
@@ -284,6 +308,54 @@ class GfsEngine(GFSService):
                 "reason": "fish_csv",
                 "reasons": ["fishloclist.csv"],
                 "meta": item.get("meta") if isinstance(item.get("meta"), dict) else {},
+                "marker_class": marker_class,
+                "bait_applicable": bait_applicable,
+                "species_profile_seed": f"{marker_class}:{str(item.get('location_key') or loc_id)}",
+                "quick_weather": {
+                    "air_temp_c": env.get("air_temp_c"),
+                    "wind_speed_kt": env.get("wind_speed_kt"),
+                    "wind_direction_deg": env.get("wind_direction_deg"),
+                    "wind_gust_kt": env.get("wind_gust_kt"),
+                    "cloud_cover_pct": env.get("cloud_cover_pct"),
+                    "precipitation_factor": env.get("precipitation_factor"),
+                    "pressure_mb": env.get("pressure_mb"),
+                    "source_tier": env_meta.get("source_tier"),
+                },
+                "quick_ocean": {
+                    "sst_c": env.get("water_temp_c"),
+                    "current_speed_kt": env.get("current_speed_kt"),
+                    "current_direction_deg": env.get("current_direction_deg"),
+                    "wave_height_ft": env.get("wave_feet"),
+                    "swell_height_ft": env.get("swell_height_ft"),
+                    "swell_period_s": env.get("swell_period_s"),
+                    "swell_direction_deg": env.get("swell_direction_deg"),
+                    "chlorophyll_mg_m3": env.get("chlorophyll_mg_m3"),
+                    "depth_m": env.get("depth_m"),
+                    "source_tier": env_meta.get("source_tier"),
+                    "degraded": env_meta.get("source_tier") not in {"station_enriched_us", "global_model_gfs"},
+                } if bait_applicable else {},
+                "quick_snapshot": {
+                    "marker_class": marker_class,
+                    "bait_applicable": bait_applicable,
+                    "bait_score": bait.get("bait_score"),
+                    "bait_intensity": bait.get("intensity"),
+                    "weather": {
+                        "air_temp_c": env.get("air_temp_c"),
+                        "wind_speed_kt": env.get("wind_speed_kt"),
+                        "cloud_cover_pct": env.get("cloud_cover_pct"),
+                        "pressure_mb": env.get("pressure_mb"),
+                        "source_tier": env_meta.get("source_tier"),
+                    },
+                    "ocean": {
+                        "sst_c": env.get("water_temp_c"),
+                        "current_speed_kt": env.get("current_speed_kt"),
+                        "wave_height_ft": env.get("wave_feet"),
+                        "swell_height_ft": env.get("swell_height_ft"),
+                        "swell_period_s": env.get("swell_period_s"),
+                        "chlorophyll_mg_m3": env.get("chlorophyll_mg_m3"),
+                        "depth_m": env.get("depth_m"),
+                    } if bait_applicable else {},
+                },
             })
         return {
             "ok": bool(raw.get("ok", True)),

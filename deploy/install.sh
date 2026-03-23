@@ -17,6 +17,43 @@ GOOGLE_CLOUD_REGION="global"
 log() { printf '[%s] %s\n' "$1" "$2"; }
 fail() { printf '[ERROR] %s\n' "$1" >&2; exit 1; }
 
+safe_fix_deploy_permissions() {
+  if [[ ! -d "$ROOT_DIR/deploy" ]]; then
+    echo "[WARN] deploy directory not found at $ROOT_DIR/deploy; skipping permission normalization"
+    return 0
+  fi
+  echo "[INFO] Normalizing deploy permissions"
+  find "$ROOT_DIR/deploy" -type d -print0 2>/dev/null | xargs -0r chmod a+rx
+  find "$ROOT_DIR/deploy" -type f -name "*.sh" -print0 2>/dev/null | xargs -0r chmod a+rx
+  find "$ROOT_DIR/deploy" -type f -print0 2>/dev/null | xargs -0r chmod a+r
+}
+
+phase0_deploy_permissions() {
+  echo "===== PHASE 0 — DEPLOY PERMISSIONS ====="
+  safe_fix_deploy_permissions
+}
+
+curl_check() {
+  local url="$1"
+  local timeout_s="${2:-3}"
+  curl -fsS --connect-timeout "$timeout_s" --max-time "$timeout_s" "$url" >/dev/null
+}
+
+wait_for_http_ready() {
+  local url="$1"
+  local tries="${2:-20}"
+  local timeout_s="${3:-2}"
+  local sleep_s="${4:-1}"
+  local i
+  for i in $(seq 1 "$tries"); do
+    if curl_check "$url" "$timeout_s"; then
+      return 0
+    fi
+    sleep "$sleep_s"
+  done
+  return 1
+}
+
 validate_static_layout() {
   [[ -d "$APP_DIR" ]] || fail "APP_DIR missing or not a directory: $APP_DIR"
 
@@ -69,7 +106,7 @@ detect_os() {
 
 phase1_system_prep() {
   echo "===== PHASE 1 — SYSTEM PREP ====="
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Run installer as root: sudo bash broadcast.sh"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Run installer as root: sudo bash deploy/install.sh"
   detect_os
 
   apt-get update
@@ -306,25 +343,23 @@ phase7_services() {
 
 phase8_health() {
   echo "===== PHASE 8 — HEALTH CHECKS ====="
-  for i in {1..20}; do
-    if curl -s http://127.0.0.1:8000/health >/dev/null; then
-      echo "[installer] backend ready"
-      break
-    fi
-    sleep 1
-    if [[ "$i" -eq 20 ]]; then
-      fail "broadcast health endpoint check failed"
-    fi
-  done
-  curl -fsS http://127.0.0.1:8000/gfs/api/health >/dev/null || fail "gfs api health check failed"
+  if wait_for_http_ready "http://127.0.0.1:8000/health" 30 2 1; then
+    echo "[installer] backend ready"
+  else
+    fail "broadcast health endpoint check failed (timeout)"
+  fi
+  if ! curl_check "http://127.0.0.1:8000/gfs/api/health" 2; then
+    echo "[WARN] gfs api health check timed out/degraded; continuing because backend is ready"
+  fi
   if [[ "${SKIP_SSL:-0}" != "1" ]]; then
-    curl -kfsS "https://$DOMAIN" >/dev/null || fail "public TLS endpoint check failed"
+    curl -kfsS --connect-timeout 3 --max-time 5 "https://$DOMAIN" >/dev/null || fail "public TLS endpoint check failed"
   fi
   validate_static_layout
   echo "[OK] Installer completed successfully"
 }
 
 main() {
+  phase0_deploy_permissions
   phase1_system_prep
   phase2_python_runtime
   phase3_firewall

@@ -45,6 +45,8 @@ class GfsEngine(GFSService):
         self._gfs_ws_last_open_ts: int | None = None
         self._weather_refresh_inflight = False
         self._weather_refresh_last_ts = 0.0
+        self._ocean_refresh_inflight = False
+        self._ocean_refresh_last_ts = 0.0
         self._prewarm_duration_ms: float | None = None
         self._last_ocean_latency_ms: float | None = None
         self._last_frame_latency_ms: float | None = None
@@ -121,6 +123,42 @@ class GfsEngine(GFSService):
         bait = self.bait_service.score(ocean, vp)
         boats = self.boat_service.agents(ocean, vp, count=12)
         return weather, ocean, fish, bait, boats
+
+    def _fallback_ocean_from_weather(self, vp, weather: dict[str, Any], reason: str) -> dict[str, Any]:
+        fields = weather.get("fields") if isinstance(weather.get("fields"), dict) else {}
+        wind_u = self._to_2d_grid(fields.get("wind_u"))
+        wind_v = self._to_2d_grid(fields.get("wind_v"))
+        ny = len(wind_u)
+        nx = len(wind_u[0]) if ny and isinstance(wind_u[0], list) else 0
+        lats = [vp.south + ((i + 0.5) / max(1, ny)) * (vp.north - vp.south) for i in range(ny)] if ny else []
+        lons = [vp.west + ((j + 0.5) / max(1, nx)) * (vp.east - vp.west) for j in range(nx)] if nx else []
+        empty = [[float("nan") for _ in range(nx)] for _ in range(ny)] if ny and nx else []
+        return {
+            "ok": True,
+            "source": "shared_ocean",
+            "bbox": vp.as_bbox(),
+            "timestamp": int(time.time() * 1000),
+            "ts": int(time.time() * 1000),
+            "stale": True,
+            "cache": "fallback",
+            "fallback_reason": reason,
+            "sources": {"weather": "ncss_weather", "currents": "hycom_pending", "chlorophyll": "coastwatch_pending", "waves": "wavewatch_pending", "depth": "bathymetry_pending"},
+            "source_status": {"currents": "pending", "chlorophyll": "pending", "waves": "pending", "depth": "pending"},
+            "degraded": {"currents": True, "waves": True, "chlorophyll": True, "depth": True},
+            "grid": {"rows": ny, "cols": nx, "lats": lats, "lons": lons, "cell_deg": 0.25},
+            "fields": {
+                "current_u": wind_u,
+                "current_v": wind_v,
+                "current_speed": empty,
+                "sst_k": empty,
+                "chlorophyll_mg_m3": empty,
+                "wave_height_m": empty,
+                "wave_period_s": empty,
+                "wave_direction_deg": empty,
+                "depth_m": empty,
+            },
+            "count": ny * nx,
+        }
 
     @staticmethod
     def _to_2d_grid(value: Any) -> list[list[float]]:
@@ -231,6 +269,40 @@ class GfsEngine(GFSService):
         )
         return ocean
 
+    def _maybe_refresh_ocean_async(self, vp) -> None:
+        now = time.time()
+        if self._ocean_refresh_inflight:
+            return
+        if (now - float(self._ocean_refresh_last_ts or 0.0)) < 20.0:
+            return
+        self._ocean_refresh_inflight = True
+        self._ocean_refresh_last_ts = now
+
+        def _refresh() -> None:
+            try:
+                self.shared_ocean_payload(vp.as_dict())
+            except Exception as exc:
+                log.warning("[gfs-perf] ocean async refresh failed err=%s", exc)
+            finally:
+                self._ocean_refresh_inflight = False
+
+        try:
+            threading.Thread(target=_refresh, daemon=True).start()
+        except Exception as exc:
+            self._ocean_refresh_inflight = False
+            log.warning("[gfs-perf] failed to start ocean async refresh thread: %s", exc)
+
+    def shared_ocean_payload_fast(self, vp, weather: dict[str, Any]) -> dict[str, Any]:
+        key = self._cache_key("ocean", vp)
+        cached = self._cache.get(key)
+        if isinstance(cached, dict):
+            out = {**cached, "warm": self._warm_ready, "stale": bool(cached.get("stale", False)), "cache": "hit"}
+            self._last_ocean_cache_state = "hit"
+            return out
+        self._maybe_refresh_ocean_async(vp)
+        self._last_ocean_cache_state = "fallback"
+        return self._fallback_ocean_from_weather(vp, weather, "ocean_refresh_pending")
+
     def fish_from_ocean(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         vp = canonicalize_viewport(bbox)
         cached = self._cache.get(self._cache_key("fish", vp))
@@ -250,7 +322,7 @@ class GfsEngine(GFSService):
                 "derived": True,
                 "cache": "hit",
             }
-        ocean = self.shared_ocean_payload(vp.as_dict())
+        ocean = self.shared_ocean_payload_fast(vp, weather)
         items = self.fish_service.score_markers(ocean, vp)
         log.info("fish derived count=%s viewport=%s", len(items), vp.as_bbox())
         payload = {
@@ -551,7 +623,7 @@ class GfsEngine(GFSService):
                 "derived": True,
                 "cache": "hit",
             }
-        ocean = self.shared_ocean_payload(vp.as_dict())
+        ocean = self.shared_ocean_payload_fast(vp, weather)
         scored = self.bait_service.score(ocean, vp)
         log.info("bait derived polygons=%s viewport=%s", len(scored.get("polygons") or []), vp.as_bbox())
         payload = {
@@ -619,7 +691,7 @@ class GfsEngine(GFSService):
         vp = canonicalize_viewport(bbox)
         weather = self._safe_weather_payload(vp)
         clouds = self._compact_cloud_payload_from_weather(weather, vp)
-        ocean = self.shared_ocean_payload(vp.as_dict())
+        ocean = self.shared_ocean_payload_fast(vp, weather)
         fields = weather.get("fields") if isinstance(weather.get("fields"), dict) else {}
         precip = self._to_2d_grid(fields.get("precip_rate") or fields.get("prate"))
         lat_grid = clouds.get("grid", {}).get("lats") or []

@@ -217,7 +217,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/clouds")
     async def api_clouds():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().cloud_tiles_payload(vp.as_dict()))
+        return jsonify(gfs().compact_cloud_payload(vp.as_dict()))
 
     @bp.route("/api/bait")
     async def api_bait():

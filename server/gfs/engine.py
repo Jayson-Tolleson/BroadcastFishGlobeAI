@@ -122,6 +122,57 @@ class GfsEngine(GFSService):
         boats = self.boat_service.agents(ocean, vp, count=12)
         return weather, ocean, fish, bait, boats
 
+    @staticmethod
+    def _to_2d_grid(value: Any) -> list[list[float]]:
+        if not isinstance(value, list) or not value or not isinstance(value[0], list):
+            return []
+        if value and isinstance(value[0], list) and value[0] and isinstance(value[0][0], list):
+            value = value[0]
+        out: list[list[float]] = []
+        for row in value:
+            if not isinstance(row, list):
+                continue
+            out.append([float(x) if isinstance(x, (int, float)) else float("nan") for x in row])
+        return out
+
+    def _compact_cloud_payload_from_weather(self, weather: dict[str, Any], vp) -> dict[str, Any]:
+        fields = weather.get("fields") if isinstance(weather.get("fields"), dict) else {}
+        low = self._to_2d_grid(fields.get("cloud_low"))
+        mid = self._to_2d_grid(fields.get("cloud_mid"))
+        high = self._to_2d_grid(fields.get("cloud_high"))
+        total = self._to_2d_grid(fields.get("cloud_total"))
+        wind_u = self._to_2d_grid(fields.get("wind_u"))
+        wind_v = self._to_2d_grid(fields.get("wind_v"))
+        grid_ref = total or low or mid or high
+        ny = len(grid_ref)
+        nx = len(grid_ref[0]) if ny and isinstance(grid_ref[0], list) else 0
+        lats = [vp.south + ((i + 0.5) / max(1, ny)) * (vp.north - vp.south) for i in range(ny)] if ny else []
+        lons = [vp.west + ((j + 0.5) / max(1, nx)) * (vp.east - vp.west) for j in range(nx)] if nx else []
+        payload = {
+            "ok": bool(weather.get("ok", True)),
+            "source": weather.get("source", "gfs"),
+            "payload_state": weather.get("payload_state", "live"),
+            "stale": bool(weather.get("stale", False)),
+            "analysis_time": weather.get("cycle"),
+            "valid_time": weather.get("valid_time"),
+            "bbox": vp.as_bbox(),
+            "grid": {
+                "lats": lats,
+                "lons": lons,
+                "low": low,
+                "mid": mid,
+                "high": high,
+                "total": total,
+            },
+            "wind": {
+                "u": wind_u,
+                "v": wind_v,
+            },
+            "count": ny * nx,
+        }
+        log.info("[gfs clouds] compact payload built cells=%s payload_state=%s", payload["count"], payload.get("payload_state"))
+        return payload
+
     def prewarm_startup(self) -> None:
         with self._warm_lock:
             if self._warm_started:
@@ -570,11 +621,7 @@ class GfsEngine(GFSService):
         weather = self._safe_weather_payload(vp)
         weather_ms = (time.time() - weather_started) * 1000
         clouds_started = time.time()
-        payload_state = str(weather.get("payload_state") or "").lower()
-        if payload_state in {"unavailable", "degraded"}:
-            clouds = {"cloud_layers": [], "convective": {}, "stale": True, "source": "fast_degraded"}
-        else:
-            clouds = self.cloud_tiles_payload(vp.as_dict())
+        clouds = self._compact_cloud_payload_from_weather(weather, vp)
         clouds_ms = (time.time() - clouds_started) * 1000
         ocean_started = time.time()
         ocean = self.shared_ocean_payload(vp.as_dict())
@@ -623,6 +670,11 @@ class GfsEngine(GFSService):
                 "warm": self._warm_ready,
             },
         }
+
+    def compact_cloud_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:
+        vp = canonicalize_viewport(bbox)
+        weather = self._safe_weather_payload(vp)
+        return self._compact_cloud_payload_from_weather(weather, vp)
 
     def warm_status(self) -> dict[str, Any]:
         return {

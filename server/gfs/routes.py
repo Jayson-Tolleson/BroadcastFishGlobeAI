@@ -14,6 +14,26 @@ from server.gfs.viewport import parse_viewport_args
 log = logging.getLogger("server.gfs.routes")
 
 
+def _route_debug_start(route: str, vp, raw_query: str) -> float:
+    started = time.time()
+    log.info("[gfs/route] start route=%s query=%s viewport=%s", route, raw_query, vp.as_dict() if hasattr(vp, "as_dict") else vp)
+    return started
+
+
+def _route_debug_done(route: str, started: float, payload: dict[str, Any], status_code: int = 200) -> None:
+    log.info(
+        "[gfs/route] done route=%s status=%s latency_ms=%.2f ok=%s source=%s stale=%s payload_state=%s count=%s",
+        route,
+        status_code,
+        (time.time() - started) * 1000,
+        payload.get("ok") if isinstance(payload, dict) else None,
+        payload.get("source") if isinstance(payload, dict) else None,
+        payload.get("stale") if isinstance(payload, dict) else None,
+        payload.get("payload_state") if isinstance(payload, dict) else None,
+        payload.get("count") if isinstance(payload, dict) else None,
+    )
+
+
 async def handle_gfs_ws(engine_getter, ws_obj) -> None:
     log.info("/ws/gfs route entry")
     engine = None
@@ -157,7 +177,35 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/weather")
     async def api_weather():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().generate_weather_payload(vp.as_dict()))
+        started = _route_debug_start("/gfs/api/weather", vp, request.query_string.decode("utf-8", errors="ignore"))
+        payload = gfs().generate_weather_payload(vp.as_dict())
+        payload_state = str(payload.get("payload_state") or "").lower()
+        source_status = "live" if payload_state == "live" else "stale_last_good" if payload_state == "cached" else "unavailable"
+        if payload_state == "synthetic":
+            out = {
+                "ok": False,
+                "source": str(payload.get("source") or "ncss_weather"),
+                "payload_state": "unavailable",
+                "error_code": "weather_unavailable",
+                "error_message": "NCSS weather unavailable and no stale last-good payload",
+                "latency_ms": round((time.time() - started) * 1000, 2),
+                "stale": False,
+                "source_status": source_status,
+                "request_url": request.full_path,
+            }
+            _route_debug_done("/gfs/api/weather", started, out, status_code=503)
+            return jsonify(out), 503
+        out = {
+            **payload,
+            "analysis_time": payload.get("cycle"),
+            "forecast_hour": payload.get("forecast_hour"),
+            "valid_time": payload.get("valid_time"),
+            "source_status": source_status,
+            "stale": source_status == "stale_last_good",
+            "ok": bool(payload.get("ok", True)),
+        }
+        _route_debug_done("/gfs/api/weather", started, out)
+        return jsonify(out)
 
     @bp.route("/api/clouds")
     async def api_clouds():

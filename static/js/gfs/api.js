@@ -207,6 +207,7 @@ export async function getJson(url, opts = {}) {
   }
 
   const run = (async () => {
+    const startedAt = performance.now();
     const timeout = timeoutSignal(timeoutMs);
     const autoAbort = upperMethod === 'GET'
       ? buildGetSignal(url, { signal: callerSignal, abortPrevious })
@@ -216,6 +217,7 @@ export async function getJson(url, opts = {}) {
       : { signal: autoAbort.signal, cleanup: () => {} };
 
     try {
+      console.info('[gfs/request] start', { layer: upperMethod === 'GET' ? gfsRequestKey(url) : upperMethod, url, params: url, method: upperMethod });
       const response = await fetch(url, {
         credentials: 'same-origin',
         ...fetchOptions,
@@ -229,21 +231,37 @@ export async function getJson(url, opts = {}) {
 
       if (!response.ok) {
         const text = await response.text().catch(() => '');
+        console.warn('[gfs/request] fail', { layer: gfsRequestKey(url), url, status: response.status, ms: Number((performance.now() - startedAt).toFixed(1)), error: text.slice(0, 180) });
         throw makeError('GET non-ok', { url, status: response.status, responseText: text.slice(0, 500) });
       }
-
-      return await parseJsonResponse(response, url);
+      const payload = await parseJsonResponse(response, url);
+      console.info('[gfs/request] done', {
+        layer: gfsRequestKey(url),
+        url,
+        status: response.status,
+        ms: Number((performance.now() - startedAt).toFixed(1)),
+        ok: payload?.ok,
+        source: payload?.source,
+        stale: payload?.stale,
+        count: payload?.count,
+        entity_type: payload?.entity_type,
+        payload_state: payload?.payload_state,
+      });
+      return payload;
     } catch (err) {
       const aborted = err?.name === 'AbortError' || merged.signal?.aborted || timeout.signal?.aborted || callerSignal?.aborted;
       if (aborted) {
         const abortErr = makeError('The operation was aborted.', { url, aborted: true });
+        console.warn('[gfs/request] fail', { layer: gfsRequestKey(url), url, status: 'aborted', ms: Number((performance.now() - startedAt).toFixed(1)), error: 'aborted' });
         if (fallback !== undefined) return fallback;
         throw abortErr;
       }
       if (fallback !== undefined) {
+        console.warn('[gfs/request] fail', { layer: gfsRequestKey(url), url, status: 'fallback', ms: Number((performance.now() - startedAt).toFixed(1)), error: err?.message || String(err) });
         warn(err?.message || 'GET failure', { url, err: err?.message || err });
         return fallback;
       }
+      console.warn('[gfs/request] fail', { layer: gfsRequestKey(url), url, status: 'error', ms: Number((performance.now() - startedAt).toFixed(1)), error: err?.message || String(err) });
       throw err instanceof Error ? err : makeError(String(err), { url });
     } finally {
       timeout.cancel();

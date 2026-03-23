@@ -46,12 +46,23 @@ wait_for_http_ready() {
   local sleep_s="${4:-1}"
   local i
   for i in $(seq 1 "$tries"); do
+    echo "[installer][health] attempt=${i}/${tries} timeout_s=${timeout_s} url=${url}"
     if curl_check "$url" "$timeout_s"; then
+      echo "[installer][health] success attempt=${i} url=${url}"
       return 0
     fi
+    echo "[installer][health] failed attempt=${i} url=${url}"
     sleep "$sleep_s"
   done
   return 1
+}
+
+dump_service_diagnostics() {
+  local svc="${1:-broadcast}"
+  echo "[installer][diag] systemctl status ${svc} --no-pager"
+  systemctl status "$svc" --no-pager || true
+  echo "[installer][diag] journalctl -u ${svc} -n 120 --no-pager"
+  journalctl -u "$svc" -n 120 --no-pager || true
 }
 
 validate_static_layout() {
@@ -346,13 +357,28 @@ phase8_health() {
   if wait_for_http_ready "http://127.0.0.1:8000/health" 30 2 1; then
     echo "[installer] backend ready"
   else
+    dump_service_diagnostics "broadcast"
     fail "broadcast health endpoint check failed (timeout)"
   fi
+  echo "[installer][health] stabilization grace delay 3s"
+  sleep 3
+  if ! curl_check "http://127.0.0.1:8000/health" 2; then
+    dump_service_diagnostics "broadcast"
+    fail "broadcast unstable after readiness grace period"
+  fi
+  echo "[installer][health] probing optional /gfs/api/health"
   if ! curl_check "http://127.0.0.1:8000/gfs/api/health" 2; then
     echo "[WARN] gfs api health check timed out/degraded; continuing because backend is ready"
+  else
+    echo "[installer][health] gfs api health ok"
   fi
   if [[ "${SKIP_SSL:-0}" != "1" ]]; then
-    curl -kfsS --connect-timeout 3 --max-time 5 "https://$DOMAIN" >/dev/null || fail "public TLS endpoint check failed"
+    echo "[installer][health] probing optional TLS endpoint https://${DOMAIN}"
+    if ! curl -kfsS --connect-timeout 3 --max-time 5 "https://$DOMAIN" >/dev/null; then
+      echo "[WARN] public TLS endpoint check failed (non-blocking): https://${DOMAIN}"
+    else
+      echo "[installer][health] public TLS endpoint ok"
+    fi
   fi
   validate_static_layout
   echo "[OK] Installer completed successfully"

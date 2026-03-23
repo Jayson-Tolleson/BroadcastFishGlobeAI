@@ -53,6 +53,17 @@ class GfsEngine(GFSService):
         self._last_ocean_cache_state: str | None = None
         self._last_frame_cache_state: str | None = None
 
+    def lightweight_startup_check(self) -> dict[str, Any]:
+        csv, csv_err = self.load_fish()
+        summary = {
+            "ok": csv_err is None,
+            "csv_count": int(len(csv) if isinstance(csv, list) else 0),
+            "csv_error": csv_err,
+            "timestamp": int(time.time() * 1000),
+        }
+        log.info("[gfs-startup] lightweight check ok=%s csv_count=%s csv_error=%s", summary["ok"], summary["csv_count"], summary["csv_error"])
+        return summary
+
     def parse_intent(self, args: Any) -> ParsedIntent:
         vp = canonicalize_viewport({
             "west": args.get("west") if hasattr(args, "get") else None,
@@ -783,29 +794,16 @@ class GfsEngine(GFSService):
             "gfs_last_exception": self._gfs_ws_last_exception,
             "gfs_last_open_ts": self._gfs_ws_last_open_ts,
         }
-        try:
-            ocean = self.shared_ocean_payload(None)
-        except Exception as exc:
-            payload["ocean"] = {
-                "currents": {
-                    "selected_source": "unknown",
-                    "degraded": True,
-                    "primary": {
-                        "name": "hycom",
-                        "attempted": True,
-                        "ok": False,
-                        "reason": "ocean_health_failed",
-                        "detail": str(exc),
-                    },
-                }
-            }
-            return payload
-        currents_diag = (ocean.get("diagnostics") or {}).get("currents") or {}
+        vp = self._default_warm_viewport()
+        cached_ocean = self._cache.get(self._cache_key("ocean", vp)) or {}
+        currents_diag = (cached_ocean.get("diagnostics") or {}).get("currents") if isinstance(cached_ocean, dict) else {}
+        currents_diag = currents_diag or {}
         payload["ocean"] = {
             "currents": {
-                "selected_source": (ocean.get("sources") or {}).get("currents"),
-                "degraded": bool((ocean.get("degraded") or {}).get("currents")),
+                "selected_source": (cached_ocean.get("sources") or {}).get("currents") if isinstance(cached_ocean, dict) else None,
+                "degraded": bool((cached_ocean.get("degraded") or {}).get("currents")) if isinstance(cached_ocean, dict) else True,
                 "primary": currents_diag,
+                "cache_state": "hit" if isinstance(cached_ocean, dict) and cached_ocean else "empty",
             }
         }
         payload["entities"] = {
@@ -821,11 +819,12 @@ class GfsEngine(GFSService):
                 "entity_type": "fish_intelligence",
                 "source": "shared_ocean",
                 "derived": True,
-                "ok": bool((ocean.get("fields") or {}).get("current_u")),
-                "currents_source": (ocean.get("sources") or {}).get("currents"),
-                "degraded": bool((ocean.get("degraded") or {}).get("currents")),
+                "ok": bool((cached_ocean.get("fields") or {}).get("current_u")) if isinstance(cached_ocean, dict) else False,
+                "currents_source": (cached_ocean.get("sources") or {}).get("currents") if isinstance(cached_ocean, dict) else None,
+                "degraded": bool((cached_ocean.get("degraded") or {}).get("currents")) if isinstance(cached_ocean, dict) else True,
             },
         }
+        payload["warmup_state"] = "running" if self._ocean_refresh_inflight or self._weather_refresh_inflight else ("ready" if self._warm_ready else "idle")
         payload["performance"] = {
             "prewarm_duration_ms": self._prewarm_duration_ms,
             "last_ocean_latency_ms": self._last_ocean_latency_ms,

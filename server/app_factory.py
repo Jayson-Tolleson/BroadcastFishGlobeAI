@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from pathlib import Path
 
@@ -54,12 +55,19 @@ def create_quart_app() -> Quart:
     app.extensions["gfs_media_store"] = app.extensions["gfs_engine"]
 
     register_routes(app, state, settings, rtc)
+    startup_log = logging.getLogger("server.startup")
+    prewarm_mode = str(os.getenv("GFS_PREWARM_MODE", "lightweight")).strip().lower()
+    ai_worker_autostart = str(os.getenv("AI_WORKER_AUTOSTART", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
     @app.before_serving
     async def _start_ai_worker() -> None:
+        if not ai_worker_autostart:
+            startup_log.info("startup ai_worker autostart disabled")
+            return
         task = app.extensions.get("ai_worker_task")
         if task and not task.done():
             return
+        startup_log.info("startup ai_worker autostart enabled")
         app.extensions["ai_worker_task"] = app.add_background_task(app.extensions["ai_worker"].run_forever)
 
     @app.after_serving
@@ -71,10 +79,34 @@ def create_quart_app() -> Quart:
         if task and not task.done():
             task.cancel()
 
-    try:
-        threading.Thread(target=app.extensions["gfs_engine"].prewarm_startup, daemon=True).start()
-    except Exception as exc:
-        logging.getLogger("server.startup").warning("gfs prewarm thread start failed: %s", exc)
+    @app.before_serving
+    async def _startup_gfs_prewarm() -> None:
+        engine = app.extensions.get("gfs_engine")
+        if not engine:
+            startup_log.warning("startup gfs_engine missing; prewarm skipped")
+            return
+        if prewarm_mode in {"disabled", "off", "none"}:
+            startup_log.info("startup warmup mode=disabled")
+            return
+        if prewarm_mode in {"light", "lightweight", "route_check"}:
+            try:
+                engine.lightweight_startup_check()
+                startup_log.info("startup warmup mode=lightweight complete")
+            except Exception as exc:
+                startup_log.warning("startup warmup mode=lightweight failed: %s", exc)
+            return
+        if prewarm_mode in {"heavy", "full"}:
+            startup_log.info("startup warmup mode=heavy background begin")
+            try:
+                threading.Thread(target=engine.prewarm_startup, daemon=True).start()
+            except Exception as exc:
+                startup_log.warning("gfs prewarm thread start failed: %s", exc)
+            return
+        startup_log.warning("startup warmup mode=%s unknown; defaulting to lightweight", prewarm_mode)
+        try:
+            engine.lightweight_startup_check()
+        except Exception as exc:
+            startup_log.warning("startup warmup lightweight fallback failed: %s", exc)
 
     app.settings_obj = settings
     app.state_obj = state
@@ -83,7 +115,7 @@ def create_quart_app() -> Quart:
     ws_gfs_registered = "/ws/gfs" in registered_rules
     ws_gfs_legacy_registered = "/gfs/ws" in registered_rules
 
-    logging.getLogger("server.startup").info(
+    startup_log.info(
         "startup ready framework=quart static=%s templates=%s routes=/,/broadcast,/watch,/gfs ws=/ws/watch,/ws/broadcast,/ws/chat,/ws/gfs ws_gfs_registered=%s ws_gfs_legacy_registered=%s",
         STATIC_DIR,
         TEMPLATES_DIR,

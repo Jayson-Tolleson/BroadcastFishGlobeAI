@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 import json
 import logging
+import math
 import time
 
 from quart import Blueprint, current_app, request, jsonify, send_file, websocket
@@ -12,6 +13,17 @@ from quart import Blueprint, current_app, request, jsonify, send_file, websocket
 from server.gfs.viewport import parse_viewport_args, canonicalize_viewport
 
 log = logging.getLogger("server.gfs.routes")
+
+
+def _json_safe(value: Any):
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+    return value
 
 
 def _ocean_stride_for_viewport(vp, args) -> int:
@@ -179,7 +191,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_health():
         payload = gfs().health_payload()
         payload["warm"] = gfs().warm_status()
-        return jsonify(payload)
+        return jsonify(_json_safe(payload))
 
     @bp.route("/api/config")
     async def api_config():
@@ -200,7 +212,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
         payload["ocean_stride"] = ocean_stride
         log.info("/gfs/api/ocean latency_ms=%s stride=%s degraded=%s", payload.get("latency_ms"), ocean_stride, payload.get("degraded"))
-        return jsonify(payload)
+        return jsonify(_json_safe(payload))
 
     @bp.route("/api/weather")
     async def api_weather():

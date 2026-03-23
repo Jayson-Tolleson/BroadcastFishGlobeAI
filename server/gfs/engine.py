@@ -258,6 +258,8 @@ class GfsEngine(GFSService):
         cached = self._cache.get(key)
         if cached:
             out = {**cached, "warm": self._warm_ready, "stale": False, "cache": "fresh"}
+            out["request_latency_ms"] = round((time.time() - started) * 1000, 2)
+            out.setdefault("source_build_latency_ms", cached.get("latency_ms"))
             self._last_ocean_latency_ms = (time.time() - started) * 1000
             self._last_ocean_cache_state = "hit"
             log.info("[gfs-perf] ocean cache=hit viewport=%s latency_ms=%.2f", vp.as_bbox(), (time.time() - started) * 1000)
@@ -269,6 +271,8 @@ class GfsEngine(GFSService):
         ocean = self.ocean_service.build_shared_state(vp, weather)
         ocean_ms = (time.time() - ocean_started) * 1000
         ocean.update({"warm": self._warm_ready, "stale": False, "cache": "miss"})
+        ocean["request_latency_ms"] = round((time.time() - started) * 1000, 2)
+        ocean.setdefault("source_build_latency_ms", ocean.get("latency_ms"))
         self._cache.set(key, ocean)
         self._last_ocean_latency_ms = (time.time() - started) * 1000
         self._last_ocean_cache_state = "miss"

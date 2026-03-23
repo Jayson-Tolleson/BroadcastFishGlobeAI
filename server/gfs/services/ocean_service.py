@@ -22,10 +22,18 @@ class OceanService:
         self.depth = BathymetryProvider()
         self._chl_last_good: list[list[float]] | None = None
         self.provider_budgets_ms = {
-            "hycom": 2400,
+            "hycom": 2500,
             "coastwatch": 2000,
             "wavewatch": 1600,
             "bathymetry": 600,
+        }
+        self._component_cache: dict[str, dict[str, Any]] = {}
+        self._component_ttl_s = {
+            "currents": 60,
+            "chlorophyll": 900,
+            "waves": 300,
+            "depth": 86400,
+            "ocean": 60,
         }
 
     def _empty_grid(self, rows: int, cols: int) -> list[list[float]]:
@@ -47,26 +55,75 @@ class OceanService:
                 log.warning("[gfs/ocean] provider failed name=%s err=%s", name, exc)
                 return default, (time.time() - started) * 1000, True
 
+    def _cache_key(self, viewport, component: str) -> str:
+        return f"{component}:{viewport.west:.2f}:{viewport.south:.2f}:{viewport.east:.2f}:{viewport.north:.2f}:s{viewport.stride}:q{viewport.quality}"
+
+    def _cache_get(self, viewport, component: str) -> dict[str, Any] | None:
+        key = self._cache_key(viewport, component)
+        item = self._component_cache.get(key)
+        if not isinstance(item, dict):
+            return None
+        age_s = time.time() - float(item.get("built_at", 0.0))
+        if age_s > float(self._component_ttl_s.get(component, 60)):
+            return None
+        return item
+
+    def _cache_put(self, viewport, component: str, payload: dict[str, Any]) -> None:
+        key = self._cache_key(viewport, component)
+        self._component_cache[key] = {"built_at": time.time(), "payload": payload, "bbox": viewport.as_bbox(), "component": component}
+
+    def _find_compatible_currents(self, viewport) -> dict[str, Any] | None:
+        exact = self._cache_get(viewport, "currents")
+        if exact:
+            return exact
+        fallback = None
+        for item in self._component_cache.values():
+            if not isinstance(item, dict) or item.get("component") != "currents":
+                continue
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+            if not isinstance(payload.get("u"), list) or not payload.get("u"):
+                continue
+            fallback = item
+            break
+        return fallback
+
     def build_shared_state(self, viewport, weather: dict[str, Any]) -> dict[str, Any]:
         started = time.time()
         grid = build_canonical_grid(viewport)
         log.info("canonical grid rows=%s cols=%s cell_deg=%s", grid.rows, grid.cols, grid.cell_deg)
         log.info("[gfs/source-policy] currents=hycom chlorophyll=coastwatch waves=wavewatch bathymetry=bathymetry weather=ncss")
 
+        log.info("[gfs/ocean] request key=%s cache=miss", self._cache_key(viewport, "ocean"))
         currents, currents_ms, currents_timed_out = self._run_with_budget(
             "hycom",
             lambda: self.hycom.fetch(weather, viewport.as_dict()),
             None,
         )
         currents_status = {"primary": "hycom", "selected_source": (currents or {}).get("source") if isinstance(currents, dict) else "none"}
+        currents_cache_used = False
         if currents is None:
-            currents = {"u": self._empty_grid(grid.rows, grid.cols), "v": self._empty_grid(grid.rows, grid.cols), "source": "hycom", "degraded": True, "ok": False, "source_status": "unavailable"}
-            currents_status["degraded"] = True
-            currents_status["reason"] = "hycom_unavailable"
+            cached_currents = self._find_compatible_currents(viewport)
+            if cached_currents and isinstance(cached_currents.get("payload"), dict):
+                cpay = cached_currents["payload"]
+                currents = {
+                    "u": cpay.get("u") or self._empty_grid(grid.rows, grid.cols),
+                    "v": cpay.get("v") or self._empty_grid(grid.rows, grid.cols),
+                    "source": "hycom_cached",
+                    "degraded": False,
+                    "ok": True,
+                    "source_status": "available_cached",
+                }
+                currents_cache_used = True
+                currents_status["reason"] = "hycom_cache_fallback"
+            else:
+                currents = {"u": self._empty_grid(grid.rows, grid.cols), "v": self._empty_grid(grid.rows, grid.cols), "source": "hycom", "degraded": True, "ok": False, "source_status": "unavailable"}
+                currents_status["degraded"] = True
+                currents_status["reason"] = "hycom_unavailable"
         else:
             currents_status["degraded"] = bool(currents.get("degraded"))
             currents["ok"] = True
             currents.setdefault("source_status", "available")
+            self._cache_put(viewport, "currents", {"u": currents.get("u") or [], "v": currents.get("v") or [], "source_status": currents.get("source_status"), "degraded": False})
         log.info("currents source=%s source_status=%s degraded=%s", currents.get("source"), currents.get("source_status"), currents.get("degraded"))
         if currents_timed_out:
             currents_status["reason"] = "hycom_timeout_or_error"
@@ -92,6 +149,7 @@ class OceanService:
             chl_ok = True
         if chlorophyll and chl_source == "coastwatch":
             self._chl_last_good = chlorophyll
+            self._cache_put(viewport, "chlorophyll", {"chlorophyll": chlorophyll, "source_status": "available"})
         log.info("chlorophyll source=%s source_status=%s", chl_source, chl_source_status)
         if chl_timed_out and chl_source == "coastwatch":
             chl_source = "timeout"
@@ -111,6 +169,8 @@ class OceanService:
             waves["ok"] = True
         if waves_timed_out:
             waves["source_status"] = "timeout"
+        elif isinstance(waves.get("height_m"), list) and waves.get("height_m"):
+            self._cache_put(viewport, "waves", {"waves": waves, "source_status": waves.get("source_status")})
         (depth_grid, depth_degraded), depth_ms, depth_timed_out = self._run_with_budget(
             "bathymetry",
             lambda: self.depth.fetch(grid.rows, grid.cols, viewport.as_dict()),
@@ -147,7 +207,7 @@ class OceanService:
                 "depth": "unavailable" if depth_degraded else "available",
             },
             "degraded": {
-                "currents": bool(currents.get("degraded")),
+                "currents": bool(currents.get("degraded")) and not currents_cache_used,
                 "waves": not bool(waves.get("ok")),
                 "chlorophyll": chl_source != "coastwatch",
                 "depth": bool(depth_degraded or depth_timed_out),
@@ -166,6 +226,10 @@ class OceanService:
                     "wavewatch": bool(waves_timed_out),
                     "bathymetry": bool(depth_timed_out),
                 },
+                "cache_used": {
+                    "currents": bool(currents_cache_used),
+                    "chlorophyll": chl_source == "cache_last_good",
+                },
             },
             "fields": {
                 "current_u": currents.get("u") or [],
@@ -180,7 +244,16 @@ class OceanService:
             },
             "count": grid.rows * grid.cols,
             "latency_ms": round((time.time() - started) * 1000, 2),
+            "source_build_latency_ms": round((time.time() - started) * 1000, 2),
         }
+        self._cache_put(viewport, "ocean", payload)
+        log.info(
+            "[gfs/ocean] resolve currents source=%s status=%s degraded=%s cache_used=%s",
+            currents.get("source"),
+            currents.get("source_status"),
+            payload["degraded"]["currents"],
+            currents_cache_used,
+        )
         log.info(
             "[gfs-perf] ocean-service rows=%s cols=%s currents_ms=%.2f chl_ms=%.2f waves_ms=%.2f depth_ms=%.2f total_ms=%.2f",
             grid.rows,

@@ -66,7 +66,7 @@ function normalizeFishPayload(payload) {
   };
 }
 
-function normalizeOceanPayload(payload) {
+export function normalizeOceanPayload(payload) {
   if (payload && typeof payload === 'object' && String(payload.source || '') === 'shared_ocean') return payload;
   warn('ocean payload contract mismatch', { source: payload?.source });
   return {

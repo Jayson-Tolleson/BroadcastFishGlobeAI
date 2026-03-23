@@ -1,4 +1,4 @@
-import { getJsonSafe, uploadSafe, fetchOceanState, fetchLocationLive, fetchLocations, getGfsWebSocketUrl } from './api.js';
+import { getJsonSafe, uploadSafe, fetchLocationLive, fetchLocations, getGfsWebSocketUrl, normalizeOceanPayload } from './api.js';
 import { ensureMaps3D, libs } from './globe.js';
 import { renderMarkers } from './markers.js';
 import { createHud } from './hud.js';
@@ -116,6 +116,7 @@ const dataState = {
   lastRequestOutcome: 'ok',
   inFlight: false,
   requestSeq: 0,
+  latestGeneration: 0,
   activeAbort: null,
   lastSignature: '',
   lastHeavySignature: '',
@@ -130,6 +131,15 @@ const dataState = {
     boats: null,
     locations: null,
   },
+};
+
+const viewportRefresh = {
+  restDebounceMs: 400,
+  refreshMs: 15000,
+  restTimer: 0,
+  refreshTimer: 0,
+  isMoving: false,
+  lastIdleSignature: '',
 };
 
 window.__gfsDataInduction = {
@@ -364,13 +374,15 @@ async function refreshData(reason = 'manual') {
     return dataState.latest;
   }
 
-  if (dataState.inFlight && dataState.activeAbort) {
+  if (dataState.inFlight) return dataState.latest;
+  if (dataState.activeAbort) {
     try { dataState.activeAbort.abort(); } catch (_) {}
   }
 
   const controller = new AbortController();
-  const seq = dataState.requestSeq + 1;
-  dataState.requestSeq = seq;
+  const generation = dataState.latestGeneration + 1;
+  dataState.latestGeneration = generation;
+  dataState.requestSeq = generation;
   dataState.inFlight = true;
   dataState.activeAbort = controller;
   dataState.latest.bbox = viewport;
@@ -381,12 +393,18 @@ async function refreshData(reason = 'manual') {
     const vpQ = viewportToQuery(viewport);
     const frameQuality = 'full';
     const frameStride = 1;
-    const frameUrl = `/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&quality=${encodeURIComponent(frameQuality)}&stride=${encodeURIComponent(frameStride)}`;
-    const [frame, ocean, locationsPayload] = await Promise.all([
-      getJsonSafe(frameUrl, null, { signal: controller.signal, timeoutMs: 12000, abortPrevious: true }),
-      fetchOceanState(viewport, { signal: controller.signal, abortPrevious: true }),
-      fetchLocations(viewport, { signal: controller.signal, timeoutMs: 2600, abortPrevious: false }),
-    ]);
+    const frameUrl = `/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&mode=live&quality=${encodeURIComponent(frameQuality)}&stride=${encodeURIComponent(frameStride)}`;
+    const frame = await getJsonSafe(frameUrl, null, { signal: controller.signal, timeoutMs: 2000, abortPrevious: true });
+    fetchLocations(viewport, { timeoutMs: 1800, abortPrevious: false })
+      .then((locationsPayload) => {
+        if (!locationsPayload || generation !== dataState.latestGeneration) return;
+        dataState.latest.locations = locationsPayload;
+        gfsState.setCache('locations', locationsPayload || null);
+        renderMarkerSets('steady');
+      })
+      .catch((err) => console.info('[gfs locations] deferred fetch failed', err?.message || err));
+    const ocean = normalizeOceanPayload(frame?.ocean);
+    const locationsPayload = dataState.latest.locations || { locations: [] };
     console.info('[gfs markers] endpoint hit', {
       endpoint: '/gfs/api/locations',
       entity_type: locationsPayload?.entity_type,
@@ -398,7 +416,7 @@ async function refreshData(reason = 'manual') {
     const normalizedFrame = normalizeFramePayload(frame);
     if (!ocean) gfsState.setStaleHold('ocean payload unavailable; holding prior ocean metadata');
     if (!normalizedFrame) { gfsState.debugHoldReason = 'frame missing/invalid; held previous visuals'; return dataState.latest; }
-    if (seq !== dataState.requestSeq) return dataState.latest;
+    if (generation !== dataState.latestGeneration) return dataState.latest;
 
     dataState.latest.weather = normalizedFrame.weather || null;
     dataState.latest.clouds = normalizedFrame.clouds || null;
@@ -434,7 +452,7 @@ async function refreshData(reason = 'manual') {
       sigmaClouds: Array.isArray(normalizedFrame?.sigmaClouds) ? normalizedFrame.sigmaClouds.length : 0,
       csvLocations: Array.isArray(dataState.latest.locations?.locations) ? dataState.latest.locations.locations.length : 0,
     });
-    if (reason === 'boot' || reason === 'steady' || reason === 'manual') {
+    if (reason === 'boot' || reason === 'manual') {
       refreshDeferredBaitAdvanced(viewport, reason).catch((err) => console.info('[gfs bait advanced] deferred fetch skipped', { message: err?.message || String(err) }));
     }
     return dataState.latest;
@@ -452,7 +470,7 @@ async function refreshData(reason = 'manual') {
     return dataState.latest;
   } finally {
     if (dataState.activeAbort === controller) dataState.activeAbort = null;
-    if (seq === dataState.requestSeq) dataState.inFlight = false;
+    if (generation === dataState.latestGeneration) dataState.inFlight = false;
   }
 }
 
@@ -521,28 +539,48 @@ async function refreshDeferredBaitAdvanced(viewport, reason = 'manual') {
   return payload;
 }
 function installSteadyRefresh() {
-  let dirty = true;
-
-  const onMove = () => {
-    dirty = true;
+  const clearRestTimer = () => {
+    if (!viewportRefresh.restTimer) return;
+    clearTimeout(viewportRefresh.restTimer);
+    viewportRefresh.restTimer = 0;
   };
-
-  const onSteady = (ev) => {
-    const isSteady = ev?.isSteady;
-    if (typeof isSteady === 'boolean' && !isSteady) return;
-    if (!dirty) return;
-    dirty = false;
+  const clearRefreshTimer = () => {
+    if (!viewportRefresh.refreshTimer) return;
+    clearInterval(viewportRefresh.refreshTimer);
+    viewportRefresh.refreshTimer = 0;
+  };
+  const scheduleIdleRefresh = () => {
+    clearRefreshTimer();
+    viewportRefresh.refreshTimer = setInterval(() => {
+      if (viewportRefresh.isMoving || dataState.inFlight) return;
+      refreshData('steady');
+    }, viewportRefresh.refreshMs);
+  };
+  const triggerRestFetch = () => {
+    if (viewportRefresh.isMoving) return;
+    const signature = bboxSignature(getCanonicalViewport());
+    if (signature === viewportRefresh.lastIdleSignature && !dataState.inFlight) return;
+    viewportRefresh.lastIdleSignature = signature;
     refreshData('steady');
+    scheduleIdleRefresh();
+  };
+  const onMove = () => {
+    viewportRefresh.isMoving = true;
+    clearRestTimer();
+    clearRefreshTimer();
+    viewportRefresh.restTimer = setTimeout(() => {
+      viewportRefresh.isMoving = false;
+      triggerRestFetch();
+    }, viewportRefresh.restDebounceMs);
   };
 
   STEADY_EVENTS.forEach((evt) => globeEl.addEventListener(evt, onMove));
-  globeEl.addEventListener('gmp-steadystate', onSteady);
-  globeEl.addEventListener('gmp-steadychange', onSteady);
+  onMove();
 
   return () => {
     STEADY_EVENTS.forEach((evt) => globeEl.removeEventListener(evt, onMove));
-    globeEl.removeEventListener('gmp-steadystate', onSteady);
-    globeEl.removeEventListener('gmp-steadychange', onSteady);
+    clearRestTimer();
+    clearRefreshTimer();
   };
 }
 

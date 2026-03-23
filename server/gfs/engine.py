@@ -617,58 +617,49 @@ class GfsEngine(GFSService):
     def frame_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:
         started = time.time()
         vp = canonicalize_viewport(bbox)
-        weather_started = time.time()
         weather = self._safe_weather_payload(vp)
-        weather_ms = (time.time() - weather_started) * 1000
-        clouds_started = time.time()
         clouds = self._compact_cloud_payload_from_weather(weather, vp)
-        clouds_ms = (time.time() - clouds_started) * 1000
-        ocean_started = time.time()
         ocean = self.shared_ocean_payload(vp.as_dict())
-        ocean_ms = (time.time() - ocean_started) * 1000
-        fish_started = time.time()
-        fish_payload = self.fish_from_ocean(vp.as_dict())
-        fish_items = fish_payload.get("items") or []
-        fish_ms = (time.time() - fish_started) * 1000
-        bait_started = time.time()
-        bait = self.bait_from_ocean(vp.as_dict())
-        bait_ms = (time.time() - bait_started) * 1000
-        boats_started = time.time()
-        boats_payload = self.boats_from_ocean(vp.as_dict())
-        boats = boats_payload.get("boats") or []
-        boats_ms = (time.time() - boats_started) * 1000
-        log.info("frame refresh viewport=%s fish=%s bait=%s boats=%s", vp.as_bbox(), len(fish_items), len(bait.get("polygons") or []), len(boats))
-        log.info(
-            "[gfs-perf] frame viewport=%s weather_ms=%.2f clouds_ms=%.2f ocean_ms=%.2f fish_ms=%.2f bait_ms=%.2f boats_ms=%.2f total_ms=%.2f",
-            vp.as_bbox(),
-            weather_ms,
-            clouds_ms,
-            ocean_ms,
-            fish_ms,
-            bait_ms,
-            boats_ms,
-            (time.time() - started) * 1000,
-        )
+        fields = weather.get("fields") if isinstance(weather.get("fields"), dict) else {}
+        precip = self._to_2d_grid(fields.get("precip_rate") or fields.get("prate"))
+        lat_grid = clouds.get("grid", {}).get("lats") or []
+        lon_grid = clouds.get("grid", {}).get("lons") or []
+        freshness = "fresh" if str(weather.get("payload_state") or "").lower() == "live" else "stale"
+
+        latency_ms = (time.time() - started) * 1000
+        log.info("[gfs-perf] frame live viewport=%s freshness=%s latency_ms=%.2f", vp.as_bbox(), freshness, latency_ms)
         self._last_frame_latency_ms = (time.time() - started) * 1000
-        self._last_frame_cache_state = f"ocean:{self._last_ocean_cache_state}|fish:{fish_payload.get('cache')}|bait:{bait.get('cache')}|boats:{boats_payload.get('cache')}"
+        self._last_frame_cache_state = f"ocean:{self._last_ocean_cache_state}|weather:{weather.get('payload_state')}"
         return {
             "ok": True,
             "bbox": vp.as_bbox(),
+            "timestamp": int(time.time() * 1000),
+            "freshness": freshness,
+            "mode": "live",
+            "grid": {
+                "lats": lat_grid,
+                "lons": lon_grid,
+                "cloud_low": clouds.get("grid", {}).get("low") or [],
+                "cloud_mid": clouds.get("grid", {}).get("mid") or [],
+                "cloud_high": clouds.get("grid", {}).get("high") or [],
+                "cloud_total": clouds.get("grid", {}).get("total") or [],
+                "precip": precip,
+            },
+            "wind": {
+                "u": clouds.get("wind", {}).get("u") or [],
+                "v": clouds.get("wind", {}).get("v") or [],
+            },
             "weather": weather,
             "clouds": clouds,
             "ocean": ocean,
-            "fish": {"items": fish_items, "count": len(fish_items), "source": fish_payload.get("source", "shared_ocean"), "cache": fish_payload.get("cache")},
-            "baitBase": {"ok": True, "source": bait.get("source", "shared_ocean"), "degraded": bait.get("degraded", False), "bait_score": bait.get("bait_score") or [], "bait": {"status": "ready", "source": bait.get("source", "shared_ocean"), "polygons": (bait.get("bait") or {}).get("polygons") or bait.get("polygons") or []}, "cache": bait.get("cache")},
-            "baitAdvanced": {"ok": True, "source": bait.get("source", "shared_ocean"), "degraded": bait.get("degraded", False), "bait_score": bait.get("bait_score") or [], "bait": {"status": "ready", "source": bait.get("source", "shared_ocean"), "polygons": (bait.get("bait") or {}).get("polygons") or bait.get("polygons") or []}, "cache": bait.get("cache")},
-            "boats": {"boats": boats, "count": len(boats), "source": "shared_ocean"},
-            "recursiveGrid": {"bbox": vp.as_bbox(), "polygons": {"boater": [{"coordinates": poly["coordinates"]} for poly in (bait.get("polygons") or [])]}},
             "debug": {
                 "cycle": ocean.get("cycle"),
                 "sources": ocean.get("sources"),
                 "degraded": ocean.get("degraded"),
-                "counts": {"fish": len(fish_items), "bait": len(bait.get("polygons") or []), "boats": len(boats)},
+                "counts": {"cells": len(lat_grid) * len(lon_grid)},
                 "warm": self._warm_ready,
             },
+            "latency_ms": round(latency_ms, 2),
         }
 
     def compact_cloud_payload(self, bbox: dict[str, float] | None) -> dict[str, Any]:

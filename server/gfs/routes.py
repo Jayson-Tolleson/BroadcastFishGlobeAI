@@ -128,8 +128,8 @@ async def handle_gfs_ws(engine_getter, ws_obj) -> None:
 
 
 def _normalize_location_item(item: dict[str, Any]) -> dict[str, Any]:
-    item_id = item.get("id") or item.get("location_key") or "loc"
     location_key = item.get("location_key") or item.get("id") or "loc"
+    item_id = location_key
     return {
         "id": item_id,
         "location_key": location_key,
@@ -352,17 +352,37 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         item = _find_fish_item(location_key) or {}
         media_payload = media().location_media(location_key)
         normalized = _normalize_location_item(item)
+        canonical_id = _coerce_key(normalized.get("location_key") or normalized.get("id") or location_key)
         return {
             "ok": True,
-            "id": normalized.get("id") or location_key,
-            "location_key": normalized.get("location_key") or location_key,
-            "name": normalized.get("name") or media_payload.get("label") or location_key,
+            "id": canonical_id,
+            "location_key": canonical_id,
+            "canonical_id": canonical_id,
+            "name": normalized.get("name") or media_payload.get("label") or canonical_id,
             "lat": normalized.get("lat"),
             "lon": normalized.get("lon"),
             "fish_index": normalized.get("fish_index"),
             "probability": normalized.get("probability"),
             "confidence": normalized.get("confidence"),
             "meta": normalized.get("meta"),
+            "marker_class": normalized.get("marker_class"),
+            "bait_applicable": bool(normalized.get("bait_applicable")),
+            "intel_tier": normalized.get("intel_tier"),
+            "intel_sources": normalized.get("intel_sources") or [],
+            "missing_inputs": normalized.get("missing_inputs") or [],
+            "quick_weather": normalized.get("quick_weather") or {},
+            "quick_ocean": normalized.get("quick_ocean") or {},
+            "quick_snapshot": normalized.get("quick_snapshot") or {},
+            "marker_environment": normalized.get("marker_environment") or {},
+            "profile": {
+                "node_id": canonical_id,
+                "canonical_id": canonical_id,
+                "marker_class": normalized.get("marker_class"),
+                "bait_applicable": bool(normalized.get("bait_applicable")),
+                "intel_tier": normalized.get("intel_tier"),
+                "intel_sources": normalized.get("intel_sources") or [],
+                "missing_inputs": normalized.get("missing_inputs") or [],
+            },
             "reports": [media_payload.get("report_text")] if media_payload.get("report_text") else [],
             "report_text": media_payload.get("report_text") or "",
             "uploads": media_payload.get("uploads") or [],
@@ -372,6 +392,10 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/location/<location_key>")
     async def location_detail(location_key):
+        return jsonify(_location_detail_payload(location_key))
+
+    @bp.route("/api/intelligence/node/<location_key>")
+    async def intelligence_node(location_key):
         return jsonify(_location_detail_payload(location_key))
 
     @bp.route("/api/location/<location_key>/media")
@@ -396,8 +420,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         if request.method == "GET":
             payload = media().location_media(location_key)
             live = payload.get("live") or {"active": False, "stream_url": "", "updated_at": None}
-            fish = _find_fish_item(location_key) or {}
-            normalized = _normalize_location_item(fish)
+            normalized = _location_detail_payload(location_key)
             return jsonify({
                 "ok": True,
                 "id": normalized.get("id") or location_key,

@@ -45,6 +45,7 @@ class GfsEngine(GFSService):
         self._gfs_ws_last_open_ts: int | None = None
         self._weather_refresh_inflight = False
         self._weather_refresh_last_ts = 0.0
+        self._weather_sync_seed_last_ts = 0.0
         self._ocean_refresh_inflight = False
         self._ocean_refresh_last_ts = 0.0
         self._prewarm_duration_ms: float | None = None
@@ -87,7 +88,28 @@ class GfsEngine(GFSService):
     def _safe_weather_payload(self, vp) -> dict[str, Any]:
         started = time.time()
         payload = self.generate_weather_payload_fast(vp.as_dict())
-        if str(payload.get("payload_state") or "").lower() != "live":
+        payload_state = str(payload.get("payload_state") or "").lower()
+        if payload_state == "unavailable":
+            now = time.time()
+            should_seed_sync = (
+                (now - float(self._weather_sync_seed_last_ts or 0.0)) >= 60.0
+                and not bool(self._weather_refresh_inflight)
+            )
+            if should_seed_sync:
+                self._weather_sync_seed_last_ts = now
+                try:
+                    seeded = self._generate_weather_payload_uncached(vp.as_dict())
+                    seeded_state = str(seeded.get("payload_state") or "").lower()
+                    if seeded_state in {"live", "cached"}:
+                        now_ms = self._now_ms()
+                        self._weather_payload_cache = {"ts": now_ms, "payload": seeded}
+                        self._weather_fast_cache = {"ts": now_ms, "payload": seeded}
+                        payload = seeded
+                        payload_state = seeded_state
+                        log.info("[gfs-perf] weather sync seed succeeded payload_state=%s source=%s", seeded.get("payload_state"), seeded.get("source"))
+                except Exception as exc:
+                    log.warning("[gfs-perf] weather sync seed failed err=%s", exc)
+        if payload_state != "live":
             self._maybe_refresh_weather_async()
         log.info(
             "[gfs-perf] weather fast_path payload_state=%s source=%s latency_ms=%.2f",

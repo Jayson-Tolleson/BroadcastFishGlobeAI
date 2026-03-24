@@ -338,6 +338,7 @@ class GfsEngine(GFSService):
                 "derived": True,
                 "cache": "hit",
             }
+        weather = self._safe_weather_payload(vp)
         ocean = self.shared_ocean_payload_fast(vp, weather)
         items = self.fish_service.score_markers(ocean, vp)
         log.info("fish derived count=%s viewport=%s", len(items), vp.as_bbox())
@@ -639,6 +640,7 @@ class GfsEngine(GFSService):
                 "derived": True,
                 "cache": "hit",
             }
+        weather = self._safe_weather_payload(vp)
         ocean = self.shared_ocean_payload_fast(vp, weather)
         scored = self.bait_service.score(ocean, vp)
         log.info("bait derived polygons=%s viewport=%s", len(scored.get("polygons") or []), vp.as_bbox())

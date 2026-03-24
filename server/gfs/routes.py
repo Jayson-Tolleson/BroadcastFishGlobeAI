@@ -283,7 +283,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         payload = gfs().frame_payload(vp.as_dict())
         payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
         log.info("/gfs/api/frame latency_ms=%s viewport=%s", payload.get("latency_ms"), vp.as_dict())
-        return jsonify(payload)
+        return jsonify(_json_safe(payload))
 
     @bp.route("/api/tiles/<layer>/<int:z>/<int:x>/<int:y>")
     async def api_tiles(layer, z, x, y):

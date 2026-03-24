@@ -132,6 +132,10 @@ const dataState = {
     ocean: null,
     locations: null,
   },
+  locationsRequest: {
+    status: 'idle', // idle | pending | resolved | error
+    completedOnce: false,
+  },
 };
 
 const viewportRefresh = {
@@ -391,6 +395,7 @@ async function refreshData(reason = 'manual') {
   dataState.activeAbort = controller;
   dataState.latest.bbox = viewport;
   dataState.lastSignature = signature;
+  dataState.locationsRequest.status = 'pending';
 
   try {
     const bboxQ = encodeURIComponent(bboxToQuery(viewport));
@@ -403,10 +408,15 @@ async function refreshData(reason = 'manual') {
       .then((locationsPayload) => {
         if (!locationsPayload || generation !== dataState.latestGeneration) return;
         dataState.latest.locations = locationsPayload;
+        dataState.locationsRequest.status = 'resolved';
+        dataState.locationsRequest.completedOnce = true;
         gfsState.setCache('locations', locationsPayload || null);
         renderMarkerSets('steady');
       })
-      .catch((err) => console.info('[gfs locations] deferred fetch failed', err?.message || err));
+      .catch((err) => {
+        dataState.locationsRequest.status = 'error';
+        console.info('[gfs locations] deferred fetch failed', err?.message || err);
+      });
     const ocean = normalizeOceanPayload(dataState.latest.ocean || frame?.ocean || null);
     const locationsPayload = dataState.latest.locations || { locations: [] };
     console.info('[gfs markers] endpoint hit', {
@@ -462,6 +472,7 @@ async function refreshData(reason = 'manual') {
     }
     return dataState.latest;
   } catch (err) {
+    if (dataState.locationsRequest.status === 'pending') dataState.locationsRequest.status = 'error';
     if (err?.name === 'AbortError') {
       dataState.lastRequestOutcome = 'intentional_abort';
     } else if (String(err?.message || '').toLowerCase().includes('timeout')) {
@@ -545,6 +556,11 @@ function renderMarkerSets(reason = 'manual') {
   }
   const rawLocations = Array.isArray(dataState.latest.locations?.locations) ? dataState.latest.locations.locations : [];
   const locationMarkers = rawLocations.map((item) => toHudMarker(item)).filter(Boolean);
+  const locationsPending = dataState.locationsRequest.status === 'pending' && !dataState.locationsRequest.completedOnce;
+  if (locationsPending && !locationMarkers.length) {
+    console.info('[gfs markers] waiting on locations payload; preserving prior markers', { reason });
+    return;
+  }
   console.info('[gfs markers] normalize counts', {
     reason,
     locations_received: rawLocations.length,
@@ -569,6 +585,7 @@ function renderMarkerSets(reason = 'manual') {
       reason,
       locations_source: dataState.latest.locations?.source,
       suppression_reason: dataState.latest.locations?.contract_mismatch ? 'locations_contract_mismatch' : 'no_locations_in_viewport',
+      locations_request_status: dataState.locationsRequest.status,
     });
   }
 }

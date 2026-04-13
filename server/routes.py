@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from quart import Quart, current_app, websocket
@@ -21,6 +22,7 @@ from server.state import AppState
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+log = logging.getLogger("server.routes")
 
 
 def _static_file(path_name: str):
@@ -36,13 +38,13 @@ def register_routes(app: Quart, state: AppState, settings: Settings, rtc: RTCMan
     app.register_blueprint(create_broadcast_ai_blueprint())
     app.register_blueprint(create_lftr_ai_blueprint())
     app.register_blueprint(api_bp)
-    try:
-        current_app_engine = app.extensions.get("gfs_engine")
-        mark_registered = getattr(current_app_engine, "mark_gfs_ws_registered", None)
-        if callable(mark_registered):
+    current_app_engine = app.extensions.get("gfs_engine")
+    mark_registered = getattr(current_app_engine, "mark_gfs_ws_registered", None)
+    if callable(mark_registered):
+        try:
             mark_registered(True)
-    except Exception:
-        pass
+        except Exception as exc:
+            log.warning("failed to mark /ws/gfs registered on gfs_engine: %s", exc)
 
     @app.websocket("/ws/gfs")
     async def ws_gfs():

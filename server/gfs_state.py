@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Internal state container used by legacy `server.gfs_service.GFSService`.
+
+Authoritative HTTP/WebSocket route wiring lives under `server.gfs.engine` and
+`server.gfs.routes`; this dataclass remains to support shared service internals.
+"""
+
 from dataclasses import dataclass, field
 from typing import Any
 

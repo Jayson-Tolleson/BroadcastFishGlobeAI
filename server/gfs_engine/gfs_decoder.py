@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""Legacy decoder retained for compatibility and reference.
+
+The authoritative runtime decode path is in `server/gfs_service.py` and the
+`server.gfs` provider/service stack used by `server.gfs.engine`.
+"""
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any

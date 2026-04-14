@@ -1,16 +1,176 @@
-"""
-GFS Routes module.
-Registers endpoints expected by the GFS frontend and installer health checks.
-"""
+"""GFS routes with canonical shared-ocean architecture."""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import json
+import logging
+import math
 import time
 
 from quart import Blueprint, current_app, request, jsonify, send_file, websocket
 
-from server.gfs.polygon_builder import build_bait_ocean_field_v1
+from server.gfs.viewport import parse_viewport_args, canonicalize_viewport
+
+log = logging.getLogger("server.gfs.routes")
+
+
+def _json_safe(value: Any):
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+    return value
+
+
+def _ocean_stride_for_viewport(vp, args) -> int:
+    span = max(abs(float(vp.east) - float(vp.west)), abs(float(vp.north) - float(vp.south)))
+    range_hint = None
+    raw_viewport = args.get("viewport") if hasattr(args, "get") else None
+    if isinstance(raw_viewport, str) and raw_viewport.strip():
+        try:
+            obj = json.loads(raw_viewport)
+            range_hint = float(((obj.get("camera") or {}).get("range")))
+        except Exception:
+            range_hint = None
+    if span <= 8 and (range_hint is None or range_hint <= 900000):
+        return 1
+    if span <= 20 and (range_hint is None or range_hint <= 2200000):
+        return 2
+    if span <= 45:
+        return 3
+    return 4
+
+
+def _route_debug_start(route: str, vp, raw_query: str) -> float:
+    started = time.time()
+    log.info("[gfs/route] start route=%s query=%s viewport=%s", route, raw_query, vp.as_dict() if hasattr(vp, "as_dict") else vp)
+    return started
+
+
+def _route_debug_done(route: str, started: float, payload: dict[str, Any], status_code: int = 200) -> None:
+    log.info(
+        "[gfs/route] done route=%s status=%s latency_ms=%.2f ok=%s source=%s stale=%s payload_state=%s count=%s",
+        route,
+        status_code,
+        (time.time() - started) * 1000,
+        payload.get("ok") if isinstance(payload, dict) else None,
+        payload.get("source") if isinstance(payload, dict) else None,
+        payload.get("stale") if isinstance(payload, dict) else None,
+        payload.get("payload_state") if isinstance(payload, dict) else None,
+        payload.get("count") if isinstance(payload, dict) else None,
+    )
+
+
+async def handle_gfs_ws(engine_getter, ws_obj) -> None:
+    log.info("/ws/gfs route entry")
+    engine = None
+    try:
+        engine = engine_getter()
+        mark_open = getattr(engine, "mark_gfs_ws_open", None)
+        if callable(mark_open):
+            mark_open()
+    except Exception:
+        log.exception("/ws/gfs failed to resolve engine before handshake")
+    log.info("/ws/gfs handshake open")
+    try:
+        await ws_obj.send_json({"type": "hello", "channel": "gfs", "ws": "connected"})
+        log.info("/ws/gfs first hello sent")
+    except Exception as exc:
+        log.exception("/ws/gfs hello send failed")
+        if engine is not None:
+            mark_exc = getattr(engine, "mark_gfs_ws_exception", None)
+            if callable(mark_exc):
+                mark_exc(exc)
+        if engine is not None:
+            mark_close = getattr(engine, "mark_gfs_ws_close", None)
+            if callable(mark_close):
+                mark_close()
+        return
+    while True:
+        try:
+            msg = await ws_obj.receive()
+            if msg is None:
+                log.info("/ws/gfs disconnect: empty")
+                break
+            parsed = msg
+            if isinstance(msg, str):
+                try:
+                    parsed = json.loads(msg)
+                except Exception:
+                    parsed = {"type": msg}
+            msg_type = str((parsed or {}).get("type") or msg).lower()
+            if msg_type == "ping":
+                await ws_obj.send_json({"type": "pong", "detail": "ping"})
+            elif msg_type == "status":
+                status_payload = (engine or engine_getter()).websocket_status_payload()
+                await ws_obj.send_json(status_payload)
+                log.info("/ws/gfs status served")
+            elif msg_type in {"refresh", "refresh_nudge"}:
+                await ws_obj.send_json({"type": "refresh_nudge", "layer": "ocean"})
+            else:
+                await ws_obj.send_json({"type": "ack", "detail": msg_type})
+        except Exception as exc:
+            log.exception("/ws/gfs exception")
+            if engine is not None:
+                mark_exc = getattr(engine, "mark_gfs_ws_exception", None)
+                if callable(mark_exc):
+                    mark_exc(exc)
+            break
+    if engine is not None:
+        mark_close = getattr(engine, "mark_gfs_ws_close", None)
+        if callable(mark_close):
+            mark_close()
+    log.info("/ws/gfs closed")
+
+
+def _normalize_location_item(item: dict[str, Any]) -> dict[str, Any]:
+    location_key = item.get("location_key") or item.get("id") or "loc"
+    item_id = location_key
+    return {
+        "id": item_id,
+        "location_key": location_key,
+        "name": item.get("name") or "Fishing location",
+        "lat": item.get("lat"),
+        "lon": item.get("lon"),
+        "fish_index": item.get("fish_index"),
+        "probability": item.get("probability"),
+        "confidence": item.get("confidence"),
+        "meta": {"reason": item.get("reason"), "reasons": item.get("reasons") or []},
+        "score": item.get("score"),
+        "marker_class": item.get("marker_class") or "coastal",
+        "bait_applicable": bool(item.get("bait_applicable")),
+        "species_profile_seed": item.get("species_profile_seed"),
+        "quick_weather": item.get("quick_weather") if isinstance(item.get("quick_weather"), dict) else {},
+        "quick_ocean": item.get("quick_ocean") if isinstance(item.get("quick_ocean"), dict) else {},
+        "quick_snapshot": item.get("quick_snapshot") if isinstance(item.get("quick_snapshot"), dict) else {},
+        "marker_environment": item.get("marker_environment") if isinstance(item.get("marker_environment"), dict) else {},
+        "intel_tier": item.get("intel_tier"),
+        "intel_sources": item.get("intel_sources") if isinstance(item.get("intel_sources"), list) else [],
+        "missing_inputs": item.get("missing_inputs") if isinstance(item.get("missing_inputs"), list) else [],
+        "intel_confidence": item.get("intel_confidence"),
+        "wavewatch_available": bool(item.get("wavewatch_available")),
+    }
+
+
+def _locations_response(payload: dict[str, Any], locations: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "count": len(locations),
+        "locations": locations,
+        "source": payload.get("source"),
+        "entity_type": payload.get("entity_type", "location_markers"),
+        "derived": bool(payload.get("derived", False)),
+        "degraded": payload.get("degraded"),
+        "warm": payload.get("warm"),
+        "stale": payload.get("stale"),
+        "fallback_reason": payload.get("fallback_reason"),
+        "timestamp": payload.get("timestamp", int(time.time() * 1000)),
+        "ts": payload.get("ts"),
+    }
 
 
 def create_gfs_blueprint(static_dir: Path) -> Blueprint:
@@ -29,7 +189,9 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/health")
     async def api_health():
-        return jsonify(gfs().health_payload())
+        payload = gfs().health_payload()
+        payload["warm"] = gfs().warm_status()
+        return jsonify(_json_safe(payload))
 
     @bp.route("/api/config")
     async def api_config():
@@ -39,48 +201,89 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_status():
         return jsonify(gfs().status_payload())
 
+    @bp.route("/api/ocean")
+    async def api_ocean():
+        started = time.time()
+        vp = parse_viewport_args(request.args)
+        ocean_stride = _ocean_stride_for_viewport(vp, request.args)
+        ocean_vp = canonicalize_viewport({**vp.as_dict(), "stride": ocean_stride})
+        log.info("/gfs/api/ocean viewport=%s ocean_stride=%s", vp.as_dict(), ocean_stride)
+        payload = gfs().shared_ocean_payload(ocean_vp.as_dict())
+        payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
+        payload["ocean_stride"] = ocean_stride
+        log.info("/gfs/api/ocean latency_ms=%s stride=%s degraded=%s", payload.get("latency_ms"), ocean_stride, payload.get("degraded"))
+        return jsonify(_json_safe(payload))
+
     @bp.route("/api/weather")
     async def api_weather():
-        bbox = _parse_bbox(request.args)
-        payload = gfs().generate_weather_payload(bbox)
-        payload.setdefault("polygon_field_v1", _build_polygon_field_v1(payload, bbox))
-        return jsonify(payload)
+        vp = parse_viewport_args(request.args)
+        started = _route_debug_start("/gfs/api/weather", vp, request.query_string.decode("utf-8", errors="ignore"))
+        payload = gfs().generate_weather_payload(vp.as_dict())
+        payload_state = str(payload.get("payload_state") or "").lower()
+        source_status = "live" if payload_state == "live" else "stale_last_good" if payload_state == "cached" else "unavailable"
+        if payload_state not in {"live", "cached"}:
+            out = {
+                "ok": False,
+                "source": str(payload.get("source") or "ncss_weather"),
+                "payload_state": "unavailable",
+                "error_code": "weather_unavailable",
+                "error_message": str(payload.get("error_message") or "NCSS weather unavailable and no stale last-good payload"),
+                "latency_ms": round((time.time() - started) * 1000, 2),
+                "stale": False,
+                "source_status": source_status,
+                "request_url": request.full_path,
+                "fallback_reason": payload.get("fallback_reason"),
+            }
+            _route_debug_done("/gfs/api/weather", started, out, status_code=503)
+            return jsonify(out), 503
+        out = {
+            **payload,
+            "analysis_time": payload.get("cycle"),
+            "forecast_hour": payload.get("forecast_hour"),
+            "valid_time": payload.get("valid_time"),
+            "source_status": source_status,
+            "stale": source_status == "stale_last_good",
+            "ok": bool(payload.get("ok", True)),
+        }
+        _route_debug_done("/gfs/api/weather", started, out)
+        return jsonify(out)
 
     @bp.route("/api/clouds")
     async def api_clouds():
-        bbox = _parse_bbox(request.args)
-        return jsonify(gfs().cloud_tiles_payload(bbox))
+        vp = parse_viewport_args(request.args)
+        return jsonify(gfs().compact_cloud_payload(vp.as_dict()))
 
     @bp.route("/api/bait")
     async def api_bait():
-        bbox = _parse_bbox(request.args)
-        return jsonify(_build_bait_payload(gfs(), bbox, include_advanced=False))
+        vp = parse_viewport_args(request.args)
+        payload = gfs().bait_from_ocean(vp.as_dict())
+        log.info("/gfs/api/bait polygons=%s", len((payload.get("bait") or {}).get("polygons") or []))
+        return jsonify(payload)
 
     @bp.route("/api/bait-advanced")
     @bp.route("/api/bait/advanced")
     async def api_bait_advanced():
-        bbox = _parse_bbox(request.args)
-        return jsonify(_build_bait_payload(gfs(), bbox, include_advanced=True))
+        vp = parse_viewport_args(request.args)
+        return jsonify(gfs().bait_from_ocean(vp.as_dict()))
+
+    @bp.route("/api/boats")
+    async def api_boats():
+        started = time.time()
+        vp = parse_viewport_args(request.args)
+        log.info("/gfs/api/boats viewport=%s", vp.as_dict())
+        payload = gfs().boats_from_ocean(vp.as_dict())
+        payload["latency_ms"] = round((time.time() - started) * 1000, 2)
+        log.info("/gfs/api/boats count=%s latency_ms=%s", payload.get("count"), payload.get("latency_ms"))
+        return jsonify(payload)
 
     @bp.route("/api/frame")
     async def api_frame():
-        bbox = _parse_bbox(request.args)
-        weather = gfs().generate_weather_payload(bbox)
-        clouds = gfs().cloud_tiles_payload(bbox)
-        bait_base = _build_bait_payload(gfs(), bbox, include_advanced=False)
-        bait_advanced = _build_bait_payload(gfs(), bbox, include_advanced=True)
-        boats = {"boats": []}
-        payload = {
-            "ok": True,
-            "weather": weather,
-            "clouds": clouds,
-            "baitBase": bait_base,
-            "baitAdvanced": bait_advanced,
-            "boats": boats,
-            "recursiveGrid": None,
-            "sigmaClouds": clouds.get("items") or [],
-        }
-        return jsonify(payload)
+        started = time.time()
+        vp = parse_viewport_args(request.args)
+        payload = gfs().frame_payload(vp.as_dict())
+        payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
+        log.info("/gfs/api/frame latency_ms=%s viewport=%s", payload.get("latency_ms"), vp.as_dict())
+        return jsonify(_json_safe(payload))
 
     @bp.route("/api/tiles/<layer>/<int:z>/<int:x>/<int:y>")
     async def api_tiles(layer, z, x, y):
@@ -88,8 +291,8 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/scene")
     async def api_scene():
-        bbox = _parse_bbox(request.args)
-        return jsonify(gfs().get_scene_payload(bbox))
+        vp = parse_viewport_args(request.args)
+        return jsonify(gfs().get_scene_payload(vp.as_dict()))
 
     @bp.route("/api/hazards")
     async def api_hazards():
@@ -101,37 +304,32 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/fish")
     async def api_fish():
-        return jsonify(gfs().fish_payload())
+        vp = parse_viewport_args(request.args)
+        payload = gfs().fish_from_ocean(vp.as_dict())
+        payload.setdefault("entity_type", "fish_intelligence")
+        payload.setdefault("derived", True)
+        return jsonify(payload)
 
     @bp.route("/api/locations")
     async def api_locations():
-        payload = gfs().fish_payload()
+        vp = parse_viewport_args(request.args)
+        payload = gfs().locations_fast(vp.as_dict(), budget_ms=1800)
+        log.info(
+            "/gfs/api/locations route=/gfs/api/locations query=%s viewport=%s source_policy=csv_only source=%s warm=%s stale=%s count=%s latency_ms=%s entity_type=%s intel_tier=%s",
+            request.query_string.decode("utf-8", errors="ignore"),
+            vp.as_dict(),
+            payload.get("source"),
+            payload.get("warm"),
+            payload.get("stale"),
+            payload.get("count"),
+            payload.get("latency_ms"),
+            payload.get("entity_type"),
+            payload.get("intel_tier"),
+        )
         items = payload.get("items") if isinstance(payload, dict) else []
-        locations = []
-        for item in items or []:
-            if not isinstance(item, dict):
-                continue
-            locations.append({
-                "id": item.get("id") or item.get("location_key") or item.get("name") or "loc",
-                "location_key": item.get("location_key") or item.get("id") or item.get("name") or "loc",
-                "name": item.get("name") or item.get("location_key") or "Fishing location",
-                "lat": item.get("lat"),
-                "lon": item.get("lon"),
-                "probability": item.get("probability") if item.get("probability") is not None else item.get("confidence"),
-                "confidence": item.get("confidence") if item.get("confidence") is not None else item.get("probability"),
-                "meta": item.get("meta") or {},
-                "environment": item.get("environment") or {},
-                "species": item.get("species") or [],
-                "score": item.get("score"),
-            })
-        return jsonify({
-            "ok": payload.get("ok", True) if isinstance(payload, dict) else True,
-            "count": len(locations),
-            "locations": locations,
-            "source": "fish_payload",
-            "ts": payload.get("ts") if isinstance(payload, dict) else None,
-            "error": payload.get("error") if isinstance(payload, dict) else None,
-        })
+        locations = [_normalize_location_item(item) for item in (items or []) if isinstance(item, dict)]
+        safe_payload = payload if isinstance(payload, dict) else {}
+        return jsonify(_locations_response(safe_payload, locations))
 
     @bp.route("/api/live/session", methods=["POST"])
     async def create_live_session():
@@ -143,88 +341,71 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         return str(value or "").strip()
 
     def _find_fish_item(location_key: str) -> dict[str, Any] | None:
-        key = _coerce_key(location_key)
-        payload = gfs().fish_payload()
-        items = payload.get("items") if isinstance(payload, dict) else []
-        for item in items or []:
-            if not isinstance(item, dict):
-                continue
-            candidates = {
-                _coerce_key(item.get("id")),
-                _coerce_key(item.get("location_key")),
-                _coerce_key(item.get("name")),
-            }
-            if key in candidates:
+        payload = gfs().locations_fast(None, budget_ms=1800)
+        for item in payload.get("items") or []:
+            item_keys = {_coerce_key(item.get("id")), _coerce_key(item.get("location_key"))}
+            if _coerce_key(location_key) in item_keys:
                 return item
         return None
 
     def _location_detail_payload(location_key: str) -> dict[str, Any]:
         item = _find_fish_item(location_key) or {}
         media_payload = media().location_media(location_key)
-        reports = []
-        report_text = media_payload.get("report_text") or ""
-        if report_text:
-            reports.append(report_text)
-        uploads = media_payload.get("uploads") or []
-        videos = []
-        for up in uploads:
-            if not isinstance(up, dict):
-                continue
-            videos.append({
-                "url": up.get("url") or up.get("media_url") or up.get("path") or "",
-                "filename": up.get("filename") or up.get("name") or "video",
-                "uploaded_at": up.get("uploaded_at") or up.get("ts"),
-            })
+        normalized = _normalize_location_item(item)
+        canonical_id = _coerce_key(normalized.get("location_key") or normalized.get("id") or location_key)
         return {
             "ok": True,
-            "id": item.get("id") or item.get("location_key") or location_key,
-            "location_key": item.get("location_key") or location_key,
-            "name": item.get("name") or media_payload.get("label") or location_key,
-            "lat": item.get("lat"),
-            "lon": item.get("lon"),
-            "probability": item.get("probability") if item.get("probability") is not None else item.get("confidence"),
-            "confidence": item.get("confidence") if item.get("confidence") is not None else item.get("probability"),
-            "species": item.get("species") or [],
-            "meta": item.get("meta") or {},
-            "environment": item.get("environment") or media_payload.get("environment") or {},
-            "reports": reports,
-            "report_text": report_text,
-            "report_updated_at": media_payload.get("report_updated_at"),
-            "uploads": uploads,
-            "videos": videos,
+            "id": canonical_id,
+            "location_key": canonical_id,
+            "canonical_id": canonical_id,
+            "name": normalized.get("name") or media_payload.get("label") or canonical_id,
+            "lat": normalized.get("lat"),
+            "lon": normalized.get("lon"),
+            "fish_index": normalized.get("fish_index"),
+            "probability": normalized.get("probability"),
+            "confidence": normalized.get("confidence"),
+            "meta": normalized.get("meta"),
+            "marker_class": normalized.get("marker_class"),
+            "bait_applicable": bool(normalized.get("bait_applicable")),
+            "intel_tier": normalized.get("intel_tier"),
+            "intel_sources": normalized.get("intel_sources") or [],
+            "missing_inputs": normalized.get("missing_inputs") or [],
+            "quick_weather": normalized.get("quick_weather") or {},
+            "quick_ocean": normalized.get("quick_ocean") or {},
+            "quick_snapshot": normalized.get("quick_snapshot") or {},
+            "marker_environment": normalized.get("marker_environment") or {},
+            "profile": {
+                "node_id": canonical_id,
+                "canonical_id": canonical_id,
+                "marker_class": normalized.get("marker_class"),
+                "bait_applicable": bool(normalized.get("bait_applicable")),
+                "intel_tier": normalized.get("intel_tier"),
+                "intel_sources": normalized.get("intel_sources") or [],
+                "missing_inputs": normalized.get("missing_inputs") or [],
+            },
+            "reports": [media_payload.get("report_text")] if media_payload.get("report_text") else [],
+            "report_text": media_payload.get("report_text") or "",
+            "uploads": media_payload.get("uploads") or [],
             "live": media_payload.get("live") or {"active": False, "stream_url": "", "updated_at": None},
             "ts": media_payload.get("ts") or int(time.time() * 1000),
         }
 
     @bp.route("/api/location/<location_key>")
     async def location_detail(location_key):
-        payload = _location_detail_payload(location_key)
-        return jsonify(payload)
+        return jsonify(_location_detail_payload(location_key))
+
+    @bp.route("/api/intelligence/node/<location_key>")
+    async def intelligence_node(location_key):
+        return jsonify(_location_detail_payload(location_key))
 
     @bp.route("/api/location/<location_key>/media")
     async def location_media(location_key):
-        payload = media().location_media(location_key)
-        payload.setdefault("videos", [
-            {
-                "url": up.get("url") or up.get("media_url") or up.get("path") or "",
-                "filename": up.get("filename") or up.get("name") or "video",
-                "uploaded_at": up.get("uploaded_at") or up.get("ts"),
-            }
-            for up in (payload.get("uploads") or []) if isinstance(up, dict)
-        ])
-        return jsonify(payload)
+        return jsonify(media().location_media(location_key))
 
     @bp.route("/api/location/<location_key>/videos")
     async def location_videos(location_key):
         payload = media().location_media(location_key)
-        videos = [
-            {
-                "url": up.get("url") or up.get("media_url") or up.get("path") or "",
-                "filename": up.get("filename") or up.get("name") or "video",
-                "uploaded_at": up.get("uploaded_at") or up.get("ts"),
-            }
-            for up in (payload.get("uploads") or []) if isinstance(up, dict)
-        ]
+        videos = [{"url": up.get("url") or up.get("media_url") or up.get("path") or "", "filename": up.get("filename") or up.get("name") or "video", "uploaded_at": up.get("uploaded_at") or up.get("ts")} for up in (payload.get("uploads") or []) if isinstance(up, dict)]
         return jsonify({"ok": True, "location_key": location_key, "videos": videos, "ts": payload.get("ts")})
 
     @bp.route("/api/location/<location_key>/report", methods=["POST"])
@@ -239,14 +420,14 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         if request.method == "GET":
             payload = media().location_media(location_key)
             live = payload.get("live") or {"active": False, "stream_url": "", "updated_at": None}
-            fish = _find_fish_item(location_key) or {}
+            normalized = _location_detail_payload(location_key)
             return jsonify({
                 "ok": True,
-                "id": fish.get("id") or fish.get("location_key") or location_key,
-                "location_key": fish.get("location_key") or location_key,
-                "name": fish.get("name") or payload.get("label") or location_key,
-                "lat": fish.get("lat"),
-                "lon": fish.get("lon"),
+                "id": normalized.get("id") or location_key,
+                "location_key": normalized.get("location_key") or location_key,
+                "name": normalized.get("name") or payload.get("label") or location_key,
+                "lat": normalized.get("lat"),
+                "lon": normalized.get("lon"),
                 "active": bool(live.get("active")),
                 "stream_url": live.get("stream_url") or "",
                 "updated_at": live.get("updated_at"),
@@ -261,134 +442,14 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/location/<location_key>/upload", methods=["POST"])
     async def upload_video(location_key):
         files = await request.files
-        if "video" not in files:
-            return jsonify({"ok": False, "error": "no video file"}), 400
-        video = files["video"]
-        raw = video.read()
-        return jsonify(media().save_upload_video(location_key, video.filename, raw))
+        video = files.get("video") or files.get("file")
+        if video is None:
+            return jsonify({"ok": False, "error": "no video/file field"}), 400
+        return jsonify(media().save_upload_video(location_key, video.filename, video.read()))
 
     @bp.websocket("/ws")
-    async def ws_gfs():
-        while True:
-            msg = await websocket.receive()
-            if msg is None:
-                break
-            await websocket.send_json({"type": "pong" if msg == "ping" else "ack", "detail": msg})
+    async def ws_gfs_legacy():
+        # compatibility websocket path under /gfs/ws; /ws/gfs remains authoritative.
+        await handle_gfs_ws(gfs, websocket)
 
     return bp
-
-
-def _parse_bbox(args: dict) -> dict[str, float] | None:
-    raw = args.get("bbox") if hasattr(args, "get") else None
-    if isinstance(raw, str) and raw.strip():
-        try:
-            west, south, east, north = [float(part.strip()) for part in raw.split(",")]
-            return {"west": west, "south": south, "east": east, "north": north}
-        except (ValueError, TypeError):
-            pass
-    try:
-        if "west" in args and "south" in args:
-            return {
-                "west": float(args["west"]),
-                "south": float(args["south"]),
-                "east": float(args["east"]),
-                "north": float(args["north"]),
-            }
-    except (ValueError, TypeError):
-        pass
-    return None
-
-
-def _get_field(payload: dict[str, Any], *names: str) -> Any:
-    for name in names:
-        if name in payload:
-            return payload.get(name)
-        fields = payload.get("fields") or {}
-        if name in fields:
-            return fields.get(name)
-    return None
-
-
-def _normalize_grid(grid: Any) -> list[list[float]]:
-    if not isinstance(grid, list) or not grid:
-        return []
-    if isinstance(grid[0], list) and grid and grid[0] and isinstance(grid[0][0], list):
-        return grid[0]
-    return grid
-
-
-def _build_polygon_field_v1(weather: dict[str, Any], bbox: dict[str, float] | None) -> dict[str, Any]:
-    bbox = bbox or weather.get("bbox_used") or {"west": -180.0, "south": -80.0, "east": 180.0, "north": 80.0}
-    wind_u = _normalize_grid(_get_field(weather, "wind_u", "ugrd", "u10", "u"))
-    wind_v = _normalize_grid(_get_field(weather, "wind_v", "vgrd", "v10", "v"))
-    temp = _normalize_grid(_get_field(weather, "air_temp", "temp2m", "temperature_k"))
-    rh = _normalize_grid(_get_field(weather, "rel_humidity", "rh2m", "relative_humidity"))
-    dew = _normalize_grid(_get_field(weather, "dewpoint", "dewpoint2m"))
-    pmsl = _normalize_grid(_get_field(weather, "pressure_msl", "mslp"))
-    rows = max(len(grid) for grid in [wind_u, wind_v, temp, rh, dew, pmsl] if isinstance(grid, list)) if any(isinstance(grid, list) and grid for grid in [wind_u, wind_v, temp, rh, dew, pmsl]) else 0
-    cols = max(len(row) for grid in [wind_u, wind_v, temp, rh, dew, pmsl] if grid for row in grid if isinstance(row, list)) if rows else 0
-    lat, lon, altitude_m = [], [], []
-    fields = {"wind_u": [], "wind_v": [], "air_temp": [], "rel_humidity": [], "dewpoint": [], "pressure_msl": []}
-    for iy in range(rows):
-        for ix in range(cols):
-            lat.append(round(float(bbox["south"]) + ((iy + 0.5) / max(1, rows)) * (float(bbox["north"]) - float(bbox["south"])), 6))
-            lon.append(round(float(bbox["west"]) + ((ix + 0.5) / max(1, cols)) * (float(bbox["east"]) - float(bbox["west"])), 6))
-            altitude_m.append(10.0)
-            for out_name, grid in [("wind_u", wind_u), ("wind_v", wind_v), ("air_temp", temp), ("rel_humidity", rh), ("dewpoint", dew), ("pressure_msl", pmsl)]:
-                try:
-                    val = grid[iy][ix]
-                except Exception:
-                    val = 0.0
-                try:
-                    val = float(val)
-                except Exception:
-                    val = 0.0
-                fields[out_name].append(val)
-    return {"schema": "gfs_polygon_field_v1", "count": len(lat), "fields": {"lat": lat, "lon": lon, "altitude_m": altitude_m, **fields}}
-
-
-def _build_bait_payload(engine: Any, bbox: dict[str, float] | None, include_advanced: bool) -> dict[str, Any]:
-    weather = engine.generate_weather_payload(bbox)
-    polygon_field_v1 = _build_polygon_field_v1(weather, bbox)
-    fields = polygon_field_v1.get("fields") or {}
-    bait_base_field_v1 = {
-        "schema": "gfs_bait_field_v1",
-        "count": polygon_field_v1.get("count", 0),
-        "fields": {
-            "lat": fields.get("lat", []),
-            "lon": fields.get("lon", []),
-            "wind_u": fields.get("wind_u", []),
-            "wind_v": fields.get("wind_v", []),
-            "air_temp": fields.get("air_temp", []),
-            "rel_humidity": fields.get("rel_humidity", []),
-            "dewpoint": fields.get("dewpoint", []),
-            "pressure_msl": fields.get("pressure_msl", []),
-            "precip_rate": [0.0 for _ in fields.get("lat", [])],
-            "cloud_total": [0.0 for _ in fields.get("lat", [])],
-        },
-    }
-    bait_advanced_field_v1 = None
-    if include_advanced:
-        bait_advanced_field_v1 = build_bait_ocean_field_v1(
-            bbox=[float((bbox or {}).get("west", -180.0)), float((bbox or {}).get("south", -80.0)), float((bbox or {}).get("east", 180.0)), float((bbox or {}).get("north", 80.0))],
-            cell_size_deg=0.25,
-            source_time=weather.get("valid_time"),
-            quality=str(request.args.get("quality") or "coarse"),
-            ocean={
-                "sst": [[0.0]],
-                "chlorophyll": [[0.0]],
-                "current_u": [[0.0]],
-                "current_v": [[0.0]],
-                "optional_ssh_anomaly": [[0.0]],
-            },
-            max_count=1,
-        )
-    return {
-        "ok": True,
-        "bbox": [float((bbox or {}).get("west", -180.0)), float((bbox or {}).get("south", -80.0)), float((bbox or {}).get("east", 180.0)), float((bbox or {}).get("north", 80.0))],
-        "valid_time": weather.get("valid_time"),
-        "polygon_field_v1": polygon_field_v1,
-        "bait_base_field_v1": bait_base_field_v1,
-        "bait_advanced_field_v1": bait_advanced_field_v1 or {},
-        "bait": {"status": "ok" if include_advanced else "incomplete", "source": "wrapper", "polygons": [], "outer_polygons": [], "inner_polygons": [], "core_polygons": []},
-    }

@@ -1,65 +1,80 @@
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
 
-from server.gfs_service import GFSService
+from server.app_factory import create_app
 
 
-def test_gfs_routes_reference_existing_service_methods(tmp_path):
-    src = Path('server/gfs/routes.py').read_text(encoding='utf-8')
-    referenced = {
-        'health',
-        'config',
-        'get_scene_payload',
-        'status_payload',
-        'cloud_tiles_payload',
-        'hazards_payload',
-        'diagnostics_payload',
-        'fish_payload',
-        'layer_tile_payload',
-        'tile_aggregate_payload',
-        'tile_diagnostics_payload',
-        'location_media',
-        'upsert_report',
-        'upsert_live',
-        'save_upload_video',
-        'frame_payload',
-        'overlay_payload',
-        'contours_payload',
-        'legend_payload',
-        'tile_png_bytes',
+def test_ws_gfs_route_is_registered_authoritative():
+    app = create_app()
+    rules = {str(rule.rule) for rule in app.url_map.iter_rules()}
+    assert "/ws/gfs" in rules
+    # legacy compatibility path may exist under /gfs/ws via blueprint websocket.
+    assert "/gfs/ws" in rules
+
+
+def test_locations_and_intelligence_share_canonical_identity(monkeypatch):
+    app = create_app()
+    app.config.update({"TESTING": True})
+    engine = app.extensions["gfs_engine"]
+
+    canonical = "csv-canonical-key-1"
+    fake_item = {
+        "id": "noncanonical-id",
+        "location_key": canonical,
+        "name": "Canonical Spot",
+        "lat": 33.1,
+        "lon": -117.2,
+        "confidence": 0.8,
+        "probability": 0.8,
     }
-    svc = GFSService(str(tmp_path))
-    for name in referenced:
-        assert hasattr(svc, name), f"GFSService missing method referenced by routes: {name}"
-    # lightweight guard that routes are still calling these names
-    for name in referenced:
-        if name in {'save_upload_video'}:
-            continue
-        assert f'gfs.{name}(' in src
 
+    monkeypatch.setattr(
+        engine,
+        "locations_fast",
+        lambda bbox, budget_ms=1800: {
+            "ok": True,
+            "source": "fish_csv",
+            "entity_type": "location_markers",
+            "derived": False,
+            "items": [fake_item],
+            "count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "location_media",
+        lambda location_key: {
+            "ok": True,
+            "location_key": location_key,
+            "report_text": "steady bite",
+            "uploads": [],
+            "live": {"active": False, "stream_url": "", "updated_at": None},
+            "ts": 123,
+        },
+    )
 
-def test_gfs_wrapper_payload_methods_are_json_safe(tmp_path):
-    svc = GFSService(str(tmp_path))
-    assert isinstance(svc.health_payload(), dict)
-    assert isinstance(svc.config_payload(), dict)
-    assert isinstance(svc.status_payload(), dict)
-    assert isinstance(svc.diagnostics_payload(), dict)
-    hazards = svc.hazards_payload()
-    assert isinstance(hazards, dict)
-    assert {'rain', 'hail', 'lightning'}.issubset(hazards.keys())
+    async def _run() -> None:
+        client = app.test_client()
+        locations_resp = await client.get("/gfs/api/locations")
+        assert locations_resp.status_code == 200
+        locations_data = await locations_resp.get_json()
+        assert locations_data["count"] == 1
+        marker = locations_data["locations"][0]
+        assert marker["id"] == canonical
+        assert marker["location_key"] == canonical
 
+        loc_resp = await client.get(f"/gfs/api/location/{canonical}")
+        intel_resp = await client.get(f"/gfs/api/intelligence/node/{canonical}")
+        assert loc_resp.status_code == 200
+        assert intel_resp.status_code == 200
+        loc_data = await loc_resp.get_json()
+        intel_data = await intel_resp.get_json()
 
-def test_tile_aggregate_payload_exposes_expected_layers(monkeypatch, tmp_path):
-    svc = GFSService(str(tmp_path))
+        assert loc_data["id"] == canonical
+        assert loc_data["location_key"] == canonical
+        assert intel_data["id"] == canonical
+        assert intel_data["location_key"] == canonical
+        assert loc_data == intel_data
 
-    def fake_layer(layer: str, z: int, x: int, y: int, pad_deg: float = 0.18, debug: bool = False):
-        return {'features': [{'layer': layer, 'z': z, 'x': x, 'y': y}]}
-
-    monkeypatch.setattr(svc, 'layer_tile_payload', fake_layer)
-    payload = svc.tile_aggregate_payload(z=3, x=1, y=2, debug=False)
-    assert payload['status']['ok'] is True
-    assert payload['clouds'] and payload['clouds'][0]['layer'] == 'clouds'
-    assert payload['rain'] and payload['rain'][0]['layer'] == 'precip'
-    assert payload['hail'] and payload['hail'][0]['layer'] == 'hail'
-    assert payload['lightning'] and payload['lightning'][0]['layer'] == 'lightning'
+    asyncio.run(_run())

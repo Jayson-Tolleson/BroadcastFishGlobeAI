@@ -52,6 +52,8 @@
   let cachedVideoInputs = [];
   let cameraCycleIndex = -1;
   let preferredFacingMode = 'user';
+  let cameraModes = [];
+  let cameraModeIndex = -1;
   let recordingStream = null;
   let recordingChunks = [];
   let recordingMedia = null;
@@ -63,9 +65,7 @@
   let programVideoTrack = null;
   let programLoopHandle = 0;
   let programLoopRunning = false;
-  let pipRect = { x: 20, y: 20, w: 220, h: 124 };
-  let pipDragging = false;
-  let pipDragOffset = { x: 0, y: 0 };
+  const pip = { enabled: false, x: 20, y: 20, w: 220, h: 124, dragging: false, dragOffsetX: 0, dragOffsetY: 0 };
   let lastSttSentAt = 0;
   let sttFrameModulo = 0;
   const camSourceEl = document.createElement('video');
@@ -303,6 +303,42 @@
     });
   }
 
+  function audioConstraints() {
+    return {
+      echoCancellation: true,
+      noiseSuppression: !!state.media.noise_cancel_enabled,
+      autoGainControl: true,
+      channelCount: 1,
+      sampleRate: 48000,
+    };
+  }
+
+  async function buildCameraModes() {
+    const inputs = await refreshVideoInputs();
+    const facingModes = [
+      { kind: 'facing', label: 'Front', facingMode: 'user' },
+      { kind: 'facing', label: 'Back', facingMode: 'environment' },
+    ];
+    const deviceModes = inputs.map((d, idx) => ({ kind: 'device', label: d.label || `Camera ${idx + 1}`, deviceId: d.deviceId }));
+    cameraModes = isTouchLikeDevice() ? [...facingModes, ...deviceModes] : [...deviceModes, ...facingModes];
+    if (!cameraModes.length) cameraModes = [...facingModes];
+    console.info('[broadcast/camera] modes built', cameraModes);
+    return cameraModes;
+  }
+
+  async function openCameraMode(mode) {
+    if (mode.kind === 'facing') {
+      console.info(`[broadcast/camera] switching to facing=${mode.facingMode}`);
+      return requestCameraStream({ facingMode: { ideal: mode.facingMode } });
+    }
+    console.info(`[broadcast/camera] switching to deviceId=${mode.deviceId}`);
+    try {
+      return await requestCameraStream({ deviceId: { exact: mode.deviceId } });
+    } catch (_) {
+      return requestCameraStream({ deviceId: { ideal: mode.deviceId } });
+    }
+  }
+
   async function startCameraStream() {
     if (state.camStream) {
       const activeTrack = state.camStream.getVideoTracks()[0];
@@ -315,9 +351,8 @@
     }
     const attempts = [];
     if (selectedVideoDeviceId) attempts.push({ deviceId: { exact: selectedVideoDeviceId } });
-    attempts.push({ facingMode: { exact: preferredFacingMode } });
-    attempts.push({ facingMode: preferredFacingMode });
-    attempts.push({ facingMode: 'user' });
+    attempts.push({ facingMode: { ideal: preferredFacingMode } });
+    attempts.push({ facingMode: { ideal: 'user' } });
     attempts.push(true);
     let stream = null;
     let lastErr = null;
@@ -408,6 +443,8 @@
       if (!state.media.screen_enabled) return;
       state.media.screen_enabled = false;
       console.info('[broadcast/screen] native screen-share ended; returning to camera');
+      pip.enabled = false;
+      console.info('[broadcast/pip] disabled');
       switchToCamera().catch(() => announceState());
     }));
     if (dom.preview) dom.preview.srcObject = state.screenStream;
@@ -439,11 +476,11 @@
     if (mainEl?.readyState >= 2) {
       try { programCtx.drawImage(mainEl, 0, 0, programCanvas.width, programCanvas.height); } catch (_) {}
     }
-    if (state.media.screen_enabled && camSourceEl.readyState >= 2) {
+    if (state.media.screen_enabled && pip.enabled && camSourceEl.readyState >= 2) {
       try {
         programCtx.fillStyle = 'rgba(0,0,0,0.45)';
-        programCtx.fillRect(pipRect.x - 2, pipRect.y - 2, pipRect.w + 4, pipRect.h + 4);
-        programCtx.drawImage(camSourceEl, pipRect.x, pipRect.y, pipRect.w, pipRect.h);
+        programCtx.fillRect(pip.x - 2, pip.y - 2, pip.w + 4, pip.h + 4);
+        programCtx.drawImage(camSourceEl, pip.x, pip.y, pip.w, pip.h);
       } catch (_) {}
     }
   }
@@ -536,6 +573,8 @@
 
   async function switchToScreen() {
     state.media.screen_enabled = true;
+    pip.enabled = true;
+    console.info('[broadcast/pip] enabled');
     await syncTracks();
     console.info('[broadcast/screen] switched to screen mode with camera PiP');
     announceState();
@@ -543,6 +582,8 @@
 
   async function switchToCamera() {
     state.media.screen_enabled = false;
+    pip.enabled = false;
+    console.info('[broadcast/pip] disabled');
     if (state.screenStream) {
       state.screenStream.getTracks().forEach((t) => t.stop());
       state.screenStream = null;
@@ -859,7 +900,28 @@
   });
 
   dom.camBtn?.addEventListener('click', async () => {
-    await cycleCameraDevice();
+    const modes = await buildCameraModes();
+    if (!modes.length) return;
+    cameraModeIndex = (cameraModeIndex + 1) % modes.length;
+    const mode = modes[cameraModeIndex];
+    const old = state.camStream;
+    try {
+      const next = await openCameraMode(mode);
+      state.camStream = next;
+      const track = next.getVideoTracks()[0];
+      selectedVideoDeviceId = track?.getSettings?.().deviceId || selectedVideoDeviceId;
+      const facing = track?.getSettings?.().facingMode;
+      if (facing === 'environment' || facing === 'user') preferredFacingMode = facing;
+      camSourceEl.srcObject = next;
+      camSourceEl.play().catch(() => {});
+      updateCameraLabel(track?.label || mode.label || 'camera');
+      await syncTracks();
+      old?.getVideoTracks?.().forEach((t) => t.stop());
+      announceState();
+    } catch (err) {
+      console.warn('[broadcast/camera] fallback after failure', { mode, message: err?.message || String(err) });
+      await cycleCameraDevice();
+    }
   });
   dom.screenBtn?.addEventListener('click', async () => {
     if (state.media.screen_enabled) await switchToCamera(); else await switchToScreen();
@@ -894,25 +956,27 @@
     if (!stage) return;
     const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - stage.left;
     const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - stage.top;
-    const inside = x >= pipRect.x && x <= (pipRect.x + pipRect.w) && y >= pipRect.y && y <= (pipRect.y + pipRect.h);
+    const inside = x >= pip.x && x <= (pip.x + pip.w) && y >= pip.y && y <= (pip.y + pip.h);
     if (!inside) return;
-    pipDragging = true;
-    pipDragOffset = { x: x - pipRect.x, y: y - pipRect.y };
+    pip.dragging = true;
+    pip.dragOffsetX = x - pip.x;
+    pip.dragOffsetY = y - pip.y;
     console.info('[broadcast/pip] drag start');
   };
   const pointerMove = (ev) => {
-    if (!pipDragging) return;
+    if (!pip.dragging) return;
     const stage = dom.preview?.parentElement?.getBoundingClientRect();
     if (!stage) return;
     const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - stage.left;
     const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - stage.top;
-    pipRect.x = Math.max(0, Math.min((stage.width - pipRect.w), x - pipDragOffset.x));
-    pipRect.y = Math.max(0, Math.min((stage.height - pipRect.h), y - pipDragOffset.y));
+    pip.x = Math.max(0, Math.min((stage.width - pip.w), x - pip.dragOffsetX));
+    pip.y = Math.max(0, Math.min((stage.height - pip.h), y - pip.dragOffsetY));
+    console.info('[broadcast/pip] moved', { x: pip.x, y: pip.y });
   };
   const pointerUp = () => {
-    if (!pipDragging) return;
-    pipDragging = false;
-    console.info('[broadcast/pip] drag end', { x: pipRect.x, y: pipRect.y });
+    if (!pip.dragging) return;
+    pip.dragging = false;
+    console.info('[broadcast/pip] drag end', { x: pip.x, y: pip.y });
   };
   dom.preview?.addEventListener('pointerdown', pointerDown);
   window.addEventListener('pointermove', pointerMove, { passive: true });

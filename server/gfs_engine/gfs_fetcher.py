@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Legacy fetch helper retained for backwards compatibility.
+
+Authoritative /gfs runtime now uses `server.gfs.providers.*` through
+`server.gfs.engine` and service composition. This module is intentionally
+isolated and not wired into the active app factory path.
+"""
+
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone

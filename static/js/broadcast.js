@@ -51,10 +51,29 @@
   let selectedVideoDeviceId = '';
   let cachedVideoInputs = [];
   let cameraCycleIndex = -1;
+  let preferredFacingMode = 'user';
   let recordingStream = null;
   let recordingChunks = [];
   let recordingMedia = null;
+  let activeAiAudio = null;
   let wakeLockSentinel = null;
+  let programCanvas = null;
+  let programCtx = null;
+  let programStream = null;
+  let programVideoTrack = null;
+  let programLoopHandle = 0;
+  let programLoopRunning = false;
+  let pipRect = { x: 20, y: 20, w: 220, h: 124 };
+  let pipDragging = false;
+  let pipDragOffset = { x: 0, y: 0 };
+  let lastSttSentAt = 0;
+  let sttFrameModulo = 0;
+  const camSourceEl = document.createElement('video');
+  camSourceEl.muted = true;
+  camSourceEl.playsInline = true;
+  const screenSourceEl = document.createElement('video');
+  screenSourceEl.muted = true;
+  screenSourceEl.playsInline = true;
 
   const state = {
     room: cfg.room || new URLSearchParams(location.search).get('room') || 'default',
@@ -68,6 +87,7 @@
     speechCtx: null,
     speechSource: null,
     speechProcessor: null,
+    speechProgramStream: null,
     media: {
       ai_enabled: true,
       ai_status: 'idle',
@@ -182,6 +202,28 @@
     camTxt.textContent = state.media.camera_enabled ? `CAM: ${compactCameraName(label)}` : 'CAM: off';
   }
 
+  function isTouchLikeDevice() {
+    return ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  }
+
+  function getPreferredRecorderOptions() {
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    for (const mimeType of candidates) {
+      if (window.MediaRecorder?.isTypeSupported?.(mimeType)) return { mimeType };
+    }
+    return {};
+  }
+
+  function timestampedRecordingName() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `broadcast-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.webm`;
+  }
+
   function appendChat(msg) {
     if (!dom.chat) return;
     const startedAt = performance.now();
@@ -248,6 +290,19 @@
     setLed(dom.ledRoom, online);
   }
 
+  async function requestCameraStream(videoConstraints) {
+    return navigator.mediaDevices.getUserMedia({
+      video: videoConstraints,
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: !!state.media.noise_cancel_enabled,
+        autoGainControl: true,
+        channelCount: 1,
+        sampleRate: 48000,
+      },
+    });
+  }
+
   async function startCameraStream() {
     if (state.camStream) {
       const activeTrack = state.camStream.getVideoTracks()[0];
@@ -258,20 +313,33 @@
       state.camStream.getTracks().forEach((t) => t.stop());
       state.camStream = null;
     }
-    const videoConstraints = selectedVideoDeviceId ? { deviceId: { exact: selectedVideoDeviceId } } : { facingMode: 'user' };
-    state.camStream = await navigator.mediaDevices.getUserMedia({
-      video: videoConstraints,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: !!state.media.noise_cancel_enabled,
-        autoGainControl: true,
-        channelCount: 1,
-        sampleRate: 48000,
-      },
-    });
+    const attempts = [];
+    if (selectedVideoDeviceId) attempts.push({ deviceId: { exact: selectedVideoDeviceId } });
+    attempts.push({ facingMode: { exact: preferredFacingMode } });
+    attempts.push({ facingMode: preferredFacingMode });
+    attempts.push({ facingMode: 'user' });
+    attempts.push(true);
+    let stream = null;
+    let lastErr = null;
+    for (const c of attempts) {
+      try {
+        stream = await requestCameraStream(c);
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.info('[broadcast/camera] getUserMedia attempt failed', { constraint: c, message: err?.message || String(err) });
+      }
+    }
+    if (!stream) throw lastErr || new Error('camera unavailable');
+    state.camStream = stream;
     if (dom.preview && !state.media.screen_enabled) dom.preview.srcObject = state.camStream;
     const track = state.camStream.getVideoTracks()[0];
+    camSourceEl.srcObject = state.camStream;
+    camSourceEl.play().catch(() => {});
     selectedVideoDeviceId = track?.getSettings?.().deviceId || selectedVideoDeviceId;
+    const facing = track?.getSettings?.().facingMode;
+    if (facing === 'environment' || facing === 'user') preferredFacingMode = facing;
+    console.info('[broadcast/camera] active track', { label: track?.label || '', deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
     updateCameraLabel(track?.label || 'camera');
     return state.camStream;
   }
@@ -283,10 +351,16 @@
     } catch {
       cachedVideoInputs = [];
     }
+    console.info('[broadcast/camera] enumerate devices', { count: cachedVideoInputs.length, labelsReady: cachedVideoInputs.some((d) => !!d.label) });
     return cachedVideoInputs;
   }
 
   async function cycleCameraDevice() {
+    if (!cachedVideoInputs.length || cachedVideoInputs.every((d) => !d.label)) {
+      try {
+        if (!state.camStream) await startCameraStream();
+      } catch (_) {}
+    }
     const inputs = await refreshVideoInputs();
     if (!inputs.length) {
       state.media.camera_enabled = !state.media.camera_enabled;
@@ -294,30 +368,96 @@
       announceState();
       return;
     }
+    if (isTouchLikeDevice()) {
+      const nextFacing = preferredFacingMode === 'user' ? 'environment' : 'user';
+      preferredFacingMode = nextFacing;
+      selectedVideoDeviceId = '';
+      state.media.camera_enabled = true;
+      const old = state.camStream;
+      state.camStream = null;
+      try {
+        await syncTracks();
+        old?.getTracks?.().forEach((t) => t.stop());
+        announceState();
+        console.info('[broadcast/camera] switched facing mode', { facingMode: preferredFacingMode });
+        return;
+      } catch (err) {
+        console.warn('[broadcast/camera] facing switch failed, falling back to device cycle', { message: err?.message || String(err) });
+        if (old) state.camStream = old;
+      }
+    }
     const idx = inputs.findIndex((d) => d.deviceId === selectedVideoDeviceId);
     cameraCycleIndex = idx >= 0 ? idx : cameraCycleIndex;
     cameraCycleIndex = (cameraCycleIndex + 1) % inputs.length;
     selectedVideoDeviceId = inputs[cameraCycleIndex].deviceId;
     state.media.camera_enabled = true;
-    if (state.camStream) {
-      state.camStream.getTracks().forEach((t) => t.stop());
-      state.camStream = null;
-    }
+    const old = state.camStream;
+    state.camStream = null;
     await syncTracks();
+    old?.getTracks?.().forEach((t) => t.stop());
     updateCameraLabel(inputs[cameraCycleIndex].label || `camera ${cameraCycleIndex + 1}`);
+    console.info('[broadcast/camera] cycled device', { deviceId: selectedVideoDeviceId, label: inputs[cameraCycleIndex].label || '' });
     announceState();
   }
 
   async function startScreenStream() {
     if (state.screenStream) return state.screenStream;
     state.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    console.info('[broadcast/screen] screen stream started');
     state.screenStream.getVideoTracks().forEach((t) => t.addEventListener('ended', () => {
       if (!state.media.screen_enabled) return;
       state.media.screen_enabled = false;
+      console.info('[broadcast/screen] native screen-share ended; returning to camera');
       switchToCamera().catch(() => announceState());
     }));
     if (dom.preview) dom.preview.srcObject = state.screenStream;
+    screenSourceEl.srcObject = state.screenStream;
+    screenSourceEl.play().catch(() => {});
     return state.screenStream;
+  }
+
+  function ensureProgramCanvas() {
+    if (programCanvas) return;
+    programCanvas = document.createElement('canvas');
+    programCanvas.width = 1280;
+    programCanvas.height = 720;
+    programCtx = programCanvas.getContext('2d');
+  }
+
+  function drawProgramFrame() {
+    if (!programCtx || !programCanvas) return;
+    const stage = dom.preview?.parentElement;
+    const w = stage?.clientWidth || 1280;
+    const h = stage?.clientHeight || 720;
+    if (programCanvas.width !== w || programCanvas.height !== h) {
+      programCanvas.width = w;
+      programCanvas.height = h;
+    }
+    programCtx.fillStyle = '#000';
+    programCtx.fillRect(0, 0, programCanvas.width, programCanvas.height);
+    const mainEl = state.media.screen_enabled ? screenSourceEl : camSourceEl;
+    if (mainEl?.readyState >= 2) {
+      try { programCtx.drawImage(mainEl, 0, 0, programCanvas.width, programCanvas.height); } catch (_) {}
+    }
+    if (state.media.screen_enabled && camSourceEl.readyState >= 2) {
+      try {
+        programCtx.fillStyle = 'rgba(0,0,0,0.45)';
+        programCtx.fillRect(pipRect.x - 2, pipRect.y - 2, pipRect.w + 4, pipRect.h + 4);
+        programCtx.drawImage(camSourceEl, pipRect.x, pipRect.y, pipRect.w, pipRect.h);
+      } catch (_) {}
+    }
+  }
+
+  function startProgramLoop() {
+    if (programLoopRunning) return;
+    ensureProgramCanvas();
+    programLoopRunning = true;
+    const tick = () => {
+      if (!programLoopRunning) return;
+      drawProgramFrame();
+      programLoopHandle = requestAnimationFrame(tick);
+    };
+    programLoopHandle = requestAnimationFrame(tick);
   }
 
   async function ensurePeerConnection(viewerId = null) {
@@ -370,12 +510,21 @@
   }
 
   async function syncTracks() {
+    startProgramLoop();
     if (state.media.screen_enabled) {
       const screen = await startScreenStream();
-      await replaceOutgoingVideoTrack(screen.getVideoTracks()[0] || null);
+      if (!programStream) {
+        programStream = programCanvas.captureStream(30);
+        programVideoTrack = programStream.getVideoTracks()[0] || null;
+      }
+      await replaceOutgoingVideoTrack(programVideoTrack || screen.getVideoTracks()[0] || null);
     } else {
       const cam = await startCameraStream();
-      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (cam.getVideoTracks()[0] || null) : null);
+      if (!programStream) {
+        programStream = programCanvas.captureStream(30);
+        programVideoTrack = programStream.getVideoTracks()[0] || null;
+      }
+      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (programVideoTrack || cam.getVideoTracks()[0] || null) : null);
     }
     if (state.media.mic_enabled) {
       const cam = await startCameraStream();
@@ -388,6 +537,7 @@
   async function switchToScreen() {
     state.media.screen_enabled = true;
     await syncTracks();
+    console.info('[broadcast/screen] switched to screen mode with camera PiP');
     announceState();
   }
 
@@ -399,6 +549,7 @@
     }
     await syncTracks();
     if (dom.preview && state.camStream) dom.preview.srcObject = state.camStream;
+    console.info('[broadcast/screen] switched back to camera mode');
     announceState();
   }
 
@@ -424,19 +575,27 @@
   async function playAiVoice(url) {
     if (!url || !state.media.hear_ai_voice) return;
     try {
+      if (activeAiAudio) {
+        activeAiAudio.pause();
+        activeAiAudio.src = '';
+        activeAiAudio = null;
+        console.info('[broadcast/ai] stopped previous AI audio');
+      }
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
       const audio = new Audio(url);
       audio.volume = 0.9;
+      activeAiAudio = audio;
+      audio.onended = () => { if (activeAiAudio === audio) activeAiAudio = null; };
       await audio.play();
+      console.info('[broadcast/ai] AI voice started');
     } catch (_) {}
   }
 
   function currentProgramStream() {
-    const base = state.media.screen_enabled ? state.screenStream : state.camStream;
-    if (!base) return null;
-    const tracks = [];
-    const videoTrack = base.getVideoTracks()[0];
-    const audioTrack = base.getAudioTracks()[0];
-    if (videoTrack) tracks.push(videoTrack.clone());
+    if (!programCanvas) return null;
+    const stream = programCanvas.captureStream(30);
+    const tracks = [...stream.getVideoTracks()];
+    const audioTrack = state.camStream?.getAudioTracks?.()[0];
     if (audioTrack) tracks.push(audioTrack.clone());
     return tracks.length ? new MediaStream(tracks) : null;
   }
@@ -464,22 +623,26 @@
     }
     recordingChunks = [];
     recordingStream = stream;
-    recordingMedia = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp8,opus' });
+    recordingMedia = new MediaRecorder(stream, getPreferredRecorderOptions());
     recordingMedia.ondataavailable = (ev) => { if (ev.data?.size) recordingChunks.push(ev.data); };
     recordingMedia.onstop = async () => {
       const blob = new Blob(recordingChunks, { type: 'video/webm' });
       recordingChunks = [];
       recordingStream?.getTracks().forEach((t) => t.stop());
       recordingStream = null;
-      if (dom.recordingStatus) dom.recordingStatus.textContent = 'Processing MP4…';
-      try {
-        const saved = await uploadRecording(blob);
-        if (dom.recordingStatus) dom.recordingStatus.textContent = `Saved ${saved.url || 'recording'}`;
-      } catch (err) {
-        if (dom.recordingStatus) dom.recordingStatus.textContent = `Recording failed: ${err.message || err}`;
-      }
+      const filename = timestampedRecordingName();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(href);
+      console.info('[broadcast/record] auto-downloaded recording', { filename, size: blob.size });
+      if (dom.recordingStatus) dom.recordingStatus.textContent = `Saved ${filename}`;
+      return;
     };
     recordingMedia.start(1000);
+    console.info('[broadcast/record] recording started');
     state.media.record_enabled = true;
     if (dom.recordingStatus) dom.recordingStatus.textContent = 'Recording live…';
     announceState();
@@ -565,12 +728,16 @@
     const processor = ctx.createScriptProcessor(4096, 1, 1);
 
     processor.onaudioprocess = (event) => {
-      if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) return;
+    if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      sttFrameModulo = (sttFrameModulo + 1) % 3;
+      if (sttFrameModulo !== 0 || (now - lastSttSentAt) < 120) return;
       const input = event.inputBuffer.getChannelData(0);
       const reduced = downsampleBuffer(input, ctx.sampleRate, STT_TARGET_SAMPLE_RATE);
       const pcm = floatToInt16(reduced);
       if (!pcm.length) return;
       sendAudioChunk(int16ToBase64(pcm), STT_TARGET_SAMPLE_RATE);
+      lastSttSentAt = now;
     };
 
     source.connect(processor);
@@ -595,7 +762,7 @@
       if (msg.type === 'state_sync' || msg.type === 'state_update') applyRoomState(msg.state || {});
       if (msg.type === 'presence') applyPresence(msg);
       if (msg.type === 'ai_status') updateAiStatus(msg.status || 'idle');
-      if (['chat', 'ai', 'ai_partial', 'attachment'].includes(msg.type)) appendChat(msg);
+      if (['chat', 'ai', 'attachment'].includes(msg.type)) appendChat(msg);
       if (msg.type === 'ai' && msg.voice) playAiVoice(msg.voice);
       if (msg.type === 'web_search_result') {
         renderSearchResults(msg.query || '', msg.result || {});
@@ -721,6 +888,38 @@
   dom.ttsMonBtn?.addEventListener('click', () => { state.media.hear_ai_voice = !state.media.hear_ai_voice; announceState(); });
   dom.recordBtn?.addEventListener('click', () => { toggleRecording().catch(() => {}); });
   dom.rtmpBtn?.addEventListener('click', () => { toggleRtmp().catch(() => {}); });
+  const pointerDown = (ev) => {
+    if (!state.media.screen_enabled) return;
+    const stage = dom.preview?.parentElement?.getBoundingClientRect();
+    if (!stage) return;
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - stage.left;
+    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - stage.top;
+    const inside = x >= pipRect.x && x <= (pipRect.x + pipRect.w) && y >= pipRect.y && y <= (pipRect.y + pipRect.h);
+    if (!inside) return;
+    pipDragging = true;
+    pipDragOffset = { x: x - pipRect.x, y: y - pipRect.y };
+    console.info('[broadcast/pip] drag start');
+  };
+  const pointerMove = (ev) => {
+    if (!pipDragging) return;
+    const stage = dom.preview?.parentElement?.getBoundingClientRect();
+    if (!stage) return;
+    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - stage.left;
+    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - stage.top;
+    pipRect.x = Math.max(0, Math.min((stage.width - pipRect.w), x - pipDragOffset.x));
+    pipRect.y = Math.max(0, Math.min((stage.height - pipRect.h), y - pipDragOffset.y));
+  };
+  const pointerUp = () => {
+    if (!pipDragging) return;
+    pipDragging = false;
+    console.info('[broadcast/pip] drag end', { x: pipRect.x, y: pipRect.y });
+  };
+  dom.preview?.addEventListener('pointerdown', pointerDown);
+  window.addEventListener('pointermove', pointerMove, { passive: true });
+  window.addEventListener('pointerup', pointerUp, { passive: true });
+  dom.preview?.addEventListener('touchstart', pointerDown, { passive: true });
+  window.addEventListener('touchmove', pointerMove, { passive: true });
+  window.addEventListener('touchend', pointerUp, { passive: true });
   dom.chatCollapseBtn?.addEventListener('click', () => {
     if (!dom.chatPanel) return;
     dom.chatPanel.classList.toggle('collapsed');
@@ -732,6 +931,7 @@
     if (dom.chatCollapseBtn) dom.chatCollapseBtn.textContent = 'Expand';
   }
   applyRoomState({ settings: state.media, runtime: { broadcaster_present: false, viewer_count: 0 } });
+  startProgramLoop();
   installWakeLock();
   connectChat();
   connectSignal();

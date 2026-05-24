@@ -12,6 +12,7 @@ import re
 import time
 import threading
 import logging
+import resource
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +41,7 @@ except Exception:  # pragma: no cover - optional fallback decoder
 
 from werkzeug.utils import secure_filename
 
+from server.gfs.field_aliases import resolve_aliases
 from server.gfs_state import GFSState
 
 
@@ -76,6 +78,7 @@ INGEST_FALLBACK_CYCLE_DEPTH = 4
 INGEST_PREFERRED_FORECAST_HOUR = 0
 INGEST_CACHE_MIN_BYTES = 2000
 INGEST_MIN_INTERVAL_SECONDS = 600
+INGEST_FAILED_CYCLE_COOLDOWN_SECONDS = 120
 WEATHER_REFRESH_TTL_SECONDS = 45
 SCENE_REFRESH_TTL_SECONDS = 30
 SCENE_DOWNSAMPLE_STRIDE = 1
@@ -143,7 +146,7 @@ def clamp_forecast_hour(fhr: int, min_hour: int = 0, max_hour: int = 384) -> int
 
 
 class FetchResult:
-    def __init__(self, ok: bool, path: Path | None = None, cycle: str = "", forecast_hour: int = 0, valid_time: str = "", error: str = "", url: str = "") -> None:
+    def __init__(self, ok: bool, path: Path | None = None, cycle: str = "", forecast_hour: int = 0, valid_time: str = "", error: str = "", url: str = "", cache_key: str = "") -> None:
         self.ok = ok
         self.path = path
         self.cycle = cycle
@@ -151,6 +154,7 @@ class FetchResult:
         self.valid_time = valid_time
         self.error = error
         self.url = url
+        self.cache_key = cache_key
 
 
 class GFSNomadsClient:
@@ -163,6 +167,7 @@ class GFSNomadsClient:
         self.retries = retries
         self.http = requests.Session()
         self.http.headers.update({"User-Agent": DEFAULT_UA})
+        self._failed_keys: dict[str, dict[str, Any]] = {}
 
     def build_file_name(self, cycle_hour: int, forecast_hour: int) -> str:
         return f"gfs.t{int(cycle_hour):02d}z.pgrb2.0p25.f{int(forecast_hour):03d}"
@@ -191,6 +196,80 @@ class GFSNomadsClient:
     def _cache_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}.grib2"
+
+    def describe_grib_file(self, path: Path | None) -> dict[str, Any]:
+        if path is None:
+            return {"path": None, "exists": False, "is_file": False, "size": 0, "mtime": None}
+        p = Path(path)
+        exists = p.exists()
+        is_file = p.is_file() if exists else False
+        size = p.stat().st_size if is_file else 0
+        mtime = p.stat().st_mtime if is_file else None
+        return {"path": str(p.resolve()), "exists": exists, "is_file": is_file, "size": int(size), "mtime": mtime}
+
+    def validate_grib_cache_entry(self, path: Path, min_bytes: int = INGEST_CACHE_MIN_BYTES) -> tuple[bool, str]:
+        info = self.describe_grib_file(path)
+        if not info["exists"]:
+            return False, "missing"
+        if not info["is_file"]:
+            return False, "not_file"
+        if int(info["size"]) < int(min_bytes):
+            return False, f"too_small:{info['size']}"
+        try:
+            with path.open("rb") as fh:
+                head = fh.read(16)
+            if not head:
+                return False, "empty_read"
+        except Exception as exc:
+            return False, f"unreadable:{exc}"
+        return True, "ok"
+
+    def _cleanup_cfgrib_sidecars(self, path: Path) -> None:
+        patterns = [
+            f"{path.name}*.idx",
+            f"{path.name}*.index",
+            f"{path.name}*.tmp",
+            f".{path.name}*.idx",
+        ]
+        for pat in patterns:
+            for sidecar in path.parent.glob(pat):
+                try:
+                    sidecar.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def quarantine_cache_entry(self, path: Path, reason: str) -> tuple[bool, str]:
+        ts = int(time.time())
+        q_path = path.with_suffix(f"{path.suffix}.quarantine.{ts}")
+        try:
+            self._cleanup_cfgrib_sidecars(path)
+            path.replace(q_path)
+            log.warning("[gfs-cache] quarantined grib path=%s quarantine=%s reason=%s", path, q_path, reason)
+            return True, str(q_path)
+        except Exception as exc:
+            try:
+                path.unlink(missing_ok=True)
+                log.warning("[gfs-cache] quarantine rename failed; deleted bad grib path=%s reason=%s err=%s", path, reason, exc)
+                return False, str(path)
+            except Exception as rm_exc:
+                log.warning("[gfs-cache] unable to quarantine/delete bad grib path=%s reason=%s err=%s rm_err=%s", path, reason, exc, rm_exc)
+                return False, str(path)
+
+    def invalidate_cache_entry(self, path: Path, reason: str) -> tuple[bool, str]:
+        return self.quarantine_cache_entry(path, reason)
+
+    def should_retry_failed_cycle(self, cache_key: str, cooldown_s: int = INGEST_FAILED_CYCLE_COOLDOWN_SECONDS) -> bool:
+        rec = self._failed_keys.get(cache_key) or {}
+        ts = float(rec.get("ts") or 0.0)
+        if ts <= 0:
+            return True
+        return (time.time() - ts) >= float(cooldown_s)
+
+    def mark_failed_cycle(self, cache_key: str, reason: str) -> None:
+        self._failed_keys[cache_key] = {"ts": time.time(), "reason": reason}
+
+    def clear_failed_cycle(self, cache_key: str) -> None:
+        self._failed_keys.pop(cache_key, None)
 
     def fetch_subset(self, url: str, out_path: Path) -> Path:
         tmp = out_path.with_suffix(".tmp")
@@ -222,12 +301,25 @@ class GFSNomadsClient:
             url = self.build_filter_url(date_str, cycle_hour, fhr, bbox, variables, levels)
             cache_key = f"{date_str}:{cycle_hour}:{fhr}:{json.dumps(self.normalize_bbox_for_nomads(bbox), sort_keys=True)}:{','.join(sorted(variables))}:{','.join(sorted(levels))}"
             path = self._cache_path(cache_key)
-            if path.exists() and (time.time() - path.stat().st_mtime) < DEFAULT_GFS_CACHE_TTL_SECONDS:
-                return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url)
+            can_retry = self.should_retry_failed_cycle(cache_key)
+            if path.exists() and (time.time() - path.stat().st_mtime) < DEFAULT_GFS_CACHE_TTL_SECONDS and can_retry:
+                ok, reason = self.validate_grib_cache_entry(path, min_bytes=INGEST_CACHE_MIN_BYTES)
+                if ok:
+                    return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url, cache_key=cache_key)
+                self.invalidate_cache_entry(path, f"cache_validation_failed:{reason}")
+            if not can_retry:
+                rec = self._failed_keys.get(cache_key) or {}
+                return FetchResult(False, error=f"recent_decode_failure_cooldown:{rec.get('reason') or 'unknown'}", cache_key=cache_key)
             try:
                 self.fetch_subset(url, path)
-                return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url)
+                ok, reason = self.validate_grib_cache_entry(path, min_bytes=INGEST_CACHE_MIN_BYTES)
+                if not ok:
+                    self.invalidate_cache_entry(path, f"post_download_validation_failed:{reason}")
+                    raise RuntimeError(f"download validation failed: {reason}")
+                self.clear_failed_cycle(cache_key)
+                return FetchResult(True, path=path, cycle=f"{date_str}{cycle_hour:02d}", forecast_hour=fhr, valid_time=(cycle_dt + timedelta(hours=fhr)).isoformat(), url=url, cache_key=cache_key)
             except Exception as exc:
+                self.mark_failed_cycle(cache_key, str(exc))
                 continue
         return FetchResult(False, error="no available nomads subset")
 
@@ -673,9 +765,39 @@ class GFSService:
         self._weather_refresh_lock = threading.Lock()
         self._decode_cache: Dict[str, Dict[str, Any]] = {}
         self._weather_payload_cache: Dict[str, Any] = {"ts": 0, "payload": None}
+        self._weather_fast_cache: Dict[str, Any] = {"ts": 0, "payload": None}
+        self._weather_refresh_inflight = False
+        self._weather_refresh_last_started_ms = 0
+        self._weather_refresh_last_completed_ms = 0
+        self._weather_refresh_failures = 0
+        self._cloud_payload_cache: Dict[str, Any] = {"ts": 0, "payload": None}
+        self._cloud_refresh_lock = threading.Lock()
+        self._cloud_refresh_inflight = False
+        self._cloud_refresh_last_started_ms = 0
+        self._cloud_refresh_last_completed_ms = 0
+        self._cloud_refresh_failures = 0
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
+
+    def _rss_mb(self) -> float:
+        try:
+            rss_kb = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0.0)
+            if rss_kb <= 0:
+                return 0.0
+            # Linux reports ru_maxrss in KiB.
+            return round(rss_kb / 1024.0, 2)
+        except Exception:
+            return 0.0
+
+    def _perf_log(self, stage: str, started: float, **fields: Any) -> None:
+        payload = {
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "rss_mb": self._rss_mb(),
+        }
+        payload.update(fields)
+        joined = " ".join(f"{k}={payload[k]}" for k in sorted(payload))
+        log.info("[gfs-perf] %s %s", stage, joined)
 
     def _default_bbox(self) -> dict[str, float]:
         return {"west": -180.0, "south": -80.0, "east": 180.0, "north": 80.0}
@@ -710,7 +832,7 @@ class GFSService:
         out["heuristic"] = bool(heuristic)
         out["quality_note"] = quality_note
         out["confidence"] = confidence
-        out.setdefault("data_source", "live_gfs_0p25" if payload_state in {"live", "cached"} else "synthetic_fallback")
+        out.setdefault("data_source", "live_gfs_0p25" if payload_state in {"live", "cached"} else "unavailable")
         out.setdefault("used_fallback", payload_state not in {"live", "cached"})
         out.setdefault("fallback_reason", None)
         out.setdefault("canonical_shape", out.get("grid_shape"))
@@ -844,15 +966,34 @@ class GFSService:
             "meanSea": self.open_mean_sea_dataset,
         }
         for name, fn in openers.items():
+            info = self.gfs_client.describe_grib_file(grib_path)
+            log.info(
+                "[gfs-decode] cfgrib open precheck group=%s backend=cfgrib path=%s exists=%s size=%s mtime=%s pid=%s tid=%s",
+                name,
+                info.get("path"),
+                info.get("exists"),
+                info.get("size"),
+                info.get("mtime"),
+                os.getpid(),
+                threading.get_ident(),
+            )
             try:
                 ds = fn(grib_path)
                 if ds is not None and len(getattr(ds, "data_vars", {})) > 0:
                     groups[name] = ds
-                    print(f"[gfs] cfgrib group opened: {name} vars={list(ds.data_vars.keys())[:8]}")
+                    log.info("[gfs-decode] cfgrib group opened group=%s vars=%s", name, list(ds.data_vars.keys())[:8])
                 elif ds is not None:
-                    print(f"[gfs] cfgrib group empty: {name}")
+                    log.info("[gfs-decode] cfgrib group empty group=%s", name)
             except Exception as exc:
-                print(f"[gfs] cfgrib group failed: {name}: {exc}")
+                post = self.gfs_client.describe_grib_file(grib_path)
+                log.warning(
+                    "[gfs-decode] cfgrib group failed group=%s path=%s exists_post=%s size_post=%s err=%r",
+                    name,
+                    post.get("path"),
+                    post.get("exists"),
+                    post.get("size"),
+                    exc,
+                )
         return groups
 
     def _open_all_valid_groups_pygrib(self, grib_path: Path) -> dict[str, Any]:
@@ -860,6 +1001,16 @@ class GFSService:
         if pygrib is None or xr is None:
             return {}
         groups: dict[str, dict[str, Any]] = {}
+        info = self.gfs_client.describe_grib_file(grib_path)
+        log.info(
+            "[gfs-decode] pygrib fallback precheck path=%s exists=%s size=%s mtime=%s pid=%s tid=%s",
+            info.get("path"),
+            info.get("exists"),
+            info.get("size"),
+            info.get("mtime"),
+            os.getpid(),
+            threading.get_ident(),
+        )
         try:
             with pygrib.open(str(grib_path)) as grbs:
                 for msg in grbs:
@@ -886,14 +1037,27 @@ class GFSService:
             for gname, vars_map in groups.items():
                 if vars_map:
                     out[gname] = xr.Dataset(vars_map)
-                    print(f"[gfs] pygrib group opened: {gname} vars={list(vars_map.keys())[:8]}")
+                    log.info("[gfs-decode] pygrib group opened group=%s vars=%s", gname, list(vars_map.keys())[:8])
             return out
         except Exception as exc:
-            print(f"[gfs] pygrib fallback failed: {exc}")
+            post = self.gfs_client.describe_grib_file(grib_path)
+            log.warning(
+                "[gfs-decode] pygrib fallback failed path=%s exists_post=%s size_post=%s err=%r",
+                post.get("path"),
+                post.get("exists"),
+                post.get("size"),
+                exc,
+            )
             return {}
 
     def open_all_valid_groups(self, grib_path: Path) -> tuple[dict[str, Any], str]:
-        """Open available GRIB groups with cfgrib primary and pygrib fallback."""
+        """Open available GRIB groups with cfgrib primary and pygrib fallback.
+
+        Decision flow:
+        1) Validate/open via cfgrib group filters.
+        2) If cfgrib produced zero valid groups, try pygrib fallback.
+        3) Return empty + \"none\" only if both decoders fail.
+        """
         groups = self._open_all_valid_groups_cfgrib(grib_path)
         if groups:
             loaded = ", ".join([k for k in ["surface", "2m", "10m", "isobaric", "meanSea"] if (k in groups or (k == "isobaric" and "isobaricInhPa" in groups))])
@@ -929,12 +1093,13 @@ class GFSService:
             for v in list(getattr(ds, "data_vars", {}).keys()):
                 available.add(f"{gname}:{v}")
 
-        desired = {
+        desired = [
             "surface:PRATE", "surface:APCP", "surface:TCDC", "surface:CAPE", "surface:UGRD", "surface:VGRD",
             "2m:TCDC", "2m:UGRD", "2m:VGRD", "10m:UGRD", "10m:VGRD",
             "isobaricInhPa:RH", "isobaricInhPa:TMP", "isobaricInhPa:HGT", "isobaricInhPa:UGRD", "isobaricInhPa:VGRD",
-        }
-        missing = sorted([k for k in desired if k not in available])
+        ]
+        resolved = resolve_aliases(available, desired)
+        missing = sorted(resolved["missing"])
         return sorted(available), missing
 
     def _update_ingest_state_success(self, fetch: FetchResult, groups: dict[str, Any], mode: str, error: str | None = None) -> None:
@@ -948,8 +1113,12 @@ class GFSService:
         self.state.model_analysis_time = self._model_analysis_time_from_cycle(fetch.cycle) or self.state.model_analysis_time
         self.state.model_source_url = fetch.url or self.state.model_source_url
         self.state.model_cache_path = str(fetch.path) if fetch.path else self.state.model_cache_path
+        info = self.gfs_client.describe_grib_file(fetch.path) if fetch.path else {"exists": False, "size": None}
+        self.state.model_cache_exists = bool(info.get("exists"))
+        self.state.model_cache_size_bytes = int(info.get("size")) if info.get("size") is not None else None
         self.state.degraded_mode = mode != "live"
         self.state.using_last_known_good = mode == "last_known_good"
+        self.state.decode_failure_reason = None if mode in {"live", "last_known_good"} else self.state.decode_failure_reason
         if self.state.decode_backend == "none":
             self.state.data_source_mode = "heuristic"
         elif self.state.decode_backend == "cfgrib":
@@ -959,6 +1128,37 @@ class GFSService:
         available, missing = self._collect_available_fields(groups)
         self.state.fields_available = available
         self.state.fields_missing = missing
+
+    def _validate_grib_for_decode(self, path: Path | None, *, reason_prefix: str) -> tuple[bool, str]:
+        if path is None:
+            return False, f"{reason_prefix}:missing_path"
+        ok, reason = self.gfs_client.validate_grib_cache_entry(path, min_bytes=INGEST_CACHE_MIN_BYTES)
+        info = self.gfs_client.describe_grib_file(path)
+        log.info(
+            "[gfs-ingest] cache validation reason_prefix=%s path=%s exists=%s size=%s mtime=%s result=%s detail=%s",
+            reason_prefix,
+            info.get("path"),
+            info.get("exists"),
+            info.get("size"),
+            info.get("mtime"),
+            ok,
+            reason,
+        )
+        return ok, reason
+
+    def _quarantine_bad_grib(self, path: Path | None, *, reason: str) -> None:
+        if path is None:
+            return
+        moved, q_path = self.gfs_client.quarantine_cache_entry(path, reason)
+        self.state.ingest_quarantine_count += 1
+        self.state.ingest_last_quarantine_path = q_path
+        self.state.ingest_last_quarantine_reason = reason
+        self.state.decode_failure_reason = reason
+        self.state.decode_last_attempt_path = str(path)
+        if moved:
+            log.warning("[gfs-ingest] quarantined decode-failed grib path=%s reason=%s", path, reason)
+        else:
+            log.warning("[gfs-ingest] invalidated decode-failed grib path=%s reason=%s", path, reason)
 
     def ingest_latest_model_fields(self, bbox: dict[str, float]) -> dict[str, Any]:
         """Attempt real NOMADS->GRIB2 ingestion and retain last-known-good state on failure."""
@@ -978,7 +1178,8 @@ class GFSService:
                 lkg = self.state.last_good_model_state or {}
                 lkg_path_raw = lkg.get("fetch", {}).get("path")
                 lkg_path = Path(lkg_path_raw) if lkg_path_raw else None
-                if lkg_path and lkg_path.exists():
+                ok_lkg, reason_lkg = self._validate_grib_for_decode(lkg_path, reason_prefix="last_known_good")
+                if ok_lkg and lkg_path and lkg_path.exists():
                     lkg_groups, lkg_backend = self.open_all_valid_groups(lkg_path)
                     if lkg_groups:
                         self.state.decode_backend = lkg_backend
@@ -994,26 +1195,36 @@ class GFSService:
                         )
                         self._update_ingest_state_success(lkg_fetch, lkg_groups, mode="last_known_good")
                         return {"mode": "last_known_good", "fetch": lkg_fetch, "groups": lkg_groups, "bbox": lkg.get("bbox") or bbox}
+                    self._quarantine_bad_grib(lkg_path, reason=f"last_known_good_decode_failed:{lkg_backend}")
+                elif lkg_path and lkg_path.exists():
+                    self._quarantine_bad_grib(lkg_path, reason=f"last_known_good_invalid:{reason_lkg}")
             try:
                 fetch = self.gfs_client.fetch_latest_available_subset(now, bbox, DEFAULT_REQUIRED_VARIABLES, DEFAULT_REQUIRED_LEVELS)
                 if not fetch.ok or not fetch.path:
                     raise RuntimeError(fetch.error or "nomads fetch failed")
-                print(f"[gfs-ingest] selected cycle={fetch.cycle} fhr={fetch.forecast_hour} url={fetch.url}")
-                if fetch.path.stat().st_size < INGEST_CACHE_MIN_BYTES:
-                    raise RuntimeError("downloaded GRIB2 too small")
-                print(f"[gfs-ingest] cache file ready path={fetch.path} size={fetch.path.stat().st_size}")
+                log.info("[gfs-ingest] selected cycle=%s fhr=%s url=%s", fetch.cycle, fetch.forecast_hour, fetch.url)
+                ok_cache, reason_cache = self._validate_grib_for_decode(fetch.path, reason_prefix="active_fetch")
+                if not ok_cache:
+                    self._quarantine_bad_grib(fetch.path, reason=f"active_cache_invalid:{reason_cache}")
+                    raise RuntimeError(f"downloaded GRIB2 validation failed: {reason_cache}")
+                self.state.decode_last_attempt_path = str(fetch.path)
+                info = self.gfs_client.describe_grib_file(fetch.path)
+                log.info("[gfs-ingest] cache file ready path=%s exists=%s size=%s", info.get("path"), info.get("exists"), info.get("size"))
 
                 try:
                     groups, decode_backend = self.open_all_valid_groups(fetch.path)
                 except Exception as e:
-                    print(f"[gfs] gfs decode failed: {e}")
+                    log.warning("[gfs-ingest] decoder raised hard failure path=%s err=%r", fetch.path, e)
                     raise RuntimeError("gfs decode failed") from e
                 self.state.decode_backend = decode_backend
                 self.state.data_source_mode = "primary" if decode_backend == "cfgrib" else "fallback" if decode_backend == "pygrib" else "heuristic"
                 if not groups:
+                    if fetch.cache_key:
+                        self.gfs_client.mark_failed_cycle(fetch.cache_key, "no_groups_decoded")
+                    self._quarantine_bad_grib(fetch.path, reason="cfgrib_and_pygrib_total_failure")
                     raise RuntimeError("no GRIB groups decoded")
 
-                print(f"[gfs-ingest] decoded groups={list(groups.keys())} backend={decode_backend}")
+                log.info("[gfs-ingest] decoded groups=%s backend=%s", list(groups.keys()), decode_backend)
                 self.state.last_good_model_state = {
                     "fetch": {
                         "cycle": fetch.cycle,
@@ -1025,15 +1236,17 @@ class GFSService:
                     "bbox": bbox,
                     "saved_at": now_ms,
                 }
+                self.state.decode_failure_reason = None
                 self._update_ingest_state_success(fetch, groups, mode="live")
                 return {"mode": "live", "fetch": fetch, "groups": groups, "bbox": bbox}
             except Exception as exc:
-                print(f"[gfs-ingest] live ingest failed: {exc}")
+                log.warning("[gfs-ingest] live ingest failed err=%s", exc)
                 self.state.ingest_error = str(exc)
                 lkg = self.state.last_good_model_state or {}
                 lkg_path_raw = lkg.get("fetch", {}).get("path")
                 lkg_path = Path(lkg_path_raw) if lkg_path_raw else None
-                if lkg_path and lkg_path.exists():
+                ok_lkg, reason_lkg = self._validate_grib_for_decode(lkg_path, reason_prefix="fallback_last_known_good")
+                if ok_lkg and lkg_path and lkg_path.exists():
                     lkg_groups, lkg_backend = self.open_all_valid_groups(lkg_path)
                     if lkg_groups:
                         self.state.decode_backend = lkg_backend
@@ -1047,14 +1260,18 @@ class GFSService:
                             error="",
                             url=str(lkg.get("fetch", {}).get("url") or ""),
                         )
-                        print("[gfs-ingest] using last-known-good GRIB2 file")
+                        log.info("[gfs-ingest] using last-known-good GRIB2 file path=%s", lkg_path)
                         self._update_ingest_state_success(lkg_fetch, lkg_groups, mode="last_known_good", error=str(exc))
                         return {"mode": "last_known_good", "fetch": lkg_fetch, "groups": lkg_groups, "bbox": lkg.get("bbox") or bbox, "error": str(exc)}
+                    self._quarantine_bad_grib(lkg_path, reason=f"fallback_last_known_good_decode_failed:{lkg_backend}")
+                elif lkg_path and lkg_path.exists():
+                    self._quarantine_bad_grib(lkg_path, reason=f"fallback_last_known_good_invalid:{reason_lkg}")
                 self.state.ingest_status = "failed"
                 self.state.degraded_mode = True
                 self.state.using_last_known_good = False
                 self.state.decode_backend = "none"
                 self.state.data_source_mode = "heuristic"
+                self.state.decode_failure_reason = str(exc)
                 raise
 
     def _utc_now(self) -> datetime:
@@ -2410,7 +2627,7 @@ class GFSService:
             yy = np.linspace(-90.0, 90.0, canonical_ds_shape[0])
             xx = np.linspace(-180.0, 180.0, canonical_ds_shape[1])
             lat2d, lon2d = np.meshgrid(yy, xx, indexing="ij")
-            log.warning("[gfs] lat/lon shape mismatch; using canonical synthetic grid for processing only")
+            log.warning("[gfs] lat/lon shape mismatch; using canonical placeholder grid for processing only")
         low = self._downsample_2d(low_live, SCENE_DOWNSAMPLE_STRIDE)
         mid = self._downsample_2d(mid_live, SCENE_DOWNSAMPLE_STRIDE)
         high = self._downsample_2d(high_live, SCENE_DOWNSAMPLE_STRIDE)
@@ -2541,6 +2758,29 @@ class GFSService:
                 "updated_at": self._now_ms(),
             }
         self.state.scalar_fields = scalar_fields
+
+    def _weather_fields_payload(self, fields: dict[str, Any]) -> dict[str, Any]:
+        if np is None:
+            return {}
+        out: dict[str, Any] = {}
+        for key in ("wind_u", "wind_v", "temperature_k", "cloud_density"):
+            val = fields.get(key)
+            if val is None:
+                continue
+            try:
+                arr = np.asarray(val, dtype=float)
+            except Exception:
+                continue
+            if arr.ndim != 2:
+                continue
+            out[key] = arr.astype(np.float32).tolist()
+        if "wind_u" in out:
+            out["10m:u10"] = out["wind_u"]
+            out["10m:UGRD"] = out["wind_u"]
+        if "wind_v" in out:
+            out["10m:v10"] = out["wind_v"]
+            out["10m:VGRD"] = out["wind_v"]
+        return out
 
     def tile_to_bounds(self, z: int, x: int, y: int) -> dict[str, float]:
         return self._tile_bounds_xyz(z, x, y)
@@ -2693,6 +2933,7 @@ class GFSService:
         return preferred
 
     def _derive_real_hazard_payloads(self, groups: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
         warned: set[str] = set()
         hazard_inputs = fields.get("hazard_inputs") if isinstance(fields.get("hazard_inputs"), dict) else {}
         precip = np.asarray(hazard_inputs.get("precip", fields["precip"]), dtype=float)
@@ -2738,13 +2979,23 @@ class GFSService:
         rain_polys = self.connected_components_or_simple_cell_polygons(rain_mask, lat2d, lon2d)
         hail_polys = self.connected_components_or_simple_cell_polygons(hail_mask, lat2d, lon2d)
         lightning_polys = self.connected_components_or_simple_cell_polygons(lightning_mask, lat2d, lon2d)
-        return {
+        out = {
             "rain": self.serialize_rain_payload(rain_polys),
             "hail": self.serialize_hail_payload(hail_polys),
             "lightning": self.serialize_lightning_payload(lightning_polys),
         }
+        self._perf_log(
+            "hazard_canonicalization",
+            started,
+            canonical_shape=f"{canonical_shape[0]}x{canonical_shape[1]}",
+            rain_polygons=len(rain_polys),
+            hail_polygons=len(hail_polys),
+            lightning_polygons=len(lightning_polys),
+        )
+        return out
 
     def generate_real_gfs_payload(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
         bbox = self._normalize_bbox(bbox)
         ingest = self.ingest_latest_model_fields(bbox)
         fetch = ingest["fetch"]
@@ -2778,11 +3029,22 @@ class GFSService:
                 "cache_path": str(fetch.path) if fetch.path else None,
                 "fields_available": list(self.state.fields_available or []),
                 "fields_missing": list(self.state.fields_missing or []),
+                "fields": self._weather_fields_payload(fields),
                 "using_last_known_good": mode == "last_known_good",
                 "degraded_mode": mode != "live",
                 "decode_backend": self.state.decode_backend,
                 "data_source_mode": self.state.data_source_mode,
             }
+            self._perf_log(
+                "weather_canonicalization",
+                started,
+                mode=mode,
+                grid_shape=str(payload.get("grid_shape")),
+                tile_count=len(payload.get("tiles") or []),
+                rain_count=int((payload.get("rain") or {}).get("count") or 0),
+                hail_count=int((payload.get("hail") or {}).get("count") or 0),
+                lightning_count=int((payload.get("lightning") or {}).get("count") or 0),
+            )
             return self._annotate_weather_payload(
                 payload,
                 bbox=bbox,
@@ -2798,51 +3060,11 @@ class GFSService:
             gc.collect()
 
     def generate_fallback_payload(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
-        bbox = self._normalize_bbox(bbox)
-        cloud = self._legacy_cloud_tiles_payload()
-        cloud.update({
-            "source": "fallback_proxy",
-            "payload_state": "synthetic",
-            "cycle": cloud.get("cycle"),
-            "forecast_hour": cloud.get("forecast_hour"),
-            "valid_time": cloud.get("valid_time"),
-            "bbox_used": bbox,
-            "quality_note": "Synthetic fallback generated from heuristic cloud-state proxies; not direct observational truth.",
-            "confidence": "low",
-        })
-        cloud["rain"] = {"items": [], "count": 0}
-        cloud["hail"] = {"items": [], "count": 0}
-        cloud["lightning"] = {"items": [], "count": 0}
-        cloud["balloons"] = {"items": [], "count": 0}
-        cloud["decode_backend"] = "none"
-        cloud["data_source_mode"] = "heuristic"
-        cloud["fallback_offset_degrees"] = SYNTHETIC_FALLBACK_OFFSET_DEGREES
-        cloud["layer_sources"] = {"clouds": "synthetic_fallback", "rain": "synthetic_fallback", "hail": "synthetic_fallback", "lightning": "synthetic_fallback", "wind": "synthetic_fallback"}
-        try:
-            for item in cloud.get("items") or cloud.get("tiles") or []:
-                if isinstance(item, dict):
-                    if "lat" in item:
-                        item["lat"] = float(item.get("lat", 0.0)) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-                    if "lon" in item:
-                        item["lon"] = float(item.get("lon", 0.0)) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-                    b = item.get("bounds")
-                    if isinstance(b, dict):
-                        for k in ("north", "south", "lat_center"):
-                            if k in b:
-                                b[k] = float(b[k]) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-                        for k in ("east", "west", "lon_center"):
-                            if k in b:
-                                b[k] = float(b[k]) + SYNTHETIC_FALLBACK_OFFSET_DEGREES
-        except Exception:
-            log.exception("[gfs] failed applying synthetic fallback offset")
-        return self._annotate_weather_payload(
-            cloud,
-            bbox=bbox,
-            source="fallback_proxy",
-            payload_state="synthetic",
-            heuristic=True,
-            quality_note=cloud["quality_note"],
-            confidence="low",
+        # Compatibility shim: historical callers should now receive explicit
+        # unavailability rather than fabricated weather.
+        return self._weather_unavailable_payload(
+            self._normalize_bbox(bbox),
+            reason="legacy_fallback_disabled",
         )
 
 
@@ -2895,14 +3117,53 @@ class GFSService:
                     confidence="medium",
                 )
                 return cached_payload
-            if not ALLOW_SYNTHETIC_FALLBACK:
-                raise RuntimeError(f"live_only_mode_failed reason={exc}")
-            log.warning("[gfs] activating synthetic fallback payload reason=%s", exc)
-            fb = self.generate_fallback_payload(bbox)
-            fb["fallback_reason"] = str(exc)
-            fb["used_fallback"] = True
-            fb["data_source"] = "synthetic_fallback"
-            return fb
+            return self._weather_unavailable_payload(bbox, reason=f"ncss_live_failed:{exc}")
+
+    def _refresh_weather_cache(self, refresh_bbox: dict[str, float], *, trigger: str = "unknown") -> None:
+        started = time.perf_counter()
+        self._weather_refresh_last_started_ms = self._now_ms()
+        try:
+            payload = self._generate_weather_payload_uncached(refresh_bbox)
+            now_ms = self._now_ms()
+            prev_ts = int((self._weather_payload_cache or {}).get("ts") or 0)
+            self._weather_payload_cache = {"ts": now_ms, "payload": payload}
+            self._weather_fast_cache = {"ts": now_ms, "payload": payload}
+            self._weather_refresh_last_completed_ms = now_ms
+            self._perf_log(
+                "weather_refresh",
+                started,
+                trigger=trigger,
+                payload_state=str(payload.get("payload_state") or "unknown"),
+                source=str(payload.get("source") or "unknown"),
+                failures=self._weather_refresh_failures,
+                cache_replaced=bool(prev_ts > 0),
+            )
+        except Exception as exc:
+            self._weather_refresh_failures += 1
+            self._perf_log("weather_refresh_failed", started, trigger=trigger, failures=self._weather_refresh_failures, error=str(exc))
+        finally:
+            self._weather_refresh_inflight = False
+            try:
+                self._weather_refresh_lock.release()
+            except RuntimeError:
+                pass
+
+    def _start_weather_refresh_async(self, refresh_bbox: dict[str, float], *, trigger: str = "unknown") -> bool:
+        now_ms = self._now_ms()
+        if self._weather_refresh_inflight:
+            return False
+        if (now_ms - int(self._weather_refresh_last_started_ms or 0)) < 12_000:
+            return False
+        if not self._weather_refresh_lock.acquire(blocking=False):
+            return False
+        self._weather_refresh_inflight = True
+        try:
+            threading.Thread(target=self._refresh_weather_cache, args=(refresh_bbox,), kwargs={"trigger": trigger}, daemon=True).start()
+            return True
+        except Exception:
+            self._weather_refresh_inflight = False
+            self._weather_refresh_lock.release()
+            raise
 
     def generate_weather_payload(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
         refresh_bbox = self._default_bbox()
@@ -2913,26 +3174,61 @@ class GFSService:
         cached_ts = int(row.get("ts") or 0)
         if cached_payload and (now_ms - cached_ts) <= ttl_ms:
             return cached_payload
+        self._start_weather_refresh_async(refresh_bbox, trigger="generate_weather_payload")
+        if cached_payload:
+            out = dict(cached_payload)
+            out["stale"] = True
+            out["refresh_in_progress"] = bool(self._weather_refresh_inflight)
+            return out
+        unavailable = self._weather_unavailable_payload(self._normalize_bbox(bbox), reason="ncss_unavailable_no_last_good")
+        unavailable["stale"] = False
+        unavailable["refresh_in_progress"] = True
+        return unavailable
 
-        if not self._weather_refresh_lock.acquire(blocking=False):
-            if cached_payload:
-                return cached_payload
-            with self._weather_refresh_lock:
-                pass
-            row = self._weather_payload_cache or {}
-            if isinstance(row.get("payload"), dict):
-                return row["payload"]
+    def generate_weather_payload_fast(self, bbox: dict[str, float] | None = None, *, max_stale_seconds: int = 21_600) -> dict[str, Any]:
+        """Non-blocking weather payload path for latency-sensitive API handlers.
 
-        try:
-            payload = self._generate_weather_payload_uncached(refresh_bbox)
-            self._weather_payload_cache = {"ts": self._now_ms(), "payload": payload}
-            return payload
-        except Exception:
-            if cached_payload:
-                return cached_payload
-            raise
-        finally:
-            self._weather_refresh_lock.release()
+        Order:
+        1) in-memory fast cache (stale-while-refresh)
+        2) in-memory live weather cache
+        3) explicit unavailable payload (no fabricated fallback)
+        """
+        bbox_norm = self._normalize_bbox(bbox)
+        fast_row = self._weather_fast_cache or {}
+        fast_payload = fast_row.get("payload") if isinstance(fast_row.get("payload"), dict) else None
+        fast_ts = int(fast_row.get("ts") or 0)
+        if fast_payload and fast_ts > 0 and (self._now_ms() - fast_ts) <= int(max_stale_seconds * 1000):
+            if (self._now_ms() - fast_ts) > max(10_000, WEATHER_REFRESH_TTL_SECONDS * 1000):
+                self._start_weather_refresh_async(self._default_bbox(), trigger="fast_cache_stale")
+            return fast_payload
+        row = self._weather_payload_cache or {}
+        cached_payload = row.get("payload") if isinstance(row.get("payload"), dict) else None
+        if cached_payload:
+            self._weather_fast_cache = {"ts": self._now_ms(), "payload": cached_payload}
+            return cached_payload
+        self._start_weather_refresh_async(self._default_bbox(), trigger="fast_unavailable")
+        return self._weather_unavailable_payload(bbox_norm, reason="ncss_unavailable_no_last_good")
+
+    def _weather_unavailable_payload(self, bbox: dict[str, float] | None, *, reason: str) -> dict[str, Any]:
+        bbox_norm = self._normalize_bbox(bbox)
+        return {
+            "ok": False,
+            "source": "ncss_weather",
+            "payload_state": "unavailable",
+            "bbox_used": bbox_norm,
+            "heuristic": False,
+            "confidence": "none",
+            "quality_note": "NCSS weather unavailable and no stale last-good payload is available.",
+            "error_code": "weather_unavailable",
+            "error_message": "NCSS weather unavailable and no stale last-good payload",
+            "fallback_reason": reason,
+            "fields": {},
+            "rain": {"items": [], "count": 0},
+            "hail": {"items": [], "count": 0},
+            "lightning": {"items": [], "count": 0},
+            "balloons": {"items": [], "count": 0},
+            "degraded_mode": True,
+        }
 
     def debug_real_gfs_cycle(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
         """Manual debug helper for cycle/hour/url/group visibility."""
@@ -2963,7 +3259,7 @@ class GFSService:
     def compare_fallback_vs_real(self, bbox: dict[str, float] | None = None) -> dict[str, Any]:
         """Manual comparison helper between fallback and real precipitation/cloud outputs."""
         real = self.generate_weather_payload(bbox)
-        fb = self.generate_fallback_payload(bbox)
+        fb = self._weather_unavailable_payload(self._normalize_bbox(bbox), reason="compare_fallback_disabled")
         return {
             "real_source": real.get("source"),
             "real_tiles": len(real.get("tiles") or real.get("items") or []),
@@ -3238,25 +3534,25 @@ class GFSService:
         if fish_error:
             warnings.append("fish_source_unavailable")
 
-        heuristic_flag = bool(weather.get("heuristic", True) or weather.get("payload_state") != "live")
+        heuristic_flag = bool(weather.get("heuristic", False) or weather.get("payload_state") != "live")
         status = {
             "ok": len(errors) == 0,
-            "mode": str(weather.get("payload_state") or "synthetic"),
+            "mode": str(weather.get("payload_state") or "unavailable"),
             "warnings": warnings,
             "errors": errors,
             "upstream_available": weather.get("source") == "gfs_nomads",
             "partial": bool(warnings),
             "generated_at": self._now_ms(),
             "request_bounds": bbox,
-            "fallback_active": str(weather.get("payload_state") or "synthetic") != "live",
+            "fallback_active": str(weather.get("payload_state") or "unavailable") != "live",
             "heuristic_dominant": heuristic_flag,
             "decode_backend": weather.get("decode_backend") or self.state.decode_backend,
             "data_source_mode": weather.get("data_source_mode") or self.state.data_source_mode,
         }
         meta = {
             "schema_version": "atmo-scene-v1",
-            "source_name": str(weather.get("source") or "fallback_proxy"),
-            "source_type": "model" if weather.get("source") == "gfs_nomads" else "heuristic",
+            "source_name": str(weather.get("source") or "ncss_weather"),
+            "source_type": "model" if weather.get("source") == "gfs_nomads" else "unavailable",
             "analysis_time": weather.get("cycle"),
             "valid_time": weather.get("valid_time"),
             "generated_at": self._now_ms(),
@@ -3271,7 +3567,7 @@ class GFSService:
             },
             "heuristic_flags": {
                 "scene_features_estimated": True,
-                "fallback_payload": str(weather.get("payload_state") or "synthetic") != "live",
+                "fallback_payload": str(weather.get("payload_state") or "unavailable") != "live",
                 "cloud_geometry_derived": True,
                 "precip_columns_derived": True,
                 "lightning_events_inferred": True,
@@ -3341,7 +3637,7 @@ class GFSService:
             "items": [],
             "precip_columns": [],
             "lightning_events": [],
-            "source": "fallback_proxy",
+            "source": "ncss_weather",
             "payload_state": "degraded",
             "heuristic": True,
             "quality_note": "Degraded scene payload due to internal derivation failure.",
@@ -3349,8 +3645,10 @@ class GFSService:
             "bbox_used": bbox,
         }
 
-    def cloud_tiles_payload(self, bbox: dict[str, float] | None = None) -> Dict[str, Any]:
-        bbox_norm = self._normalize_bbox(bbox)
+    def _build_cloud_tiles_payload(self, bbox_norm: dict[str, float]) -> Dict[str, Any]:
+        started = time.perf_counter()
+        cloud_started = time.perf_counter()
+        bbox_norm = self._normalize_bbox(bbox_norm)
         try:
             weather = self.generate_weather_payload(bbox_norm)
         except Exception as exc:
@@ -3379,25 +3677,109 @@ class GFSService:
                 payload = self._annotate_weather_payload(
                     weather,
                     bbox=bbox_norm,
-                    source=str(weather.get("source") or "fallback_proxy"),
-                    payload_state=str(weather.get("payload_state") or "synthetic"),
-                    heuristic=bool(weather.get("heuristic", True)),
-                    quality_note=str(weather.get("quality_note") or "Synthetic weather fallback in use."),
+                    source=str(weather.get("source") or "ncss_weather"),
+                    payload_state=str(weather.get("payload_state") or "unavailable"),
+                    heuristic=bool(weather.get("heuristic", False)),
+                    quality_note=str(weather.get("quality_note") or "Weather unavailable; using explicit degraded scene payload."),
                     confidence=str(weather.get("confidence") or "low"),
                 )
                 payload.setdefault("precip_columns", self.derive_precip_columns_from_tiles(payload.get("items", []), max_items=260))
                 payload.setdefault("lightning_events", self.derive_lightning_events_from_tiles(payload.get("items", []), max_items=140))
 
+            self._perf_log(
+                "cloud_canonicalization",
+                cloud_started,
+                bbox=f"{round(bbox_norm['west'],2)},{round(bbox_norm['south'],2)},{round(bbox_norm['east'],2)},{round(bbox_norm['north'],2)}",
+                source=str(payload.get("source") or "unknown"),
+                payload_state=str(payload.get("payload_state") or "unknown"),
+                item_count=len(payload.get("items") or []),
+            )
+            scene_started = time.perf_counter()
             scene_payload = self.build_scene_payload(payload, bbox_norm)
             payload["status"] = scene_payload.get("status", {})
             payload["meta"] = scene_payload.get("meta", {})
             payload["scene"] = scene_payload.get("scene", {})
             payload["summary"] = scene_payload.get("summary", payload.get("summary") or {})
             payload["ok"] = bool(payload.get("ok", True) and payload["status"].get("ok", True))
+            self._perf_log(
+                "cloud_scene_assembly",
+                scene_started,
+                cloud_count=len((payload.get("scene") or {}).get("clouds") or []),
+                precip_count=len(payload.get("precip_columns") or []),
+                lightning_count=len(payload.get("lightning_events") or []),
+            )
+            self._perf_log("cloud_payload_total", started, ok=bool(payload.get("ok", True)))
             return payload
         except Exception as exc:
             log.exception("[gfs] scene payload assembly failed")
             return self._degraded_scene_payload(bbox_norm, str(exc))
+
+    def _refresh_cloud_cache(self, bbox_norm: dict[str, float], *, trigger: str = "unknown") -> None:
+        started = time.perf_counter()
+        self._cloud_refresh_last_started_ms = self._now_ms()
+        try:
+            payload = self._build_cloud_tiles_payload(bbox_norm)
+            now_ms = self._now_ms()
+            prev_ts = int((self._cloud_payload_cache or {}).get("ts") or 0)
+            self._cloud_payload_cache = {"ts": now_ms, "payload": payload}
+            self.state.scene_cache = payload
+            self.state.scene_cache_ts = now_ms
+            self._cloud_refresh_last_completed_ms = now_ms
+            self._perf_log(
+                "cloud_refresh",
+                started,
+                trigger=trigger,
+                ok=bool(payload.get("ok", False)),
+                failures=self._cloud_refresh_failures,
+                cache_replaced=bool(prev_ts > 0),
+            )
+        except Exception as exc:
+            self._cloud_refresh_failures += 1
+            self._perf_log("cloud_refresh_failed", started, trigger=trigger, failures=self._cloud_refresh_failures, error=str(exc))
+        finally:
+            self._cloud_refresh_inflight = False
+            try:
+                self._cloud_refresh_lock.release()
+            except RuntimeError:
+                pass
+
+    def _start_cloud_refresh_async(self, bbox_norm: dict[str, float], *, trigger: str = "unknown") -> bool:
+        now_ms = self._now_ms()
+        if self._cloud_refresh_inflight:
+            return False
+        if (now_ms - int(self._cloud_refresh_last_started_ms or 0)) < 10_000:
+            return False
+        if not self._cloud_refresh_lock.acquire(blocking=False):
+            return False
+        self._cloud_refresh_inflight = True
+        try:
+            threading.Thread(target=self._refresh_cloud_cache, args=(bbox_norm,), kwargs={"trigger": trigger}, daemon=True).start()
+            return True
+        except Exception:
+            self._cloud_refresh_inflight = False
+            self._cloud_refresh_lock.release()
+            raise
+
+    def cloud_tiles_payload(self, bbox: dict[str, float] | None = None) -> Dict[str, Any]:
+        bbox_norm = self._normalize_bbox(bbox)
+        ttl_ms = max(10_000, SCENE_REFRESH_TTL_SECONDS * 1000)
+        now_ms = self._now_ms()
+        row = self._cloud_payload_cache or {}
+        cached = row.get("payload") if isinstance(row.get("payload"), dict) else None
+        ts = int(row.get("ts") or 0)
+        if cached and (now_ms - ts) <= ttl_ms:
+            out = dict(cached)
+            out["refresh_in_progress"] = bool(self._cloud_refresh_inflight)
+            return out
+        self._start_cloud_refresh_async(bbox_norm, trigger="cloud_tiles_payload")
+        if cached:
+            out = dict(cached)
+            out["stale"] = True
+            out["refresh_in_progress"] = bool(self._cloud_refresh_inflight)
+            return out
+        fallback = self._degraded_scene_payload(bbox_norm, "cloud_refresh_pending")
+        fallback["refresh_in_progress"] = True
+        return fallback
 
 
     def _tile_bounds_xyz(self, z: int, x: int, y: int) -> dict[str, float]:
@@ -3619,32 +4001,25 @@ class GFSService:
             diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
             return row["payload"], diag
 
-        if not self._scene_refresh_lock.acquire(blocking=False):
-            if isinstance(row.get("payload"), dict):
-                diag["cache_hit"] = True
-                diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
-                return row["payload"], diag
-            with self._scene_refresh_lock:
-                pass
-            row = self.state.tile_cache.get(key) or {}
-            if isinstance(row.get("payload"), dict):
-                diag["cache_hit"] = True
-                diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
-                return row["payload"], diag
+        if isinstance(row.get("payload"), dict):
+            diag["cache_hit"] = True
+            diag["cache_age_ms"] = now_ms - int(row.get("ts") or 0)
+            self._start_cloud_refresh_async(bbox, trigger="scene_cache_stale")
+            return row["payload"], diag
 
-        started = time.perf_counter()
-        try:
-            payload = self.cloud_tiles_payload(bbox)
-        except Exception as exc:
-            log.exception("[gfs] cached scene generation failed")
-            payload = self._degraded_scene_payload(bbox, str(exc))
-        finally:
-            self._scene_refresh_lock.release()
+        self._start_cloud_refresh_async(bbox, trigger="scene_cache_miss")
+        cloud_row = self._cloud_payload_cache or {}
+        if isinstance(cloud_row.get("payload"), dict):
+            payload = cloud_row["payload"]
+            diag["cache_hit"] = True
+            diag["cache_age_ms"] = now_ms - int(cloud_row.get("ts") or 0)
+        else:
+            started = time.perf_counter()
+            payload = self._degraded_scene_payload(bbox, "scene_refresh_pending")
+            diag["build_duration_ms"] = int((time.perf_counter() - started) * 1000)
+            return payload, diag
 
-        diag["build_duration_ms"] = int((time.perf_counter() - started) * 1000)
         self.state.tile_cache[key] = {"ts": now_ms, "payload": payload}
-        self.state.scene_cache = payload
-        self.state.scene_cache_ts = now_ms
         try:
             self._build_layer_feature_indexes(payload)
         except Exception:
@@ -3861,11 +4236,18 @@ class GFSService:
                 "analysis_time": self.state.model_analysis_time,
                 "source_url": self.state.model_source_url,
                 "cache_path": self.state.model_cache_path,
+                "cache_exists": self.state.model_cache_exists,
+                "cache_size_bytes": self.state.model_cache_size_bytes,
                 "source_format": self.state.model_source_format,
                 "fields_available": list(self.state.fields_available or []),
                 "fields_missing": list(self.state.fields_missing or []),
                 "decode_backend": self.state.decode_backend,
                 "data_source_mode": self.state.data_source_mode,
+                "decode_failure_reason": self.state.decode_failure_reason,
+                "decode_last_attempt_path": self.state.decode_last_attempt_path,
+                "quarantine_count": self.state.ingest_quarantine_count,
+                "last_quarantine_path": self.state.ingest_last_quarantine_path,
+                "last_quarantine_reason": self.state.ingest_last_quarantine_reason,
             },
             "ts": self._now_ms(),
         }
@@ -3886,6 +4268,7 @@ class GFSService:
                 "fallback_cycle_depth": INGEST_FALLBACK_CYCLE_DEPTH,
                 "preferred_forecast_hour": INGEST_PREFERRED_FORECAST_HOUR,
                 "cache_min_bytes": INGEST_CACHE_MIN_BYTES,
+                "failed_cycle_cooldown_seconds": INGEST_FAILED_CYCLE_COOLDOWN_SECONDS,
                 "source_format": "grib2",
             },
             "ts": self._now_ms(),

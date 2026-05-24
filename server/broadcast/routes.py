@@ -29,6 +29,13 @@ STT_FAILURE_THRESHOLD = 3
 WATCH_RETRY_BACKOFF_S = 1.5
 RECORDINGS_DIR = Path(__file__).resolve().parents[2] / "uploads" / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+_LAST_STT_FINAL: dict[tuple[str, str], tuple[str, float]] = {}
+_LAST_AI_INPUT: dict[tuple[str, str], tuple[str, float]] = {}
+_DEDUP_WINDOW_S = 3.5
+
+
+def _norm_text(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
 
 
 class RoomRegistry:
@@ -169,6 +176,20 @@ async def _route_to_broadcaster(room_id: str, payload: dict[str, Any]) -> bool:
 
 
 async def _handle_chat_text(state: AppState, room_id: str, client_id: str, role: str, text: str, source: str | None = None) -> None:
+    key = (room_id, client_id)
+    now = asyncio.get_running_loop().time()
+    norm = _norm_text(text)
+    if source == "stt":
+        prev = _LAST_STT_FINAL.get(key)
+        if prev and prev[0] == norm and (now - prev[1]) < _DEDUP_WINDOW_S:
+            log.info("[broadcast/ai] suppress duplicate stt final room=%s client=%s", room_id, client_id)
+            return
+        _LAST_STT_FINAL[key] = (norm, now)
+    prev_ai = _LAST_AI_INPUT.get(key)
+    if prev_ai and prev_ai[0] == norm and (now - prev_ai[1]) < _DEDUP_WINDOW_S:
+        log.info("[broadcast/ai] suppress duplicate ai reply trigger room=%s client=%s", room_id, client_id)
+        return
+    _LAST_AI_INPUT[key] = (norm, now)
     room = state.ensure_room(room_id)
     base_payload = {"user": role, "clientId": client_id, "text": text}
     if source:

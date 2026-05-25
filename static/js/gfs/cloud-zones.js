@@ -1,405 +1,357 @@
-import { normalizePolygonFieldPayload } from './polygon_math.js';
 import { createPolygon3D } from './polygon3d.js';
 
-const CLOUD_PRESSURE_BANDS = {
-  low: { baseHpa: 940, topHpa: 760, threshold: 20, color: '#dcefff' },
-  mid: { baseHpa: 760, topHpa: 520, threshold: 18, color: '#eef6ff' },
-  high: { baseHpa: 520, topHpa: 220, threshold: 14, color: '#ffffff' },
-  total: { baseHpa: 880, topHpa: 520, threshold: 35, color: '#e9f4ff' },
+const LAYER_CONFIG = {
+  low: { threshold: 24, baseAlt: 900, topAlt: 2200, color: '#dcefff' },
+  mid: { threshold: 22, baseAlt: 2600, topAlt: 5200, color: '#eef6ff' },
+  high: { threshold: 18, baseAlt: 5800, topAlt: 9800, color: '#f7fbff' },
 };
-const MAX_CLOUD_BODIES = 280;
-const MAX_ADVECTION_STEP_SEC = 0.08;
 
-function polygonApiPath() {
-  return window.google?.maps?.maps3d?.Polygon3DElement ? 'Polygon3DElement.path' : 'gmp-polygon-3d.path';
+const BUDGETS = {
+  far: { maxRegions: 18, maxHulls: 28, maxPuffs: 110, maxPuffsPerRegion: 8 },
+  regional: { maxRegions: 36, maxHulls: 56, maxPuffs: 260, maxPuffsPerRegion: 14 },
+  close: { maxRegions: 54, maxHulls: 84, maxPuffs: 480, maxPuffsPerRegion: 20 },
+};
+const PUFF_STATE_CACHE = new Map();
+const MAX_CACHED_PUFFS = 4000;
+
+function hashUnit(key) {
+  let h = 2166136261;
+  const txt = String(key || '');
+  for (let i = 0; i < txt.length; i += 1) {
+    h ^= txt.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return ((h >>> 0) % 100000) / 100000;
 }
 
-function toNumber(v, fallback = 0) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function wrapLongitude(lon) {
-  let value = Number(lon) || 0;
-  while (value < -180) value += 360;
-  while (value >= 180) value -= 360;
-  return value;
-}
-
-function to2DGrid(value) {
-  if (!Array.isArray(value)) return [];
-  if (!Array.isArray(value[0])) return [];
+function to2D(value) {
+  if (!Array.isArray(value) || !Array.isArray(value[0])) return [];
   if (Array.isArray(value[0][0])) return value[0];
   return value;
 }
 
-function bboxFromPayload(payload) {
-  const box = Array.isArray(payload?.bbox) ? payload.bbox : null;
-  if (!box || box.length < 4) return null;
-  return { west: toNumber(box[0]), south: toNumber(box[1]), east: toNumber(box[2]), north: toNumber(box[3]) };
+function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+function toNum(v, d = 0) { const n = Number(v); return Number.isFinite(n) ? n : d; }
+
+function inferLod(payload) {
+  const box = payload?.bbox;
+  if (!Array.isArray(box) || box.length < 4) return 'regional';
+  const span = Math.max(Math.abs(toNum(box[2]) - toNum(box[0])), Math.abs(toNum(box[3]) - toNum(box[1])));
+  if (span > 45) return 'far';
+  if (span > 14) return 'regional';
+  return 'close';
 }
 
-function latLonFromIndex(i, j, ny, nx, bbox) {
-  const lat = bbox.south + ((i + 0.5) / Math.max(1, ny)) * (bbox.north - bbox.south);
-  const lon = bbox.west + ((j + 0.5) / Math.max(1, nx)) * (bbox.east - bbox.west);
-  return { lat, lon };
-}
-
-function cloudFeaturesFromContract(payload) {
-  return normalizePolygonFieldPayload(payload?.polygon_field_v1 || null);
-}
-
-function cellSizeDeg(bbox, ny, nx) {
+function indexToLatLon(i, j, lats, lons, bbox, ny, nx) {
+  if (Array.isArray(lats) && lats.length === ny && Array.isArray(lons) && lons.length === nx) {
+    return { lat: toNum(lats[i]), lon: toNum(lons[j]) };
+  }
+  const west = toNum(bbox?.[0], -180); const south = toNum(bbox?.[1], -80);
+  const east = toNum(bbox?.[2], 180); const north = toNum(bbox?.[3], 80);
   return {
-    lat: Math.abs((bbox.north - bbox.south) / Math.max(1, ny)),
-    lon: Math.abs((bbox.east - bbox.west) / Math.max(1, nx)),
+    lat: south + ((i + 0.5) / Math.max(1, ny)) * (north - south),
+    lon: west + ((j + 0.5) / Math.max(1, nx)) * (east - west),
   };
 }
 
-function hashJitter(lat, lon, salt = 0) {
-  const v = Math.sin((lat * 12.9898) + (lon * 78.233) + (salt * 19.19)) * 43758.5453;
-  return v - Math.floor(v);
+function regionExtract(layerName, grid, threshold, lats, lons, bbox, windU, windV, cap) {
+  const ny = grid.length;
+  const nx = ny ? grid[0].length : 0;
+  const seen = Array.from({ length: ny }, () => Array(nx).fill(false));
+  const out = [];
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1]];
+
+  for (let i = 0; i < ny; i += 1) {
+    for (let j = 0; j < nx; j += 1) {
+      const seed = toNum(grid[i]?.[j], 0);
+      if (seed < threshold || seen[i][j]) continue;
+      const q = [[i, j]];
+      seen[i][j] = true;
+      const cells = [];
+      let sum = 0; let minI = i; let maxI = i; let minJ = j; let maxJ = j;
+      let wu = 0; let wv = 0; let wCount = 0;
+      while (q.length) {
+        const [cy, cx] = q.pop();
+        const val = toNum(grid[cy]?.[cx], 0);
+        if (val < threshold) continue;
+        sum += val;
+        cells.push([cy, cx]);
+        minI = Math.min(minI, cy); maxI = Math.max(maxI, cy);
+        minJ = Math.min(minJ, cx); maxJ = Math.max(maxJ, cx);
+        const localU = toNum(windU?.[cy]?.[cx], NaN);
+        const localV = toNum(windV?.[cy]?.[cx], NaN);
+        if (Number.isFinite(localU) && Number.isFinite(localV)) { wu += localU; wv += localV; wCount += 1; }
+        for (const [dy, dx] of dirs) {
+          const nyi = cy + dy; const nxi = cx + dx;
+          if (nyi < 0 || nxi < 0 || nyi >= ny || nxi >= nx || seen[nyi][nxi]) continue;
+          seen[nyi][nxi] = true;
+          if (toNum(grid[nyi]?.[nxi], 0) >= threshold) q.push([nyi, nxi]);
+        }
+      }
+      if (!cells.length) continue;
+      const ci = Math.round((minI + maxI) / 2);
+      const cj = Math.round((minJ + maxJ) / 2);
+      const center = indexToLatLon(ci, cj, lats, lons, bbox, ny, nx);
+      const nw = indexToLatLon(minI, minJ, lats, lons, bbox, ny, nx);
+      const se = indexToLatLon(maxI, maxJ, lats, lons, bbox, ny, nx);
+      out.push({
+        id: `${layerName}:${ci}:${cj}`,
+        layer: layerName,
+        meanDensity: sum / cells.length,
+        cellCount: cells.length,
+        center,
+        extent: { minLat: Math.min(nw.lat, se.lat), maxLat: Math.max(nw.lat, se.lat), minLon: Math.min(nw.lon, se.lon), maxLon: Math.max(nw.lon, se.lon) },
+        elongation: (Math.abs(maxJ - minJ) + 1) / Math.max(1, (Math.abs(maxI - minI) + 1)),
+        driftU: wCount ? wu / wCount : 0,
+        driftV: wCount ? wv / wCount : 0,
+      });
+      if (out.length >= cap) return out;
+    }
+  }
+  return out;
 }
 
-function pressureToHeightMeters(hpa) {
-  const pressure = clamp(toNumber(hpa, 1013.25), 80, 1050);
-  return 44330 * (1 - Math.pow(pressure / 1013.25, 0.1903));
+function classify(region, totalVal, lowVal, midVal, highVal) {
+  if (region.meanDensity > 74 && totalVal > 82) return 'storm';
+  if (region.layer === 'high' && region.elongation > 1.6) return 'cirrus';
+  if (region.layer === 'low' && region.elongation > 1.5 && region.cellCount > 8) return 'stratus';
+  if ((region.layer === 'low' || region.layer === 'mid') && region.cellCount <= 6 && Math.max(lowVal, midVal) > 55) return 'cumulus';
+  return region.layer === 'high' ? 'cirrus' : 'stratus';
 }
 
-function metersToLatDegrees(meters) {
-  return meters / 111320;
-}
-
-function metersToLonDegrees(meters, lat) {
-  const lonScale = Math.max(0.2, Math.cos((Number(lat) * Math.PI) / 180));
-  return meters / (111320 * lonScale);
-}
-
-function advectPath(basePath, latOffsetDeg, lonOffsetDeg) {
-  return basePath.map((point) => ({
-    lat: point.lat + latOffsetDeg,
-    lng: wrapLongitude(point.lng + lonOffsetDeg),
-  }));
-}
-
-function roundedCloudPath({ lat, lon, latRadiusDeg, lonRadiusDeg, wobble = 0.18, points = 14, elongation = 1, headingDeg = 90 }) {
-  const path = [];
-  const basePhase = hashJitter(lat, lon) * Math.PI * 2;
-  const heading = (headingDeg * Math.PI) / 180;
-  const cosH = Math.cos(heading);
-  const sinH = Math.sin(heading);
+function polygonEllipse(lat, lon, latR, lonR, points = 10, rotDeg = 0) {
+  const out = [];
+  const rot = (rotDeg * Math.PI) / 180;
+  const cr = Math.cos(rot); const sr = Math.sin(rot);
   for (let i = 0; i < points; i += 1) {
     const t = (i / points) * Math.PI * 2;
-    const harmonic = Math.sin((t * 2) + basePhase) * wobble;
-    const secondary = Math.cos((t * 3) - basePhase) * (wobble * 0.55);
-    const scale = 1 + harmonic + secondary;
-    const localLat = Math.sin(t) * latRadiusDeg * scale;
-    const localLon = Math.cos(t) * lonRadiusDeg * scale * elongation;
-    const rotLat = (localLat * cosH) - (localLon * sinH);
-    const rotLon = (localLat * sinH) + (localLon * cosH);
-    path.push({ lat: lat + rotLat, lng: lon + rotLon });
+    const y = Math.sin(t) * latR;
+    const x = Math.cos(t) * lonR;
+    out.push({ lat: lat + (y * cr - x * sr), lng: lon + (y * sr + x * cr) });
   }
-  return path;
+  return out;
 }
 
-function buildCloudPressureBand(type, density, totalBoost, family = 'stratiform') {
-  const band = CLOUD_PRESSURE_BANDS[type] || CLOUD_PRESSURE_BANDS.total;
-  const weight = clamp(density / 100, 0, 1);
-  const deepening = clamp((totalBoost - 0.82) / 0.45, 0, 1);
-  const familyStretch = family === 'vertical' ? 1.3 : (family === 'cumuliform' ? 1.14 : (family === 'cirriform' ? 0.78 : 0.96));
-  const baseHpa = band.baseHpa - ((band.baseHpa - band.topHpa) * weight * 0.16);
-  const topHpa = band.topHpa - ((band.topHpa * 0.07) * deepening * weight * familyStretch);
-  const baseAltitude = pressureToHeightMeters(baseHpa);
-  const topAltitude = pressureToHeightMeters(topHpa);
-  return {
-    baseAltitude: Math.round(baseAltitude),
-    height: Math.max(600, Math.round((topAltitude - baseAltitude) * familyStretch)),
-    color: band.color,
-    weight,
-  };
+function hullPath(region) {
+  const { minLat, maxLat, minLon, maxLon } = region.extent;
+  const latR = Math.max(0.06, (maxLat - minLat) * 0.58);
+  const lonR = Math.max(0.06, (maxLon - minLon) * 0.58);
+  return polygonEllipse(region.center.lat, region.center.lon, latR, lonR, 12, region.elongation > 1 ? 18 : 0);
 }
 
-function classifyCloudMorphology(feature) {
-  const low = toNumber(feature?.cloud_low, 0);
-  const mid = toNumber(feature?.cloud_mid, 0);
-  const high = toNumber(feature?.cloud_high, 0);
-  const total = toNumber(feature?.cloud_total, Math.max(low, mid, high));
-  const precip = toNumber(feature?.precip_rate, 0);
-  const dominant = high >= Math.max(low, mid) ? 'high' : (mid >= low ? 'mid' : 'low');
-
-  if (precip >= 0.85 && total >= 72) return { family: 'vertical', subtype: 'cumulonimbus' };
-  if (precip >= 0.35 && mid >= 45 && total >= 68) return { family: 'stratiform', subtype: 'nimbostratus' };
-  if (high >= 58 && low < 35 && mid < 45) return { family: 'cirriform', subtype: high >= 78 ? 'cirrostratus' : 'cirrus' };
-  if (low >= 58 && total < 75) return { family: 'cumuliform', subtype: low >= 78 ? 'towering-cumulus' : 'cumulus' };
-  if (dominant === 'mid' && total >= 62) return { family: 'stratiform', subtype: 'altostratus' };
-  return { family: 'stratiform', subtype: total >= 60 ? 'stratus' : 'stratocumulus' };
-}
-
-function shellBlueprints(morphology) {
-  switch (morphology.family) {
-    case 'cirriform':
-      return [
-        { shell: 'veil', latScale: 0.82, lonScale: 1.8, opacityBase: 0.07, opacitySpan: 0.08, wobble: 0.12, points: 16, elongation: 1.6 },
-        { shell: 'streak', latScale: 0.56, lonScale: 1.45, opacityBase: 0.04, opacitySpan: 0.06, wobble: 0.08, points: 12, elongation: 1.9 },
-      ];
-    case 'vertical':
-      return [
-        { shell: 'core', latScale: 0.72, lonScale: 0.76, opacityBase: 0.16, opacitySpan: 0.18, wobble: 0.2, points: 14, elongation: 1.0 },
-        { shell: 'tower', latScale: 0.5, lonScale: 0.54, opacityBase: 0.14, opacitySpan: 0.14, wobble: 0.24, points: 12, elongation: 0.92, baseLift: 0.22, heightBoost: 0.42 },
-        { shell: 'anvil', latScale: 0.96, lonScale: 1.42, opacityBase: 0.08, opacitySpan: 0.1, wobble: 0.16, points: 16, elongation: 1.25, baseLift: 0.78, heightBoost: 0.18 },
-      ];
-    case 'cumuliform':
-      return [
-        { shell: 'body', latScale: 0.7, lonScale: 0.84, opacityBase: 0.12, opacitySpan: 0.2, wobble: 0.24, points: 14, elongation: 1.0 },
-        { shell: 'tuft', latScale: 0.46, lonScale: 0.5, opacityBase: 0.08, opacitySpan: 0.14, wobble: 0.3, points: 11, elongation: 0.94, baseLift: 0.38, heightBoost: 0.26 },
-      ];
-    default:
-      return [
-        { shell: 'deck', latScale: 0.96, lonScale: 1.3, opacityBase: 0.11, opacitySpan: 0.16, wobble: 0.14, points: 16, elongation: 1.18 },
-        { shell: 'underside', latScale: 0.82, lonScale: 1.08, opacityBase: 0.06, opacitySpan: 0.1, wobble: 0.1, points: 14, elongation: 1.12, baseLift: 0.14, heightBoost: 0.08 },
-      ];
+function styleForFamily(family, density) {
+  const alpha = clamp(0.12 + (density / 100) * 0.28, 0.12, 0.48);
+  switch (family) {
+    case 'storm': return { color: '#d4deeb', alpha: clamp(alpha + 0.12, 0.22, 0.56), puffAlpha: 0.22, vertical: 1.5 };
+    case 'cumulus': return { color: '#edf6ff', alpha: alpha, puffAlpha: 0.18, vertical: 1.2 };
+    case 'cirrus': return { color: '#ffffff', alpha: clamp(alpha - 0.08, 0.08, 0.26), puffAlpha: 0.1, vertical: 0.8 };
+    default: return { color: '#e8f2ff', alpha: clamp(alpha - 0.03, 0.1, 0.4), puffAlpha: 0.14, vertical: 1.0 };
   }
 }
 
-function cloudBodiesForFeature(feature, footprintScale) {
-  const low = toNumber(feature?.cloud_low, 0);
-  const mid = toNumber(feature?.cloud_mid, 0);
-  const high = toNumber(feature?.cloud_high, 0);
-  const total = toNumber(feature?.cloud_total, Math.max(low, mid, high));
-  const totalBoost = clamp(total / 100, 0.82, 1.25);
-  const morphology = classifyCloudMorphology(feature);
-  const blueprints = shellBlueprints(morphology);
-  const layers = [];
-
-  const appendLayer = (type, density) => {
-    const band = buildCloudPressureBand(type, density, totalBoost, morphology.family);
-    const weight = band.weight;
-    if (weight <= 0) return;
-    for (const bp of blueprints) {
-      layers.push({
-        baseAltitude: Math.round(band.baseAltitude + (band.height * (bp.baseLift || 0))),
-        height: Math.round(band.height * (1 + (bp.heightBoost || 0))),
-        opacity: Math.min(bp.opacityBase + (weight * bp.opacitySpan), 0.58),
-        latRadiusDeg: footprintScale.lat * (bp.latScale + (weight * 0.42)),
-        lonRadiusDeg: footprintScale.lon * (bp.lonScale + (weight * 0.48)),
-        color: band.color,
-        pressureBand: type,
-        family: morphology.family,
-        subtype: morphology.subtype,
-        wobble: bp.wobble,
-        points: bp.points,
-        elongation: bp.elongation,
-        shell: bp.shell,
-      });
-    }
-  };
-
-  if (low >= CLOUD_PRESSURE_BANDS.low.threshold) appendLayer('low', low);
-  if (mid >= CLOUD_PRESSURE_BANDS.mid.threshold) appendLayer('mid', mid);
-  if (high >= CLOUD_PRESSURE_BANDS.high.threshold) appendLayer('high', high);
-  if (!layers.length && total >= CLOUD_PRESSURE_BANDS.total.threshold) appendLayer('total', total);
-  return layers;
+function windHeading(u, v) {
+  if (!Number.isFinite(u) || !Number.isFinite(v)) return 0;
+  return ((Math.atan2(u, v) * 180) / Math.PI + 360) % 360;
 }
 
-function sampleGridBilinear(grid, bbox, lat, lon) {
-  if (!Array.isArray(grid) || !Array.isArray(grid[0]) || !bbox) return null;
-  const arr = Array.isArray(grid[0][0]) ? grid[0] : grid;
-  const ny = arr.length;
-  const nx = Array.isArray(arr[0]) ? arr[0].length : 0;
-  if (!ny || !nx) return null;
-  const y = clamp(((lat - bbox.south) / Math.max(1e-6, bbox.north - bbox.south)) * (ny - 1), 0, ny - 1);
-  const x = clamp(((lon - bbox.west) / Math.max(1e-6, bbox.east - bbox.west)) * (nx - 1), 0, nx - 1);
-  const y0 = Math.floor(y);
-  const x0 = Math.floor(x);
-  const y1 = Math.min(ny - 1, y0 + 1);
-  const x1 = Math.min(nx - 1, x0 + 1);
-  const fy = y - y0;
-  const fx = x - x0;
-  const q11 = toNumber(arr[y0]?.[x0], NaN);
-  const q21 = toNumber(arr[y0]?.[x1], q11);
-  const q12 = toNumber(arr[y1]?.[x0], q11);
-  const q22 = toNumber(arr[y1]?.[x1], q21);
-  if (![q11, q21, q12, q22].every(Number.isFinite)) return null;
-  return (q11 * (1 - fx) * (1 - fy)) + (q21 * fx * (1 - fy)) + (q12 * (1 - fx) * fy) + (q22 * fx * fy);
+function spawnPuffs(region, family, lod, budget, pool) {
+  const cfg = BUDGETS[lod];
+  const baseCount = Math.round(clamp(region.cellCount * (region.meanDensity / 100) * 0.9, 2, cfg.maxPuffsPerRegion));
+  const count = Math.min(baseCount, cfg.maxPuffsPerRegion, Math.max(0, budget.left));
+  if (count <= 0) return;
+  const layerCfg = LAYER_CONFIG[region.layer] || LAYER_CONFIG.mid;
+  const style = styleForFamily(family, region.meanDensity);
+  const heading = windHeading(region.driftU, region.driftV);
+  const latSpan = Math.max(0.03, (region.extent.maxLat - region.extent.minLat) * 0.6);
+  const lonSpan = Math.max(0.03, (region.extent.maxLon - region.extent.minLon) * 0.6);
+  for (let i = 0; i < count; i += 1) {
+    const puffKey = `${region.id}:puff:${i}`;
+    const cached = PUFF_STATE_CACHE.get(puffKey);
+    const seedBase = hashUnit(puffKey);
+    const state = cached || {
+      key: puffKey,
+      phase: seedBase * Math.PI * 2,
+      jitterSeed: hashUnit(`${puffKey}:jitter`) * Math.PI * 2,
+      wobbleSeed: hashUnit(`${puffKey}:wobble`) * Math.PI * 2,
+      breathSeed: hashUnit(`${puffKey}:breath`) * Math.PI * 2,
+      driftLatDeg: 0,
+      driftLonDeg: 0,
+      seenAt: performance.now(),
+    };
+    const fx = ((i * 37) % 100) / 100;
+    const fy = ((i * 61) % 100) / 100;
+    const lat = region.center.lat + (fy - 0.5) * latSpan * 1.3;
+    const lon = region.center.lon + (fx - 0.5) * lonSpan * 1.3;
+    const alt = layerCfg.baseAlt + ((i % 5) / 4) * (layerCfg.topAlt - layerCfg.baseAlt) * style.vertical;
+    const puff = createPolygon3D({
+      path: polygonEllipse(lat, lon, latSpan * 0.22, lonSpan * 0.22, 8, heading),
+      altitude: alt,
+      altitudeMode: 'absolute',
+      fillColor: style.color,
+      fillOpacity: style.puffAlpha,
+      strokeColor: style.color,
+      strokeOpacity: 0,
+      strokeWidth: 0,
+      extrudedHeight: 120,
+    });
+    if (!puff) continue;
+    pool.created.push(puff);
+    pool.drift.push({
+      el: puff,
+      u: region.driftU,
+      v: region.driftV,
+      lat,
+      lon,
+      latOff: state.driftLatDeg || 0,
+      lonOff: state.driftLonDeg || 0,
+      basePath: puff.path,
+      state,
+      jitterAmpLat: latSpan * 0.07,
+      jitterAmpLon: lonSpan * 0.07,
+      wobbleAmpLat: latSpan * 0.09,
+      wobbleAmpLon: lonSpan * 0.09,
+      verticalAmp: 40 + (style.vertical * 18),
+      baseAltitude: alt,
+      regionKey: region.id,
+    });
+    budget.left -= 1;
+    state.seenAt = performance.now();
+    PUFF_STATE_CACHE.set(puffKey, state);
+    if (budget.left <= 0) break;
+  }
 }
 
-function windHeadingDeg(u, v) {
-  if (!Number.isFinite(u) || !Number.isFinite(v)) return 90;
-  return ((Math.atan2(u, v) * 180 / Math.PI) + 360) % 360;
-}
-
-function makeCloudBody({ lat, lon, baseAltitude, height, latRadiusDeg, lonRadiusDeg, color, opacity, windU = 0, windV = 0, family = 'stratiform', wobble = 0.16, points = 14, elongation = 1.0 }) {
-  const headingDeg = windHeadingDeg(windU, windV);
-  const basePath = roundedCloudPath({ lat, lon, latRadiusDeg, lonRadiusDeg, wobble, points, elongation: family === 'cirriform' ? Math.max(1.25, elongation) : elongation, headingDeg });
-  const element = createPolygon3D({
-    path: basePath,
-    altitude: baseAltitude,
-    altitudeMode: 'absolute',
-    fillColor: color,
-    fillOpacity: opacity,
-    strokeColor: color,
-    strokeOpacity: 0,
-    strokeWidth: 0,
-    extrudedHeight: height,
-  });
-  if (!element) return null;
-  return {
-    element,
-    basePath,
-    anchorLat: lat,
-    anchorLon: lon,
-    windU: toNumber(windU, 0),
-    windV: toNumber(windV, 0),
-    latOffsetDeg: 0,
-    lonOffsetDeg: 0,
-  };
-}
-
-function startCloudAdvection(items) {
+function startDrift(items) {
   if (!items.length) return () => {};
-  let rafId = 0;
-  let stopped = false;
-  let lastTs = 0;
-
+  let raf = 0;
+  let last = 0;
+  let t = 0;
+  let stop = false;
   const tick = (ts) => {
-    if (stopped) return;
-    if (!lastTs) lastTs = ts;
-    const dtSec = Math.min(MAX_ADVECTION_STEP_SEC, Math.max(0.01, (ts - lastTs) * 0.001));
-    lastTs = ts;
-    for (const item of items) {
-      item.latOffsetDeg += metersToLatDegrees(item.windV * dtSec);
-      item.lonOffsetDeg += metersToLonDegrees(item.windU * dtSec, item.anchorLat + item.latOffsetDeg);
-      item.element.path = advectPath(item.basePath, item.latOffsetDeg, item.lonOffsetDeg);
+    if (stop) return;
+    if (!last) last = ts;
+    const dt = clamp((ts - last) / 1000, 0.01, 0.12);
+    last = ts;
+    t += dt;
+    for (const it of items) {
+      it.latOff += (it.v * dt) / 111320;
+      const lonScale = Math.max(0.2, Math.cos((it.lat * Math.PI) / 180));
+      it.lonOff += (it.u * dt) / (111320 * lonScale);
+      if (it.state) {
+        it.state.driftLatDeg = it.latOff;
+        it.state.driftLonDeg = it.lonOff;
+      }
+      const jitterLat = Math.sin((t * 0.11) + (it.state?.jitterSeed || 0)) * it.jitterAmpLat;
+      const jitterLon = Math.cos((t * 0.13) + (it.state?.jitterSeed || 0)) * it.jitterAmpLon;
+      const wobbleLat = Math.sin((t * 0.23) + (it.state?.wobbleSeed || 0)) * it.wobbleAmpLat;
+      const wobbleLon = Math.cos((t * 0.19) + (it.state?.wobbleSeed || 0)) * it.wobbleAmpLon;
+      const breath = Math.sin((t * 0.16) + (it.state?.breathSeed || 0));
+      const z = it.baseAltitude + (breath * it.verticalAmp);
+      const latShift = it.latOff + jitterLat + wobbleLat;
+      const lonShift = it.lonOff + jitterLon + wobbleLon;
+      try {
+        it.el.path = (it.basePath || []).map((p) => ({ lat: p.lat + latShift, lng: p.lng + lonShift, altitude: Number.isFinite(p.altitude) ? p.altitude + (breath * 0.22 * it.verticalAmp) : z }));
+      } catch (_) {}
     }
-    rafId = requestAnimationFrame(tick);
+    raf = requestAnimationFrame(tick);
   };
+  raf = requestAnimationFrame(tick);
+  return () => { stop = true; if (raf) cancelAnimationFrame(raf); };
+}
 
-  rafId = requestAnimationFrame(tick);
+export function renderCloudZones({ payload, map3DElement }) {
+  if (!map3DElement || !payload || !payload.grid) return () => {};
+  const started = performance.now();
+  const lod = inferLod(payload);
+  const budget = { ...BUDGETS[lod], left: BUDGETS[lod].maxPuffs };
+
+  const low = to2D(payload.grid.low);
+  const mid = to2D(payload.grid.mid);
+  const high = to2D(payload.grid.high);
+  const total = to2D(payload.grid.total);
+  const windU = to2D(payload?.wind?.u);
+  const windV = to2D(payload?.wind?.v);
+  const gridRef = total.length ? total : (low.length ? low : (mid.length ? mid : high));
+  const ny = gridRef.length;
+  const nx = ny ? gridRef[0].length : 0;
+  if (!ny || !nx) return () => {};
+
+  console.info('[gfs clouds] payload received', { cells: ny * nx, lod, source: payload.source, analysis_time: payload.analysis_time });
+
+  const regions = [
+    ...regionExtract('low', low.length ? low : gridRef, LAYER_CONFIG.low.threshold, payload.grid.lats, payload.grid.lons, payload.bbox, windU, windV, budget.maxRegions),
+    ...regionExtract('mid', mid.length ? mid : gridRef, LAYER_CONFIG.mid.threshold, payload.grid.lats, payload.grid.lons, payload.bbox, windU, windV, budget.maxRegions),
+    ...regionExtract('high', high.length ? high : gridRef, LAYER_CONFIG.high.threshold, payload.grid.lats, payload.grid.lons, payload.bbox, windU, windV, budget.maxRegions),
+  ].slice(0, budget.maxRegions);
+
+  console.info('[gfs clouds] regions extracted', { count: regions.length, lod });
+
+  const created = [];
+  const drift = [];
+  const frag = document.createDocumentFragment();
+  let hulls = 0;
+
+  for (const region of regions) {
+    if (hulls >= budget.maxHulls) break;
+    const ci = clamp(Math.round((region.extent.minLat + region.extent.maxLat) / 2), -90, 90);
+    const cj = clamp(Math.round((region.extent.minLon + region.extent.maxLon) / 2), -180, 180);
+    const totalVal = toNum(total?.[0]?.[0], region.meanDensity);
+    const family = classify(region, totalVal, region.meanDensity, region.meanDensity, region.meanDensity);
+    const layerCfg = LAYER_CONFIG[region.layer] || LAYER_CONFIG.mid;
+    const style = styleForFamily(family, region.meanDensity);
+    const hull = createPolygon3D({
+      path: hullPath(region),
+      altitude: layerCfg.baseAlt,
+      altitudeMode: 'absolute',
+      fillColor: style.color,
+      fillOpacity: style.alpha,
+      strokeColor: style.color,
+      strokeOpacity: 0,
+      strokeWidth: 0,
+      extrudedHeight: Math.max(180, layerCfg.topAlt - layerCfg.baseAlt),
+    });
+    if (!hull) continue;
+    frag.append(hull);
+    created.push(hull);
+    drift.push({ el: hull, u: region.driftU * 0.35, v: region.driftV * 0.35, lat: ci, lon: cj, latOff: 0, lonOff: 0, basePath: hull.path });
+    hulls += 1;
+
+    spawnPuffs(region, family, lod, budget, { created, drift });
+  }
+
+  if (PUFF_STATE_CACHE.size > MAX_CACHED_PUFFS) {
+    const cutoff = performance.now() - 180000;
+    for (const [k, v] of PUFF_STATE_CACHE.entries()) {
+      if ((v?.seenAt || 0) < cutoff) PUFF_STATE_CACHE.delete(k);
+      if (PUFF_STATE_CACHE.size <= MAX_CACHED_PUFFS) break;
+    }
+  }
+
+  map3DElement.append(frag);
+  const stop = startDrift(drift);
+  console.info('[gfs clouds] hulls rendered', { count: hulls, lod });
+  console.info('[gfs clouds] puffs active', { count: created.length - hulls, cap: BUDGETS[lod].maxPuffs, lod });
+  console.info('[gfs clouds] refresh ms', { ms: Number((performance.now() - started).toFixed(1)), lod });
+
   return () => {
-    stopped = true;
-    if (rafId) cancelAnimationFrame(rafId);
+    stop();
+    for (const el of created) {
+      try { el.remove(); } catch (_) {}
+    }
   };
 }
 
 export function estimateCloudColumnAltitudes(cloudTotal = 0, layerMix = {}) {
-  const low = toNumber(layerMix.low, 0);
-  const mid = toNumber(layerMix.mid, 0);
-  const high = toNumber(layerMix.high, 0);
-  const total = Math.max(cloudTotal, low, mid, high);
-  const dominant = high >= Math.max(mid, low) && high >= 16
-    ? 'high'
-    : (mid >= Math.max(low, high) && mid >= 18 ? 'mid' : (low >= 20 ? 'low' : 'total'));
-  const morphology = classifyCloudMorphology({ cloud_low: low, cloud_mid: mid, cloud_high: high, cloud_total: total });
-  const band = buildCloudPressureBand(dominant, total, clamp(total / 100, 0.82, 1.24), morphology.family);
+  const low = toNum(layerMix.low, cloudTotal * 0.6);
+  const mid = toNum(layerMix.mid, cloudTotal * 0.4);
+  const high = toNum(layerMix.high, cloudTotal * 0.2);
+  const dominant = high >= Math.max(low, mid) ? 'high' : (mid >= low ? 'mid' : 'low');
+  const cfg = LAYER_CONFIG[dominant] || LAYER_CONFIG.mid;
   return {
-    cloudBaseAltitude: band.baseAltitude,
-    cloudTopAltitude: band.baseAltitude + band.height,
+    cloudBaseAltitude: cfg.baseAlt,
+    cloudTopAltitude: cfg.topAlt,
     dominantBand: dominant,
-    family: morphology.family,
-    subtype: morphology.subtype,
-  };
-}
-
-export function renderCloudZones({ payload, map3DElement }) {
-  const created = [];
-  const advected = [];
-  if (!map3DElement || !payload) return () => {};
-  console.info('[gfs clouds] polygon api', { api: polygonApiPath() });
-
-  const bbox = bboxFromPayload(payload);
-  if (!bbox) return () => {};
-
-  const contractFeatures = cloudFeaturesFromContract(payload);
-  if (contractFeatures.length) {
-    const frag = document.createDocumentFragment();
-    let bodyCount = 0;
-    for (let i = 0; i < contractFeatures.length; i += 1) {
-      const feature = contractFeatures[i]?.properties || contractFeatures[i] || {};
-      const lat = toNumber(feature.lat, NaN);
-      const lon = toNumber(feature.lon, NaN);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      const footprint = { lat: Math.max(toNumber(feature.cell_lat_deg, 0.12) * 0.94, 0.05), lon: Math.max(toNumber(feature.cell_lon_deg, 0.12) * 0.94, 0.05) };
-      const layers = cloudBodiesForFeature(feature, footprint);
-      for (const layer of layers) {
-        const body = makeCloudBody({ lat, lon, windU: feature.wind_u, windV: feature.wind_v, ...layer });
-        if (!body) continue;
-        frag.append(body.element);
-        created.push(body.element);
-        advected.push(body);
-        bodyCount += 1;
-        if (bodyCount >= MAX_CLOUD_BODIES) break;
-      }
-      if (bodyCount >= MAX_CLOUD_BODIES) break;
-    }
-    map3DElement.append(frag);
-    const stopAdvection = startCloudAdvection(advected);
-    console.info('[gfs clouds] rendered bodies', { bodies: bodyCount, mode: 'meteorological_family_uv_advected' });
-    return () => {
-      stopAdvection();
-      created.forEach((el) => { try { el.remove(); } catch (_) {} });
-    };
-  }
-
-  const low = to2DGrid(payload?.cloud_layers?.find((l) => l?.name === 'low')?.density);
-  const mid = to2DGrid(payload?.cloud_layers?.find((l) => l?.name === 'mid')?.density);
-  const high = to2DGrid(payload?.cloud_layers?.find((l) => l?.name === 'high')?.density);
-  const total = to2DGrid(payload?.fields?.cloud_total || payload?.cloud_cover);
-  const precip = to2DGrid(payload?.fields?.precip_rate || payload?.fields?.prate);
-  const windUGrid = to2DGrid(payload?.fields?.wind_u);
-  const windVGrid = to2DGrid(payload?.fields?.wind_v);
-  const grid = low.length ? low : (mid.length ? mid : (high.length ? high : total));
-  if (!grid.length) return () => {};
-
-  const ny = grid.length;
-  const nx = Array.isArray(grid[0]) ? grid[0].length : 0;
-  if (!ny || !nx) return () => {};
-
-  const step = Math.max(1, Math.floor(Math.max(nx, ny) / 26));
-  const cell = cellSizeDeg(bbox, ny, nx);
-  const frag = document.createDocumentFragment();
-  let bodyCount = 0;
-  let cellCount = 0;
-
-  for (let i = 0; i < ny; i += step) {
-    for (let j = 0; j < nx; j += step) {
-      const lowVal = toNumber(low?.[i]?.[j], 0);
-      const midVal = toNumber(mid?.[i]?.[j], 0);
-      const highVal = toNumber(high?.[i]?.[j], 0);
-      const precipVal = toNumber(precip?.[i]?.[j], 0);
-      const totalVal = toNumber(total?.[i]?.[j], Math.max(lowVal, midVal, highVal));
-      if (totalVal < 22 && precipVal < 0.06 && lowVal < 18 && midVal < 16 && highVal < 14) continue;
-      const { lat, lon } = latLonFromIndex(i, j, ny, nx, bbox);
-      const layers = cloudBodiesForFeature({ lat, lon, cloud_low: lowVal, cloud_mid: midVal, cloud_high: highVal, cloud_total: totalVal, precip_rate: precipVal }, {
-        lat: Math.max(cell.lat * 0.92, 0.05),
-        lon: Math.max(cell.lon * 0.92, 0.05),
-      });
-      const sampledWindU = sampleGridBilinear(windUGrid, bbox, lat, lon);
-      const sampledWindV = sampleGridBilinear(windVGrid, bbox, lat, lon);
-      for (const layer of layers) {
-        const body = makeCloudBody({ lat, lon, windU: sampledWindU, windV: sampledWindV, ...layer });
-        if (!body) continue;
-        frag.append(body.element);
-        created.push(body.element);
-        advected.push(body);
-        bodyCount += 1;
-        if (bodyCount >= MAX_CLOUD_BODIES) break;
-      }
-      cellCount += 1;
-      if (bodyCount >= MAX_CLOUD_BODIES) break;
-    }
-    if (bodyCount >= MAX_CLOUD_BODIES) break;
-  }
-
-  map3DElement.append(frag);
-  const stopAdvection = startCloudAdvection(advected);
-  console.info('[gfs clouds] rendered bodies', { cells: cellCount, bodies: bodyCount, mode: 'meteorological_family_uv_advected' });
-
-  return () => {
-    stopAdvection();
-    created.forEach((el) => { try { el.remove(); } catch (_) {} });
+    family: dominant === 'high' ? 'cirrus' : 'stratus',
+    subtype: dominant,
   };
 }

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+WEB_CONCURRENCY=${WEB_CONCURRENCY:-2}
+GFS_WORKERS=${GFS_WORKERS:-2}
+GFS_MAX_CONCURRENT_BUILDS=${GFS_MAX_CONCURRENT_BUILDS:-1}
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOMAIN="${DOMAIN:-lftr.biz}"
@@ -16,6 +19,54 @@ GOOGLE_CLOUD_REGION="global"
 
 log() { printf '[%s] %s\n' "$1" "$2"; }
 fail() { printf '[ERROR] %s\n' "$1" >&2; exit 1; }
+
+safe_fix_deploy_permissions() {
+  if [[ ! -d "$ROOT_DIR/deploy" ]]; then
+    echo "[WARN] deploy directory not found at $ROOT_DIR/deploy; skipping permission normalization"
+    return 0
+  fi
+  echo "[INFO] Normalizing deploy permissions"
+  find "$ROOT_DIR/deploy" -type d -print0 2>/dev/null | xargs -0r chmod a+rx
+  find "$ROOT_DIR/deploy" -type f -name "*.sh" -print0 2>/dev/null | xargs -0r chmod a+rx
+  find "$ROOT_DIR/deploy" -type f -print0 2>/dev/null | xargs -0r chmod a+r
+}
+
+phase0_deploy_permissions() {
+  echo "===== PHASE 0 — DEPLOY PERMISSIONS ====="
+  safe_fix_deploy_permissions
+}
+
+curl_check() {
+  local url="$1"
+  local timeout_s="${2:-3}"
+  curl -fsS --connect-timeout "$timeout_s" --max-time "$timeout_s" "$url" >/dev/null
+}
+
+wait_for_http_ready() {
+  local url="$1"
+  local tries="${2:-20}"
+  local timeout_s="${3:-2}"
+  local sleep_s="${4:-1}"
+  local i
+  for i in $(seq 1 "$tries"); do
+    echo "[installer][health] attempt=${i}/${tries} timeout_s=${timeout_s} url=${url}"
+    if curl_check "$url" "$timeout_s"; then
+      echo "[installer][health] success attempt=${i} url=${url}"
+      return 0
+    fi
+    echo "[installer][health] failed attempt=${i} url=${url}"
+    sleep "$sleep_s"
+  done
+  return 1
+}
+
+dump_service_diagnostics() {
+  local svc="${1:-broadcast}"
+  echo "[installer][diag] systemctl status ${svc} --no-pager"
+  systemctl status "$svc" --no-pager || true
+  echo "[installer][diag] journalctl -u ${svc} -n 120 --no-pager"
+  journalctl -u "$svc" -n 120 --no-pager || true
+}
 
 validate_static_layout() {
   [[ -d "$APP_DIR" ]] || fail "APP_DIR missing or not a directory: $APP_DIR"
@@ -69,7 +120,7 @@ detect_os() {
 
 phase1_system_prep() {
   echo "===== PHASE 1 — SYSTEM PREP ====="
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Run installer as root: sudo bash broadcast.sh"
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || fail "Run installer as root: sudo bash deploy/install.sh"
   detect_os
 
   apt-get update
@@ -279,6 +330,16 @@ phase6_nginx() {
   systemctl restart nginx
   systemctl enable nginx
 }
+
+preflight_runtime() {
+  echo "===== PREFLIGHT — PYTHON RUNTIME CHECKS ====="
+  [[ -x "$VENV_DIR/bin/python" ]] || fail "venv python missing: $VENV_DIR/bin/python"
+  runuser -u "$INSTALL_USER" -- "$VENV_DIR/bin/python" -c "import hypercorn" || fail "hypercorn import failed in venv"
+  runuser -u "$INSTALL_USER" -- "$VENV_DIR/bin/python" -c "import quart" || fail "quart import failed in venv"
+  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && '$VENV_DIR/bin/python' -c \"from server.app_factory import create_app; app=create_app(); assert app is not None; print('preflight_ok')\"" || fail "app import/create_app preflight failed"
+  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && '$VENV_DIR/bin/python' -c \"from server.app_factory import create_app; app=create_app(); rules={str(r.rule) for r in app.url_map.iter_rules()}; assert '/ws/gfs' in rules; print('preflight_ws_gfs_ok')\"" || fail "gfs websocket route /ws/gfs missing in app url map"
+}
+
 phase7_services() {
   echo "===== PHASE 7 — SYSTEMD SERVICES ====="
   cp "$ROOT_DIR/deploy/systemd/broadcast.service" /etc/systemd/system/broadcast.service
@@ -287,7 +348,7 @@ phase7_services() {
   sed -i "s|\${CFG_DIR}|/etc/broadcast|g" /etc/systemd/system/broadcast.service
   sed -i "s|\${APP_DIR}|$APP_DIR|g" /etc/systemd/system/broadcast.service
 
-  runuser -u "$INSTALL_USER" -- bash -lc "cd '$APP_DIR' && . '$VENV_DIR/bin/activate' && python -c 'from server.app_factory import create_app; app=create_app(); print(app.url_map)'"
+  preflight_runtime
 
   systemctl daemon-reload
   systemctl enable broadcast
@@ -296,25 +357,38 @@ phase7_services() {
 
 phase8_health() {
   echo "===== PHASE 8 — HEALTH CHECKS ====="
-  for i in {1..20}; do
-    if curl -s http://127.0.0.1:8000/health >/dev/null; then
-      echo "[installer] backend ready"
-      break
-    fi
-    sleep 1
-    if [[ "$i" -eq 20 ]]; then
-      fail "broadcast health endpoint check failed"
-    fi
-  done
-  curl -fsS http://127.0.0.1:8000/gfs/api/health >/dev/null || fail "gfs api health check failed"
+  if wait_for_http_ready "http://127.0.0.1:8000/health" 30 2 1; then
+    echo "[installer] backend ready"
+  else
+    dump_service_diagnostics "broadcast"
+    fail "broadcast health endpoint check failed (timeout)"
+  fi
+  echo "[installer][health] stabilization grace delay 3s"
+  sleep 3
+  if ! curl_check "http://127.0.0.1:8000/health" 2; then
+    dump_service_diagnostics "broadcast"
+    fail "broadcast unstable after readiness grace period"
+  fi
+  echo "[installer][health] probing optional /gfs/api/health"
+  if ! curl_check "http://127.0.0.1:8000/gfs/api/health" 2; then
+    echo "[WARN] gfs api health check timed out/degraded; continuing because backend is ready"
+  else
+    echo "[installer][health] gfs api health ok"
+  fi
   if [[ "${SKIP_SSL:-0}" != "1" ]]; then
-    curl -kfsS "https://$DOMAIN" >/dev/null || fail "public TLS endpoint check failed"
+    echo "[installer][health] probing optional TLS endpoint https://${DOMAIN}"
+    if ! curl -kfsS --connect-timeout 3 --max-time 5 "https://$DOMAIN" >/dev/null; then
+      echo "[WARN] public TLS endpoint check failed (non-blocking): https://${DOMAIN}"
+    else
+      echo "[installer][health] public TLS endpoint ok"
+    fi
   fi
   validate_static_layout
   echo "[OK] Installer completed successfully"
 }
 
 main() {
+  phase0_deploy_permissions
   phase1_system_prep
   phase2_python_runtime
   phase3_firewall

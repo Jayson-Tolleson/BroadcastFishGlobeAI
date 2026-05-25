@@ -10,6 +10,12 @@ from .auth import get_effective_google_project, maybe_apply_google_credentials_e
 
 
 log = logging.getLogger("server.ai.gemini")
+_BROADCAST_STYLE_PROMPT = (
+    "You are a live broadcast host assistant. "
+    "Reply in 1-2 concise sentences, confident and conversational. "
+    "Avoid rambling, avoid repetition, and skip disclaimers unless safety-critical. "
+    "If user asks for detail, give at most 4 short bullet points."
+)
 
 
 @dataclass
@@ -37,11 +43,11 @@ class VertexGeminiProvider:
         self.client = genai.Client(vertexai=True, project=self.project, location=self.location)
 
     def generate_content(self, prompt: str) -> str:
-        response = self.client.models.generate_content(model=self.model_name, contents=prompt)
+        response = self.client.models.generate_content(model=self.model_name, contents=f"{_BROADCAST_STYLE_PROMPT}\nUser: {prompt}")
         return (getattr(response, "text", "") or "").strip()
 
     def stream_content(self, prompt: str) -> Generator[str, None, None]:
-        for chunk in self.client.models.generate_content_stream(model=self.model_name, contents=prompt):
+        for chunk in self.client.models.generate_content_stream(model=self.model_name, contents=f"{_BROADCAST_STYLE_PROMPT}\nUser: {prompt}"):
             text = (getattr(chunk, "text", "") or "")
             if text:
                 yield text

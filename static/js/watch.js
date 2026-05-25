@@ -30,7 +30,7 @@
   const v = dom.video;
 
   const unmuteBtn = document.createElement('button');
-  unmuteBtn.textContent = 'Tap for sound';
+  unmuteBtn.textContent = 'Tap to Play Stream';
   unmuteBtn.style.display = 'none';
 
   let ws = null;
@@ -135,14 +135,17 @@
 
   async function tryPlay(reason) {
     if (!dom.video) return;
+    dom.video.controls = true;
+    dom.video.muted = false;
     try {
-      await dom.video.play();
+      console.info('[watch/video] autoplay attempt', { reason });
       dom.video.muted = false;
+      await dom.video.play();
       showJoinOverlay(false);
-      console.info('[watch] playback started successfully', { reason, muted: dom.video.muted });
+      console.info('[watch/video] playing', { reason });
     } catch (err) {
-      console.warn('[watch] autoplay blocked', { reason, message: err?.message || String(err) });
-      showJoinOverlay(true, 'Tap to join audio');
+      console.warn('[watch/video] autoplay blocked', { reason, message: err?.message || String(err) });
+      showJoinOverlay(true, 'Tap to Play Stream');
     }
   }
 
@@ -194,7 +197,7 @@
       if (dom.video.srcObject !== stream) dom.video.srcObject = stream;
       setStandby(false);
       dom.mode && (dom.mode.textContent = 'LIVE');
-      console.info('[watch] remote track attached', { kind: event.track?.kind || 'unknown' });
+      console.info('[watch/video] stream attached', { kind: event.track?.kind || 'unknown' });
       await tryPlay('remote_track_attach');
     };
     pc.onicecandidate = (e) => {
@@ -374,6 +377,8 @@
 
   dom.joinBtn?.addEventListener('click', async () => {
     dom.video.muted = false;
+    dom.video.controls = true;
+    console.info('[watch/video] user play started');
     await tryPlay('manual_overlay_click');
   });
 

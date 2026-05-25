@@ -13,8 +13,9 @@ body{margin:0;background:radial-gradient(circle at 20% 10%,#1b2030 0,#07090f 40%
 .badge{display:flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid #30384e;border-radius:999px;background:#121a2cdd;font-size:12px}
 .main{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:12px;padding:12px;min-height:0}
 .glass{background:var(--pane);border:1px solid var(--line);border-radius:14px;box-shadow:0 10px 26px #0007, inset 0 1px 0 #fff1;backdrop-filter:blur(10px)}
-.videoWrap{padding:10px}.stage{background:#000;border:1px solid #000;border-radius:10px;overflow:hidden;min-height:360px}
+.videoWrap{padding:10px}.stage{background:#000;border:1px solid #000;border-radius:10px;overflow:hidden;min-height:360px;width:100%;max-width:1280px;aspect-ratio:16 / 9;position:relative}.stage #preview{width:100%;height:100%;display:block;object-fit:contain;background:#000}
 video{width:100%;height:100%;object-fit:contain}
+.cameraPipPreview{position:absolute;left:20px;top:20px;width:220px;aspect-ratio:16/9;display:none;z-index:5;border:2px solid rgba(255,255,255,.85);border-radius:10px;box-shadow:0 6px 18px rgba(0,0,0,.45);background:#000;cursor:grab;object-fit:cover;pointer-events:auto}.cameraPipPreview.active{display:block}.cameraPipBadge{position:absolute;left:28px;top:26px;display:none;z-index:6;padding:2px 8px;border-radius:8px;background:rgba(0,0,0,.55);font-size:10px;letter-spacing:.6px;border:1px solid rgba(255,255,255,.4)}.cameraPipBadge.active{display:block}
 .controlBar{margin-top:10px;padding:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-start}
 .btn{padding:8px 12px;border-radius:999px;border:1px solid #3a435c;background:#151c2fee;color:var(--text);cursor:pointer;display:inline-flex;align-items:center;gap:8px;font-size:12px}
 .btn:hover{border-color:#5f6c91}.btn.active{border-color:var(--accent);box-shadow:0 0 0 1px #0a121e,inset 0 0 24px #1e2f4f}
@@ -58,7 +59,7 @@ textarea{flex:1;min-height:58px;max-height:140px;background:#0b1220;color:#eaf1f
 
   <div class="main">
     <div class="glass videoWrap">
-      <div class="stage"><video id="preview" autoplay playsinline muted></video></div>
+      <div class="stage"><video id="preview" autoplay playsinline muted></video><video id="cameraPipPreview" class="cameraPipPreview" autoplay playsinline muted></video><div id="cameraPipBadge" class="cameraPipBadge">CAMERA</div></div>
       <div class="controlBar">
         <button id="camBtn" class="btn"><span id="camLed" class="led r"></span><span id="camTxt">CAM: off</span></button>
         <button id="screenBtn" class="btn"><span id="screenLed" class="led r"></span><span id="screenTxt">SCREEN: off</span></button>

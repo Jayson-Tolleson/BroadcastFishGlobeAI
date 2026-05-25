@@ -2,6 +2,9 @@
   const cfg = window.BROADCAST_CONFIG || {};
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsBase = `${wsProto}://${location.host}`;
+  const PROGRAM_WIDTH = 1280;
+  const PROGRAM_HEIGHT = 720;
+  const PROGRAM_ASPECT = PROGRAM_WIDTH / PROGRAM_HEIGHT;
 
   const dom = {
     preview: document.getElementById('preview'),
@@ -41,6 +44,9 @@
     fileInput: document.getElementById('file'),
     chatCollapseBtn: document.getElementById('chatCollapseBtn'),
     chatPanel: document.querySelector('.chat'),
+    stage: document.querySelector('.stage'),
+    cameraPipPreview: document.getElementById('cameraPipPreview'),
+    cameraPipBadge: document.getElementById('cameraPipBadge'),
   };
 
   let chatRetryMs = 1200;
@@ -51,10 +57,29 @@
   let selectedVideoDeviceId = '';
   let cachedVideoInputs = [];
   let cameraCycleIndex = -1;
+  let preferredFacingMode = 'user';
+  let cameraModes = [];
+  let cameraModeIndex = -1;
   let recordingStream = null;
   let recordingChunks = [];
   let recordingMedia = null;
+  let activeAiAudio = null;
   let wakeLockSentinel = null;
+  let programCanvas = null;
+  let programCtx = null;
+  let programStream = null;
+  let programVideoTrack = null;
+  let programLoopHandle = 0;
+  let programLoopRunning = false;
+  const pip = { enabled: false, x: 20, y: 20, w: 220, h: 124, dragging: false, dragDx: 0, dragDy: 0 };
+  let lastSttSentAt = 0;
+  let sttFrameModulo = 0;
+  const camSourceEl = document.createElement('video');
+  camSourceEl.muted = true;
+  camSourceEl.playsInline = true;
+  const screenSourceEl = document.createElement('video');
+  screenSourceEl.muted = true;
+  screenSourceEl.playsInline = true;
 
   const state = {
     room: cfg.room || new URLSearchParams(location.search).get('room') || 'default',
@@ -68,6 +93,7 @@
     speechCtx: null,
     speechSource: null,
     speechProcessor: null,
+    speechProgramStream: null,
     media: {
       ai_enabled: true,
       ai_status: 'idle',
@@ -182,6 +208,28 @@
     camTxt.textContent = state.media.camera_enabled ? `CAM: ${compactCameraName(label)}` : 'CAM: off';
   }
 
+  function isTouchLikeDevice() {
+    return ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  }
+
+  function getPreferredRecorderOptions() {
+    const candidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ];
+    for (const mimeType of candidates) {
+      if (window.MediaRecorder?.isTypeSupported?.(mimeType)) return { mimeType };
+    }
+    return {};
+  }
+
+  function timestampedRecordingName() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `broadcast-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.webm`;
+  }
+
   function appendChat(msg) {
     if (!dom.chat) return;
     const startedAt = performance.now();
@@ -248,6 +296,139 @@
     setLed(dom.ledRoom, online);
   }
 
+  function syncCameraPipPreviewPosition() {
+    if (!dom.cameraPipPreview || !dom.preview || !dom.cameraPipPreview.classList.contains('active')) return;
+    const rect = dom.preview.getBoundingClientRect();
+    const scaleX = rect.width / PROGRAM_WIDTH;
+    const scaleY = rect.height / PROGRAM_HEIGHT;
+    dom.cameraPipPreview.style.left = `${pip.x * scaleX}px`;
+    dom.cameraPipPreview.style.top = `${pip.y * scaleY}px`;
+    dom.cameraPipPreview.style.width = `${pip.w * scaleX}px`;
+    dom.cameraPipPreview.style.height = `${pip.h * scaleY}px`;
+    if (dom.cameraPipBadge) {
+      dom.cameraPipBadge.style.left = `${pip.x * scaleX + 8}px`;
+      dom.cameraPipBadge.style.top = `${pip.y * scaleY + 6}px`;
+    }
+  }
+
+  function showCameraPipPreview() {
+    if (!dom.cameraPipPreview || !state.camStream || !state.media.screen_enabled || !pip.enabled) return;
+    dom.cameraPipPreview.srcObject = state.camStream;
+    dom.cameraPipPreview.classList.add('active');
+    dom.cameraPipBadge?.classList.add('active');
+    dom.cameraPipPreview.play?.().catch(() => {});
+    syncCameraPipPreviewPosition();
+  }
+
+  function hideCameraPipPreview() {
+    dom.cameraPipPreview?.classList.remove('active');
+    dom.cameraPipBadge?.classList.remove('active');
+  }
+
+  async function rotateCamera() {
+    console.info('[broadcast/camera] rotate requested');
+    const modes = await buildCameraModes();
+    if (!modes.length) return;
+    const active = state.camStream?.getVideoTracks?.()[0];
+    const activeFacing = active?.getSettings?.().facingMode;
+    let target = null;
+    if (isTouchLikeDevice()) {
+      const wantFacing = activeFacing === 'environment' ? 'user' : 'environment';
+      target = modes.find((m) => m.kind === 'facing' && m.facingMode === wantFacing) || modes.find((m) => m.kind === 'facing');
+      console.info(`[broadcast/camera] rotate target ${target?.facingMode || 'device'}`);
+    } else {
+      const devices = modes.filter((m) => m.kind === 'device');
+      if (devices.length) {
+        const idx = devices.findIndex((d) => d.deviceId === selectedVideoDeviceId);
+        target = devices[(idx + 1 + devices.length) % devices.length];
+      }
+      if (!target) target = modes.find((m) => m.kind === 'facing' && m.facingMode !== activeFacing) || modes[0];
+      console.info(`[broadcast/camera] rotate target ${target.kind === 'device' ? 'device' : target.facingMode}`);
+    }
+    try {
+      const old = state.camStream;
+      if (old?.getVideoTracks?.().length) {
+        console.info('[broadcast/camera] stopping old video before rotate');
+        old.getVideoTracks().forEach((t) => t.stop());
+      }
+      const next = await openCameraMode(target);
+      state.camStream = next;
+      camSourceEl.srcObject = next;
+      camSourceEl.play().catch(() => {});
+      const track = next.getVideoTracks()[0];
+      const settings = track?.getSettings?.() || {};
+      selectedVideoDeviceId = settings.deviceId || selectedVideoDeviceId;
+      if (settings.facingMode === 'environment' || settings.facingMode === 'user') preferredFacingMode = settings.facingMode;
+      await syncTracks();
+      updateCameraLabel(track?.label || target.label || 'camera');
+      showCameraPipPreview();
+      announceState();
+      console.info('[broadcast/camera] rotate active', { label: track?.label || '', deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
+    } catch (err) {
+      console.warn('[broadcast/camera] rotate failed', { message: err?.message || String(err) });
+    }
+  }
+
+  async function requestCameraStream(videoConstraints) {
+    return navigator.mediaDevices.getUserMedia({
+      video: videoConstraints,
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: !!state.media.noise_cancel_enabled,
+        autoGainControl: true,
+        channelCount: 1,
+        sampleRate: 48000,
+      },
+    });
+  }
+
+  function audioConstraints() {
+    return {
+      echoCancellation: true,
+      noiseSuppression: !!state.media.noise_cancel_enabled,
+      autoGainControl: true,
+      channelCount: 1,
+      sampleRate: 48000,
+    };
+  }
+
+  async function buildCameraModes() {
+    const inputs = await refreshVideoInputs();
+    const facingModes = [
+      { kind: 'facing', label: 'Front', facingMode: 'user' },
+      { kind: 'facing', label: 'Back', facingMode: 'environment' },
+    ];
+    const deviceModes = inputs.map((d, idx) => ({ kind: 'device', label: d.label || `Camera ${idx + 1}`, deviceId: d.deviceId }));
+    cameraModes = isTouchLikeDevice() ? [...facingModes, ...deviceModes] : [...deviceModes, ...facingModes];
+    if (!cameraModes.length) cameraModes = [...facingModes];
+    console.info('[broadcast/camera] modes built', cameraModes);
+    return cameraModes;
+  }
+
+  async function openCameraMode(mode) {
+    if (mode.kind === 'facing') {
+      try {
+        if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user exact');
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment exact');
+        const exactStream = await requestCameraStream({ facingMode: { exact: mode.facingMode } });
+        console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'exact' });
+        return exactStream;
+      } catch (_) {
+        if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user ideal');
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment ideal');
+        const idealStream = await requestCameraStream({ facingMode: { ideal: mode.facingMode } });
+        console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'ideal' });
+        return idealStream;
+      }
+    }
+    console.info(`[broadcast/camera] switching to deviceId=${mode.deviceId}`);
+    try {
+      return await requestCameraStream({ deviceId: { exact: mode.deviceId } });
+    } catch (_) {
+      return requestCameraStream({ deviceId: { ideal: mode.deviceId } });
+    }
+  }
+
   async function startCameraStream() {
     if (state.camStream) {
       const activeTrack = state.camStream.getVideoTracks()[0];
@@ -258,20 +439,33 @@
       state.camStream.getTracks().forEach((t) => t.stop());
       state.camStream = null;
     }
-    const videoConstraints = selectedVideoDeviceId ? { deviceId: { exact: selectedVideoDeviceId } } : { facingMode: 'user' };
-    state.camStream = await navigator.mediaDevices.getUserMedia({
-      video: videoConstraints,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: !!state.media.noise_cancel_enabled,
-        autoGainControl: true,
-        channelCount: 1,
-        sampleRate: 48000,
-      },
-    });
-    if (dom.preview && !state.media.screen_enabled) dom.preview.srcObject = state.camStream;
+    const attempts = [];
+    if (selectedVideoDeviceId) attempts.push({ deviceId: { exact: selectedVideoDeviceId } });
+    attempts.push({ facingMode: { ideal: preferredFacingMode } });
+    attempts.push({ facingMode: { ideal: 'user' } });
+    attempts.push(true);
+    let stream = null;
+    let lastErr = null;
+    for (const c of attempts) {
+      try {
+        stream = await requestCameraStream(c);
+        break;
+      } catch (err) {
+        lastErr = err;
+        console.info('[broadcast/camera] getUserMedia attempt failed', { constraint: c, message: err?.message || String(err) });
+      }
+    }
+    if (!stream) throw lastErr || new Error('camera unavailable');
+    state.camStream = stream;
+    ensureProgramStream();
+  hideCameraPipPreview();
     const track = state.camStream.getVideoTracks()[0];
+    camSourceEl.srcObject = state.camStream;
+    camSourceEl.play().catch(() => {});
     selectedVideoDeviceId = track?.getSettings?.().deviceId || selectedVideoDeviceId;
+    const facing = track?.getSettings?.().facingMode;
+    if (facing === 'environment' || facing === 'user') preferredFacingMode = facing;
+    console.info('[broadcast/camera] active track', { label: track?.label || '', deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
     updateCameraLabel(track?.label || 'camera');
     return state.camStream;
   }
@@ -283,10 +477,16 @@
     } catch {
       cachedVideoInputs = [];
     }
+    console.info('[broadcast/camera] enumerate devices', { count: cachedVideoInputs.length, labelsReady: cachedVideoInputs.some((d) => !!d.label) });
     return cachedVideoInputs;
   }
 
   async function cycleCameraDevice() {
+    if (!cachedVideoInputs.length || cachedVideoInputs.every((d) => !d.label)) {
+      try {
+        if (!state.camStream) await startCameraStream();
+      } catch (_) {}
+    }
     const inputs = await refreshVideoInputs();
     if (!inputs.length) {
       state.media.camera_enabled = !state.media.camera_enabled;
@@ -294,30 +494,149 @@
       announceState();
       return;
     }
+    if (isTouchLikeDevice()) {
+      const nextFacing = preferredFacingMode === 'user' ? 'environment' : 'user';
+      preferredFacingMode = nextFacing;
+      selectedVideoDeviceId = '';
+      state.media.camera_enabled = true;
+      const old = state.camStream;
+      state.camStream = null;
+      try {
+        await syncTracks();
+        old?.getTracks?.().forEach((t) => t.stop());
+        announceState();
+        console.info('[broadcast/camera] switched facing mode', { facingMode: preferredFacingMode });
+        return;
+      } catch (err) {
+        console.warn('[broadcast/camera] facing switch failed, falling back to device cycle', { message: err?.message || String(err) });
+        if (old) state.camStream = old;
+      }
+    }
     const idx = inputs.findIndex((d) => d.deviceId === selectedVideoDeviceId);
     cameraCycleIndex = idx >= 0 ? idx : cameraCycleIndex;
     cameraCycleIndex = (cameraCycleIndex + 1) % inputs.length;
     selectedVideoDeviceId = inputs[cameraCycleIndex].deviceId;
     state.media.camera_enabled = true;
-    if (state.camStream) {
-      state.camStream.getTracks().forEach((t) => t.stop());
-      state.camStream = null;
-    }
+    const old = state.camStream;
+    state.camStream = null;
     await syncTracks();
+    old?.getTracks?.().forEach((t) => t.stop());
     updateCameraLabel(inputs[cameraCycleIndex].label || `camera ${cameraCycleIndex + 1}`);
+    console.info('[broadcast/camera] cycled device', { deviceId: selectedVideoDeviceId, label: inputs[cameraCycleIndex].label || '' });
     announceState();
   }
 
   async function startScreenStream() {
     if (state.screenStream) return state.screenStream;
     state.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    console.info('[broadcast/screen] screen stream started');
     state.screenStream.getVideoTracks().forEach((t) => t.addEventListener('ended', () => {
       if (!state.media.screen_enabled) return;
       state.media.screen_enabled = false;
+      console.info('[broadcast/screen] native screen-share ended; returning to camera');
+      pip.enabled = false;
+      console.info('[broadcast/pip] disabled');
       switchToCamera().catch(() => announceState());
     }));
-    if (dom.preview) dom.preview.srcObject = state.screenStream;
+    ensureProgramStream();
+  hideCameraPipPreview();
+    screenSourceEl.srcObject = state.screenStream;
+    screenSourceEl.play().catch(() => {});
     return state.screenStream;
+  }
+
+  function ensureProgramCanvas() {
+    if (programCanvas) return;
+    programCanvas = document.createElement('canvas');
+    programCanvas.width = PROGRAM_WIDTH;
+    programCanvas.height = PROGRAM_HEIGHT;
+    programCtx = programCanvas.getContext('2d');
+    console.info('[broadcast/program] canvas fixed size 1280x720');
+  }
+  function ensureProgramStream() {
+    ensureProgramCanvas();
+    startProgramLoop();
+
+    if (!programStream) {
+      programStream = programCanvas.captureStream(30);
+      programVideoTrack = programStream.getVideoTracks()[0] || null;
+      console.info('[broadcast/program] stream ready');
+    }
+
+    if (dom.preview && dom.preview.srcObject !== programStream) {
+      dom.preview.srcObject = programStream;
+      dom.preview.muted = true;
+      dom.preview.playsInline = true;
+      dom.preview.play?.().catch(() => {});
+      console.info('[broadcast/program] preview using program stream');
+      console.info('[broadcast/program] preview aspect locked');
+    }
+
+    return programStream;
+  }
+
+  function drawVideoContain(ctx, video, dx, dy, dw, dh) {
+    if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return false;
+
+    const sw = video.videoWidth;
+    const sh = video.videoHeight;
+    const sourceAspect = sw / sh;
+    const destAspect = dw / dh;
+
+    let renderW = dw;
+    let renderH = dh;
+    let renderX = dx;
+    let renderY = dy;
+
+    if (sourceAspect > destAspect) {
+      renderW = dw;
+      renderH = dw / sourceAspect;
+      renderY = dy + (dh - renderH) / 2;
+    } else {
+      renderH = dh;
+      renderW = dh * sourceAspect;
+      renderX = dx + (dw - renderW) / 2;
+    }
+
+    ctx.drawImage(video, renderX, renderY, renderW, renderH);
+    return true;
+  }
+
+  function drawProgramFrame() {
+    if (!programCtx || !programCanvas) return;
+    programCtx.fillStyle = '#000';
+    programCtx.fillRect(0, 0, PROGRAM_WIDTH, PROGRAM_HEIGHT);
+    const mainEl = state.media.screen_enabled ? screenSourceEl : camSourceEl;
+    if (mainEl?.readyState >= 2) {
+      try {
+        drawVideoContain(programCtx, mainEl, 0, 0, PROGRAM_WIDTH, PROGRAM_HEIGHT);
+        if (state.media.screen_enabled) { if (!loggedContainScreen) { console.info('[broadcast/program] source contain draw screen'); loggedContainScreen = true; } }
+        else { if (!loggedContainCamera) { console.info('[broadcast/program] source contain draw camera'); loggedContainCamera = true; } }
+      } catch (_) {}
+    }
+    if (state.media.screen_enabled && pip.enabled && camSourceEl.readyState >= 2) {
+      syncCameraPipPreviewPosition();
+      try {
+        programCtx.fillStyle = 'rgba(0,0,0,0.45)';
+        programCtx.fillRect(pip.x - 2, pip.y - 2, pip.w + 4, pip.h + 4);
+        drawVideoContain(programCtx, camSourceEl, pip.x, pip.y, pip.w, pip.h);
+        programCtx.strokeStyle = 'rgba(255,255,255,0.85)';
+        programCtx.lineWidth = 2;
+        programCtx.strokeRect(pip.x, pip.y, pip.w, pip.h);
+      } catch (_) {}
+    }
+  }
+
+  function startProgramLoop() {
+    if (programLoopRunning) return;
+    ensureProgramCanvas();
+    programLoopRunning = true;
+    const tick = () => {
+      if (!programLoopRunning) return;
+      drawProgramFrame();
+      programLoopHandle = requestAnimationFrame(tick);
+    };
+    programLoopHandle = requestAnimationFrame(tick);
   }
 
   async function ensurePeerConnection(viewerId = null) {
@@ -335,8 +654,14 @@
     pc.onconnectionstatechange = () => dom.stPc && (dom.stPc.textContent = pc.connectionState);
     pc.oniceconnectionstatechange = () => dom.stIce && (dom.stIce.textContent = pc.iceConnectionState);
     if (viewerId) {
-      const stream = state.media.screen_enabled ? state.screenStream : state.camStream;
-      (stream?.getTracks?.() || []).forEach((track) => pc.addTrack(track, stream));
+      const ps = ensureProgramStream();
+      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+      if (vtrack) pc.addTrack(vtrack, ps);
+      if (state.media.mic_enabled) {
+        const atrack = state.camStream?.getAudioTracks?.()[0] || null;
+        if (atrack) pc.addTrack(atrack, state.camStream);
+      }
+      console.info('[broadcast/program] sender using program video track');
     }
     return pc;
   }
@@ -370,12 +695,17 @@
   }
 
   async function syncTracks() {
+    startProgramLoop();
     if (state.media.screen_enabled) {
       const screen = await startScreenStream();
-      await replaceOutgoingVideoTrack(screen.getVideoTracks()[0] || null);
+      const ps = ensureProgramStream();
+      await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || screen.getVideoTracks()[0] || null);
+      console.info('[broadcast/program] sender using program video track');
     } else {
       const cam = await startCameraStream();
-      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (cam.getVideoTracks()[0] || null) : null);
+      const ps = ensureProgramStream();
+      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (programVideoTrack || ps.getVideoTracks()[0] || cam.getVideoTracks()[0] || null) : null);
+      console.info('[broadcast/program] sender using program video track');
     }
     if (state.media.mic_enabled) {
       const cam = await startCameraStream();
@@ -387,18 +717,28 @@
 
   async function switchToScreen() {
     state.media.screen_enabled = true;
+    try { if (!state.camStream) await startCameraStream(); } catch (err) { console.warn('[broadcast/pip] camera unavailable for pip', err?.message || err); }
+    pip.enabled = Boolean(state.camStream);
+    console.info('[broadcast/pip] enabled');
     await syncTracks();
+    if (pip.enabled) showCameraPipPreview(); else hideCameraPipPreview();
+    console.info('[broadcast/screen] switched to screen mode with camera PiP');
     announceState();
   }
 
   async function switchToCamera() {
     state.media.screen_enabled = false;
+    pip.enabled = false;
+    hideCameraPipPreview();
+    console.info('[broadcast/pip] disabled');
     if (state.screenStream) {
       state.screenStream.getTracks().forEach((t) => t.stop());
       state.screenStream = null;
     }
     await syncTracks();
-    if (dom.preview && state.camStream) dom.preview.srcObject = state.camStream;
+    ensureProgramStream();
+  hideCameraPipPreview();
+    console.info('[broadcast/screen] switched back to camera mode');
     announceState();
   }
 
@@ -424,20 +764,29 @@
   async function playAiVoice(url) {
     if (!url || !state.media.hear_ai_voice) return;
     try {
+      if (activeAiAudio) {
+        activeAiAudio.pause();
+        activeAiAudio.src = '';
+        activeAiAudio = null;
+        console.info('[broadcast/ai] stopped previous AI audio');
+      }
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
       const audio = new Audio(url);
       audio.volume = 0.9;
+      activeAiAudio = audio;
+      audio.onended = () => { if (activeAiAudio === audio) activeAiAudio = null; };
       await audio.play();
+      console.info('[broadcast/ai] AI voice started');
     } catch (_) {}
   }
 
   function currentProgramStream() {
-    const base = state.media.screen_enabled ? state.screenStream : state.camStream;
-    if (!base) return null;
+    const ps = ensureProgramStream();
     const tracks = [];
-    const videoTrack = base.getVideoTracks()[0];
-    const audioTrack = base.getAudioTracks()[0];
-    if (videoTrack) tracks.push(videoTrack.clone());
-    if (audioTrack) tracks.push(audioTrack.clone());
+    const videoTrack = programVideoTrack || ps.getVideoTracks()[0];
+    if (videoTrack) tracks.push(videoTrack);
+    const audioTrack = state.camStream?.getAudioTracks?.()[0];
+    if (audioTrack) tracks.push(audioTrack);
     return tracks.length ? new MediaStream(tracks) : null;
   }
 
@@ -464,22 +813,26 @@
     }
     recordingChunks = [];
     recordingStream = stream;
-    recordingMedia = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp8,opus' });
+    recordingMedia = new MediaRecorder(stream, getPreferredRecorderOptions());
     recordingMedia.ondataavailable = (ev) => { if (ev.data?.size) recordingChunks.push(ev.data); };
     recordingMedia.onstop = async () => {
       const blob = new Blob(recordingChunks, { type: 'video/webm' });
       recordingChunks = [];
-      recordingStream?.getTracks().forEach((t) => t.stop());
+      recordingStream?.getAudioTracks?.().forEach((t) => t.stop());
       recordingStream = null;
-      if (dom.recordingStatus) dom.recordingStatus.textContent = 'Processing MP4…';
-      try {
-        const saved = await uploadRecording(blob);
-        if (dom.recordingStatus) dom.recordingStatus.textContent = `Saved ${saved.url || 'recording'}`;
-      } catch (err) {
-        if (dom.recordingStatus) dom.recordingStatus.textContent = `Recording failed: ${err.message || err}`;
-      }
+      const filename = timestampedRecordingName();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(href);
+      console.info('[broadcast/record] auto-downloaded recording', { filename, size: blob.size });
+      if (dom.recordingStatus) dom.recordingStatus.textContent = `Saved ${filename}`;
+      return;
     };
     recordingMedia.start(1000);
+    console.info('[broadcast/record] recording started');
     state.media.record_enabled = true;
     if (dom.recordingStatus) dom.recordingStatus.textContent = 'Recording live…';
     announceState();
@@ -565,12 +918,16 @@
     const processor = ctx.createScriptProcessor(4096, 1, 1);
 
     processor.onaudioprocess = (event) => {
-      if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) return;
+    if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) return;
+      const now = Date.now();
+      sttFrameModulo = (sttFrameModulo + 1) % 3;
+      if (sttFrameModulo !== 0 || (now - lastSttSentAt) < 120) return;
       const input = event.inputBuffer.getChannelData(0);
       const reduced = downsampleBuffer(input, ctx.sampleRate, STT_TARGET_SAMPLE_RATE);
       const pcm = floatToInt16(reduced);
       if (!pcm.length) return;
       sendAudioChunk(int16ToBase64(pcm), STT_TARGET_SAMPLE_RATE);
+      lastSttSentAt = now;
     };
 
     source.connect(processor);
@@ -595,7 +952,7 @@
       if (msg.type === 'state_sync' || msg.type === 'state_update') applyRoomState(msg.state || {});
       if (msg.type === 'presence') applyPresence(msg);
       if (msg.type === 'ai_status') updateAiStatus(msg.status || 'idle');
-      if (['chat', 'ai', 'ai_partial', 'attachment'].includes(msg.type)) appendChat(msg);
+      if (['chat', 'ai', 'attachment'].includes(msg.type)) appendChat(msg);
       if (msg.type === 'ai' && msg.voice) playAiVoice(msg.voice);
       if (msg.type === 'web_search_result') {
         renderSearchResults(msg.query || '', msg.result || {});
@@ -692,7 +1049,8 @@
   });
 
   dom.camBtn?.addEventListener('click', async () => {
-    await cycleCameraDevice();
+    state.media.camera_enabled = true;
+    await rotateCamera();
   });
   dom.screenBtn?.addEventListener('click', async () => {
     if (state.media.screen_enabled) await switchToCamera(); else await switchToScreen();
@@ -721,6 +1079,50 @@
   dom.ttsMonBtn?.addEventListener('click', () => { state.media.hear_ai_voice = !state.media.hear_ai_voice; announceState(); });
   dom.recordBtn?.addEventListener('click', () => { toggleRecording().catch(() => {}); });
   dom.rtmpBtn?.addEventListener('click', () => { toggleRtmp().catch(() => {}); });
+  const pointerDown = (ev) => {
+    if (!state.media.screen_enabled) return;
+    const rect = dom.preview?.getBoundingClientRect();
+    if (!rect || !programCanvas) return;
+    const scaleX = PROGRAM_WIDTH / rect.width;
+    const scaleY = PROGRAM_HEIGHT / rect.height;
+    const x = ((ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left) * scaleX;
+    const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
+    const inside = x >= pip.x && x <= (pip.x + pip.w) && y >= pip.y && y <= (pip.y + pip.h);
+    if (!inside) return;
+    pip.dragging = true;
+    pip.dragDx = x - pip.x;
+    pip.dragDy = y - pip.y;
+    console.info('[broadcast/pip] drag start');
+  };
+  const pointerMove = (ev) => {
+    if (!pip.dragging) return;
+    const rect = dom.preview?.getBoundingClientRect();
+    if (!rect || !programCanvas) return;
+    const scaleX = PROGRAM_WIDTH / rect.width;
+    const scaleY = PROGRAM_HEIGHT / rect.height;
+    const x = ((ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left) * scaleX;
+    const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
+    pip.x = Math.max(0, Math.min((PROGRAM_WIDTH - pip.w), x - pip.dragDx));
+    pip.y = Math.max(0, Math.min((PROGRAM_HEIGHT - pip.h), y - pip.dragDy));
+    syncCameraPipPreviewPosition();
+    console.info('[broadcast/pip] moved', { x: pip.x, y: pip.y });
+  };
+  const pointerUp = () => {
+    if (!pip.dragging) return;
+    pip.dragging = false;
+    console.info('[broadcast/pip] drag end', { x: pip.x, y: pip.y });
+  };
+  dom.preview?.addEventListener('pointerdown', pointerDown);
+  dom.cameraPipPreview?.addEventListener('pointerdown', pointerDown);
+  window.addEventListener('pointermove', pointerMove, { passive: true });
+  window.addEventListener('pointerup', pointerUp, { passive: true });
+  dom.preview?.addEventListener('pointercancel', pointerUp);
+  window.addEventListener('mousedown', pointerDown, { passive: true });
+  window.addEventListener('mousemove', pointerMove, { passive: true });
+  window.addEventListener('mouseup', pointerUp, { passive: true });
+  dom.preview?.addEventListener('touchstart', pointerDown, { passive: true });
+  window.addEventListener('touchmove', pointerMove, { passive: true });
+  window.addEventListener('touchend', pointerUp, { passive: true });
   dom.chatCollapseBtn?.addEventListener('click', () => {
     if (!dom.chatPanel) return;
     dom.chatPanel.classList.toggle('collapsed');
@@ -732,6 +1134,8 @@
     if (dom.chatCollapseBtn) dom.chatCollapseBtn.textContent = 'Expand';
   }
   applyRoomState({ settings: state.media, runtime: { broadcaster_present: false, viewer_count: 0 } });
+  ensureProgramStream();
+  hideCameraPipPreview();
   installWakeLock();
   connectChat();
   connectSignal();

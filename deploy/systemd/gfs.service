@@ -8,8 +8,14 @@ User=${APP_USER}
 Group=${APP_GROUP}
 WorkingDirectory=${APP_DIR}
 Environment=PYTHONUNBUFFERED=1
+Environment=WEB_CONCURRENCY=2
+Environment=GFS_WORKERS=2
+Environment=GFS_MAX_CONCURRENT_BUILDS=1
+Environment=GFS_CACHE_MAX_ENTRIES=24
+Environment=GFS_WEATHER_TTL_SECONDS=15
+Environment=GFS_OCEAN_TTL_SECONDS=60
 EnvironmentFile=-/etc/broadcast/install.env
-ExecStart=${APP_DIR}/venv/bin/python -m hypercorn main:app --workers ${WEB_CONCURRENCY:-2} --bind 127.0.0.1:8000
+ExecStart=${APP_DIR}/venv/bin/python -m hypercorn main:app --workers ${WEB_CONCURRENCY} --bind 127.0.0.1:8000
 Restart=always
 RestartSec=3
 

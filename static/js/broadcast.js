@@ -44,6 +44,9 @@
     fileInput: document.getElementById('file'),
     chatCollapseBtn: document.getElementById('chatCollapseBtn'),
     chatPanel: document.querySelector('.chat'),
+    stage: document.querySelector('.stage'),
+    cameraPipPreview: document.getElementById('cameraPipPreview'),
+    cameraPipBadge: document.getElementById('cameraPipBadge'),
   };
 
   let chatRetryMs = 1200;
@@ -68,7 +71,7 @@
   let programVideoTrack = null;
   let programLoopHandle = 0;
   let programLoopRunning = false;
-  const pip = { enabled: false, x: 20, y: 20, w: 220, h: 124, dragging: false, dragOffsetX: 0, dragOffsetY: 0 };
+  const pip = { enabled: false, x: 20, y: 20, w: 220, h: 124, dragging: false, dragDx: 0, dragDy: 0 };
   let lastSttSentAt = 0;
   let sttFrameModulo = 0;
   const camSourceEl = document.createElement('video');
@@ -293,6 +296,79 @@
     setLed(dom.ledRoom, online);
   }
 
+  function syncCameraPipPreviewPosition() {
+    if (!dom.cameraPipPreview || !dom.preview || !dom.cameraPipPreview.classList.contains('active')) return;
+    const rect = dom.preview.getBoundingClientRect();
+    const scaleX = rect.width / PROGRAM_WIDTH;
+    const scaleY = rect.height / PROGRAM_HEIGHT;
+    dom.cameraPipPreview.style.left = `${pip.x * scaleX}px`;
+    dom.cameraPipPreview.style.top = `${pip.y * scaleY}px`;
+    dom.cameraPipPreview.style.width = `${pip.w * scaleX}px`;
+    dom.cameraPipPreview.style.height = `${pip.h * scaleY}px`;
+    if (dom.cameraPipBadge) {
+      dom.cameraPipBadge.style.left = `${pip.x * scaleX + 8}px`;
+      dom.cameraPipBadge.style.top = `${pip.y * scaleY + 6}px`;
+    }
+  }
+
+  function showCameraPipPreview() {
+    if (!dom.cameraPipPreview || !state.camStream || !state.media.screen_enabled || !pip.enabled) return;
+    dom.cameraPipPreview.srcObject = state.camStream;
+    dom.cameraPipPreview.classList.add('active');
+    dom.cameraPipBadge?.classList.add('active');
+    dom.cameraPipPreview.play?.().catch(() => {});
+    syncCameraPipPreviewPosition();
+  }
+
+  function hideCameraPipPreview() {
+    dom.cameraPipPreview?.classList.remove('active');
+    dom.cameraPipBadge?.classList.remove('active');
+  }
+
+  async function rotateCamera() {
+    console.info('[broadcast/camera] rotate requested');
+    const modes = await buildCameraModes();
+    if (!modes.length) return;
+    const active = state.camStream?.getVideoTracks?.()[0];
+    const activeFacing = active?.getSettings?.().facingMode;
+    let target = null;
+    if (isTouchLikeDevice()) {
+      const wantFacing = activeFacing === 'environment' ? 'user' : 'environment';
+      target = modes.find((m) => m.kind === 'facing' && m.facingMode === wantFacing) || modes.find((m) => m.kind === 'facing');
+      console.info(`[broadcast/camera] rotate target ${target?.facingMode || 'device'}`);
+    } else {
+      const devices = modes.filter((m) => m.kind === 'device');
+      if (devices.length) {
+        const idx = devices.findIndex((d) => d.deviceId === selectedVideoDeviceId);
+        target = devices[(idx + 1 + devices.length) % devices.length];
+      }
+      if (!target) target = modes.find((m) => m.kind === 'facing' && m.facingMode !== activeFacing) || modes[0];
+      console.info(`[broadcast/camera] rotate target ${target.kind === 'device' ? 'device' : target.facingMode}`);
+    }
+    try {
+      const old = state.camStream;
+      if (old?.getVideoTracks?.().length) {
+        console.info('[broadcast/camera] stopping old video before rotate');
+        old.getVideoTracks().forEach((t) => t.stop());
+      }
+      const next = await openCameraMode(target);
+      state.camStream = next;
+      camSourceEl.srcObject = next;
+      camSourceEl.play().catch(() => {});
+      const track = next.getVideoTracks()[0];
+      const settings = track?.getSettings?.() || {};
+      selectedVideoDeviceId = settings.deviceId || selectedVideoDeviceId;
+      if (settings.facingMode === 'environment' || settings.facingMode === 'user') preferredFacingMode = settings.facingMode;
+      await syncTracks();
+      updateCameraLabel(track?.label || target.label || 'camera');
+      showCameraPipPreview();
+      announceState();
+      console.info('[broadcast/camera] rotate active', { label: track?.label || '', deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
+    } catch (err) {
+      console.warn('[broadcast/camera] rotate failed', { message: err?.message || String(err) });
+    }
+  }
+
   async function requestCameraStream(videoConstraints) {
     return navigator.mediaDevices.getUserMedia({
       video: videoConstraints,
@@ -382,6 +458,7 @@
     if (!stream) throw lastErr || new Error('camera unavailable');
     state.camStream = stream;
     ensureProgramStream();
+  hideCameraPipPreview();
     const track = state.camStream.getVideoTracks()[0];
     camSourceEl.srcObject = state.camStream;
     camSourceEl.play().catch(() => {});
@@ -462,6 +539,7 @@
       switchToCamera().catch(() => announceState());
     }));
     ensureProgramStream();
+  hideCameraPipPreview();
     screenSourceEl.srcObject = state.screenStream;
     screenSourceEl.play().catch(() => {});
     return state.screenStream;
@@ -537,6 +615,7 @@
       } catch (_) {}
     }
     if (state.media.screen_enabled && pip.enabled && camSourceEl.readyState >= 2) {
+      syncCameraPipPreviewPosition();
       try {
         programCtx.fillStyle = 'rgba(0,0,0,0.45)';
         programCtx.fillRect(pip.x - 2, pip.y - 2, pip.w + 4, pip.h + 4);
@@ -638,9 +717,11 @@
 
   async function switchToScreen() {
     state.media.screen_enabled = true;
-    pip.enabled = true;
+    try { if (!state.camStream) await startCameraStream(); } catch (err) { console.warn('[broadcast/pip] camera unavailable for pip', err?.message || err); }
+    pip.enabled = Boolean(state.camStream);
     console.info('[broadcast/pip] enabled');
     await syncTracks();
+    if (pip.enabled) showCameraPipPreview(); else hideCameraPipPreview();
     console.info('[broadcast/screen] switched to screen mode with camera PiP');
     announceState();
   }
@@ -648,6 +729,7 @@
   async function switchToCamera() {
     state.media.screen_enabled = false;
     pip.enabled = false;
+    hideCameraPipPreview();
     console.info('[broadcast/pip] disabled');
     if (state.screenStream) {
       state.screenStream.getTracks().forEach((t) => t.stop());
@@ -655,6 +737,7 @@
     }
     await syncTracks();
     ensureProgramStream();
+  hideCameraPipPreview();
     console.info('[broadcast/screen] switched back to camera mode');
     announceState();
   }
@@ -966,28 +1049,8 @@
   });
 
   dom.camBtn?.addEventListener('click', async () => {
-    const modes = await buildCameraModes();
-    if (!modes.length) return;
-    cameraModeIndex = (cameraModeIndex + 1) % modes.length;
-    const mode = modes[cameraModeIndex];
-    const old = state.camStream;
-    try {
-      const next = await openCameraMode(mode);
-      state.camStream = next;
-      const track = next.getVideoTracks()[0];
-      selectedVideoDeviceId = track?.getSettings?.().deviceId || selectedVideoDeviceId;
-      const facing = track?.getSettings?.().facingMode;
-      if (facing === 'environment' || facing === 'user') preferredFacingMode = facing;
-      camSourceEl.srcObject = next;
-      camSourceEl.play().catch(() => {});
-      updateCameraLabel(track?.label || mode.label || 'camera');
-      await syncTracks();
-      old?.getVideoTracks?.().forEach((t) => t.stop());
-      announceState();
-    } catch (err) {
-      console.warn('[broadcast/camera] fallback after failure', { mode, message: err?.message || String(err) });
-      await cycleCameraDevice();
-    }
+    state.media.camera_enabled = true;
+    await rotateCamera();
   });
   dom.screenBtn?.addEventListener('click', async () => {
     if (state.media.screen_enabled) await switchToCamera(); else await switchToScreen();
@@ -1041,6 +1104,7 @@
     const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
     pip.x = Math.max(0, Math.min((PROGRAM_WIDTH - pip.w), x - pip.dragDx));
     pip.y = Math.max(0, Math.min((PROGRAM_HEIGHT - pip.h), y - pip.dragDy));
+    syncCameraPipPreviewPosition();
     console.info('[broadcast/pip] moved', { x: pip.x, y: pip.y });
   };
   const pointerUp = () => {
@@ -1049,6 +1113,7 @@
     console.info('[broadcast/pip] drag end', { x: pip.x, y: pip.y });
   };
   dom.preview?.addEventListener('pointerdown', pointerDown);
+  dom.cameraPipPreview?.addEventListener('pointerdown', pointerDown);
   window.addEventListener('pointermove', pointerMove, { passive: true });
   window.addEventListener('pointerup', pointerUp, { passive: true });
   dom.preview?.addEventListener('pointercancel', pointerUp);
@@ -1070,6 +1135,7 @@
   }
   applyRoomState({ settings: state.media, runtime: { broadcaster_present: false, viewer_count: 0 } });
   ensureProgramStream();
+  hideCameraPipPreview();
   installWakeLock();
   connectChat();
   connectSignal();

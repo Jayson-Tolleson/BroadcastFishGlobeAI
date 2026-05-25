@@ -109,9 +109,11 @@ async def _heavy_json(route: str, vp, ttl: float, builder, *, extra_key: str = "
         return jsonify(_json_safe(cached))
 
     async def _build_once():
+        acquired = False
         try:
             log.info("[gfs/backpressure] waiting route=%s request_id=%s", route, request_id)
             await asyncio.wait_for(_GFS_BUILD_SEMAPHORE.acquire(), timeout=2.0)
+            acquired = True
             log.info("[gfs/backpressure] acquired route=%s request_id=%s", route, request_id)
         except asyncio.TimeoutError:
             log.warning("[gfs/backpressure] timeout route=%s request_id=%s", route, request_id)
@@ -130,7 +132,7 @@ async def _heavy_json(route: str, vp, ttl: float, builder, *, extra_key: str = "
             timeout_count += 1
             return {"ok": False, "status": "timeout", "message": "GFS payload timed out"}, 504
         finally:
-            if _GFS_BUILD_SEMAPHORE.locked():
+            if acquired:
                 _GFS_BUILD_SEMAPHORE.release()
 
     payload, status = await _singleflight(key, _build_once)
@@ -335,22 +337,31 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/ocean")
     async def api_ocean():
-        started = time.time()
         vp = parse_viewport_args(request.args)
         ocean_stride = _ocean_stride_for_viewport(vp, request.args)
         ocean_vp = canonicalize_viewport({**vp.as_dict(), "stride": ocean_stride})
-        log.info("/gfs/api/ocean viewport=%s ocean_stride=%s", vp.as_dict(), ocean_stride)
-        payload = gfs().shared_ocean_payload(ocean_vp.as_dict())
-        payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
-        payload["ocean_stride"] = ocean_stride
-        log.info("/gfs/api/ocean latency_ms=%s stride=%s degraded=%s", payload.get("latency_ms"), ocean_stride, payload.get("degraded"))
-        return jsonify(_json_safe(payload))
+        return await _heavy_json(
+            "/gfs/api/ocean",
+            ocean_vp,
+            GFS_OCEAN_TTL_SECONDS,
+            lambda: {**gfs().shared_ocean_payload(ocean_vp.as_dict()), "ocean_stride": ocean_stride},
+            extra_key=f"ocean_stride={ocean_stride}",
+        )
 
     @bp.route("/api/weather")
     async def api_weather():
         vp = parse_viewport_args(request.args)
         started = _route_debug_start("/gfs/api/weather", vp, request.query_string.decode("utf-8", errors="ignore"))
-        payload = gfs().generate_weather_payload(vp.as_dict())
+        weather_resp, weather_status = await _heavy_json(
+            "/gfs/api/weather",
+            vp,
+            GFS_WEATHER_TTL_SECONDS,
+            lambda: gfs().generate_weather_payload(vp.as_dict()),
+            extra_key=request.query_string.decode("utf-8", errors="ignore"),
+        )
+        if weather_status != 200:
+            return weather_resp, weather_status
+        payload = await weather_resp.get_json()
         payload_state = str(payload.get("payload_state") or "").lower()
         source_status = "live" if payload_state == "live" else "stale_last_good" if payload_state == "cached" else "unavailable"
         if payload_state not in {"live", "cached"}:
@@ -388,9 +399,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/bait")
     async def api_bait():
         vp = parse_viewport_args(request.args)
-        payload = gfs().bait_from_ocean(vp.as_dict())
-        log.info("/gfs/api/bait polygons=%s", len((payload.get("bait") or {}).get("polygons") or []))
-        return jsonify(payload)
+        return await _heavy_json("/gfs/api/bait", vp, GFS_OCEAN_TTL_SECONDS, lambda: gfs().bait_from_ocean(vp.as_dict()))
 
     @bp.route("/api/bait-advanced")
     @bp.route("/api/bait/advanced")
@@ -400,31 +409,24 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/boats")
     async def api_boats():
-        started = time.time()
         vp = parse_viewport_args(request.args)
-        log.info("/gfs/api/boats viewport=%s", vp.as_dict())
-        payload = gfs().boats_from_ocean(vp.as_dict())
-        payload["latency_ms"] = round((time.time() - started) * 1000, 2)
-        log.info("/gfs/api/boats count=%s latency_ms=%s", payload.get("count"), payload.get("latency_ms"))
-        return jsonify(payload)
+        return await _heavy_json("/gfs/api/boats", vp, GFS_OCEAN_TTL_SECONDS, lambda: gfs().boats_from_ocean(vp.as_dict()))
 
     @bp.route("/api/frame")
     async def api_frame():
-        started = time.time()
         vp = parse_viewport_args(request.args)
-        payload = gfs().frame_payload(vp.as_dict())
-        payload.setdefault("latency_ms", round((time.time() - started) * 1000, 2))
-        log.info("/gfs/api/frame latency_ms=%s viewport=%s", payload.get("latency_ms"), vp.as_dict())
-        return jsonify(_json_safe(payload))
+        extra_key = f"query={request.query_string.decode('utf-8', errors='ignore')}"
+        return await _heavy_json("/gfs/api/frame", vp, GFS_WEATHER_TTL_SECONDS, lambda: gfs().frame_payload(vp.as_dict()), extra_key=extra_key)
 
     @bp.route("/api/tiles/<layer>/<int:z>/<int:x>/<int:y>")
     async def api_tiles(layer, z, x, y):
-        return jsonify(gfs().layer_tile_payload(layer, z, x, y))
+        vp = parse_viewport_args(request.args)
+        return await _heavy_json("/gfs/api/tiles", vp, GFS_OCEAN_TTL_SECONDS, lambda: gfs().layer_tile_payload(layer, z, x, y), extra_key=f"{layer}:{z}:{x}:{y}")
 
     @bp.route("/api/scene")
     async def api_scene():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().get_scene_payload(vp.as_dict()))
+        return await _heavy_json("/gfs/api/scene", vp, GFS_OCEAN_TTL_SECONDS, lambda: gfs().get_scene_payload(vp.as_dict()))
 
     @bp.route("/api/hazards")
     async def api_hazards():
@@ -437,10 +439,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/fish")
     async def api_fish():
         vp = parse_viewport_args(request.args)
-        payload = gfs().fish_from_ocean(vp.as_dict())
-        payload.setdefault("entity_type", "fish_intelligence")
-        payload.setdefault("derived", True)
-        return jsonify(payload)
+        return await _heavy_json("/gfs/api/fish", vp, GFS_OCEAN_TTL_SECONDS, lambda: gfs().fish_from_ocean(vp.as_dict()))
 
     @bp.route("/api/locations")
     async def api_locations():

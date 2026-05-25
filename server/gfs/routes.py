@@ -21,7 +21,7 @@ log = logging.getLogger("server.gfs.routes")
 
 GFS_WORKERS = int(os.getenv("GFS_WORKERS", "2"))
 GFS_TIMEOUT_SECONDS = float(os.getenv("GFS_TIMEOUT_SECONDS", "25"))
-GFS_MAX_CONCURRENT_BUILDS = int(os.getenv("GFS_MAX_CONCURRENT_BUILDS", "2"))
+GFS_MAX_CONCURRENT_BUILDS = int(os.getenv("GFS_MAX_CONCURRENT_BUILDS", "1"))
 GFS_CACHE_MAX_ENTRIES = int(os.getenv("GFS_CACHE_MAX_ENTRIES", "32"))
 GFS_WEATHER_TTL_SECONDS = float(os.getenv("GFS_WEATHER_TTL_SECONDS", "15"))
 GFS_OCEAN_TTL_SECONDS = float(os.getenv("GFS_OCEAN_TTL_SECONDS", "60"))
@@ -471,17 +471,17 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     def _coerce_key(value: str) -> str:
         return str(value or "").strip()
 
-    def _find_fish_item(location_key: str) -> dict[str, Any] | None:
-        payload = gfs().locations_fast(None, budget_ms=1800)
+    async def _find_fish_item(location_key: str) -> dict[str, Any] | None:
+        payload = await _run_gfs_blocking(lambda: gfs().locations_fast(None, budget_ms=1800))
         for item in payload.get("items") or []:
             item_keys = {_coerce_key(item.get("id")), _coerce_key(item.get("location_key"))}
             if _coerce_key(location_key) in item_keys:
                 return item
         return None
 
-    def _location_detail_payload(location_key: str) -> dict[str, Any]:
-        item = _find_fish_item(location_key) or {}
-        media_payload = media().location_media(location_key)
+    async def _location_detail_payload(location_key: str) -> dict[str, Any]:
+        item = (await _find_fish_item(location_key)) or {}
+        media_payload = await _run_gfs_blocking(lambda: media().location_media(location_key))
         normalized = _normalize_location_item(item)
         canonical_id = _coerce_key(normalized.get("location_key") or normalized.get("id") or location_key)
         return {
@@ -523,11 +523,11 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
 
     @bp.route("/api/location/<location_key>")
     async def location_detail(location_key):
-        return jsonify(_location_detail_payload(location_key))
+        return jsonify(await _location_detail_payload(location_key))
 
     @bp.route("/api/intelligence/node/<location_key>")
     async def intelligence_node(location_key):
-        return jsonify(_location_detail_payload(location_key))
+        return jsonify(await _location_detail_payload(location_key))
 
     @bp.route("/api/location/<location_key>/media")
     async def location_media(location_key):
@@ -551,7 +551,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
         if request.method == "GET":
             payload = media().location_media(location_key)
             live = payload.get("live") or {"active": False, "stream_url": "", "updated_at": None}
-            normalized = _location_detail_payload(location_key)
+            normalized = await _location_detail_payload(location_key)
             return jsonify({
                 "ok": True,
                 "id": normalized.get("id") or location_key,

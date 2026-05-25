@@ -92,7 +92,9 @@ def register_core_routes(app: Quart, settings: Settings, static_dir: Path | None
     @app.get("/")
     async def index():
         try:
-            return await send_file(str(_static_file("index.html", static_dir)))
+            out = await send_file(str(_static_file("index.html", static_dir)))
+            log.info("[root] served lightweight shell")
+            return out
         except Exception as exc:
             return _static_error_response(app, "index.html", exc, static_dir)
 

@@ -7,12 +7,140 @@ import json
 import logging
 import math
 import time
+import os
+import uuid
+import asyncio
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 from quart import Blueprint, current_app, request, jsonify, send_file, websocket
 
 from server.gfs.viewport import parse_viewport_args, canonicalize_viewport
 
 log = logging.getLogger("server.gfs.routes")
+
+GFS_WORKERS = int(os.getenv("GFS_WORKERS", "2"))
+GFS_TIMEOUT_SECONDS = float(os.getenv("GFS_TIMEOUT_SECONDS", "25"))
+GFS_MAX_CONCURRENT_BUILDS = int(os.getenv("GFS_MAX_CONCURRENT_BUILDS", "2"))
+GFS_CACHE_MAX_ENTRIES = int(os.getenv("GFS_CACHE_MAX_ENTRIES", "32"))
+GFS_WEATHER_TTL_SECONDS = float(os.getenv("GFS_WEATHER_TTL_SECONDS", "15"))
+GFS_OCEAN_TTL_SECONDS = float(os.getenv("GFS_OCEAN_TTL_SECONDS", "60"))
+GFS_STALE_SECONDS = float(os.getenv("GFS_STALE_SECONDS", "180"))
+
+_GFS_EXECUTOR = ThreadPoolExecutor(max_workers=GFS_WORKERS, thread_name_prefix="gfs-worker")
+_GFS_BUILD_SEMAPHORE = asyncio.Semaphore(GFS_MAX_CONCURRENT_BUILDS)
+_inflight: dict[str, asyncio.Task] = {}
+_inflight_lock = asyncio.Lock()
+_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
+cache_hits = 0
+cache_misses = 0
+timeout_count = 0
+
+
+def _cache_get(key: str):
+    global cache_hits, cache_misses
+    entry = _cache.get(key)
+    if not entry:
+        cache_misses += 1
+        log.info("[gfs/cache] miss key=%s", key)
+        return None
+    age = time.time() - entry["ts"]
+    ttl = entry.get("ttl", GFS_OCEAN_TTL_SECONDS)
+    if age <= ttl:
+        cache_hits += 1
+        log.info("[gfs/cache] hit key=%s age=%.2f", key, age)
+        return {**entry["payload"], "cache_status": "fresh", "generated_at": entry["generated_at"]}
+    if age <= (ttl + GFS_STALE_SECONDS):
+        log.info("[gfs/cache] stale key=%s age=%.2f", key, age)
+        return {**entry["payload"], "cache_status": "stale", "generated_at": entry["generated_at"]}
+    _cache.pop(key, None)
+    cache_misses += 1
+    log.info("[gfs/cache] miss key=%s", key)
+    return None
+
+
+def _cache_put(key: str, payload: dict[str, Any], ttl: float):
+    _cache[key] = {"ts": time.time(), "payload": payload, "ttl": ttl, "generated_at": int(time.time() * 1000)}
+    _cache.move_to_end(key)
+    while len(_cache) > GFS_CACHE_MAX_ENTRIES:
+        _cache.popitem(last=False)
+
+
+async def _run_gfs_blocking(fn, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    log.info("[gfs/worker] offloaded blocking task=%s", getattr(fn, "__name__", "callable"))
+    return await loop.run_in_executor(_GFS_EXECUTOR, lambda: fn(*args, **kwargs))
+
+
+async def _singleflight(key: str, coro_factory):
+    async with _inflight_lock:
+        task = _inflight.get(key)
+        if task and not task.done():
+            log.info("[gfs/dedupe] joined in-flight key=%s", key)
+            return await task
+        task = asyncio.create_task(coro_factory())
+        _inflight[key] = task
+        log.info("[gfs/dedupe] new task key=%s", key)
+    try:
+        out = await task
+        log.info("[gfs/dedupe] complete key=%s", key)
+        return out
+    finally:
+        async with _inflight_lock:
+            if _inflight.get(key) is task:
+                _inflight.pop(key, None)
+
+
+def _norm_key(route: str, vp, extra: str = "") -> str:
+    d = vp.as_dict() if hasattr(vp, "as_dict") else dict(vp or {})
+    rounded = {k: round(float(v), 2) if isinstance(v, (int, float)) else v for k, v in d.items()}
+    return f"{route}|{json.dumps(rounded, sort_keys=True)}|{extra}"
+
+
+async def _heavy_json(route: str, vp, ttl: float, builder, *, extra_key: str = ""):
+    global timeout_count
+    request_id = uuid.uuid4().hex[:8]
+    bbox = vp.as_bbox() if hasattr(vp, "as_bbox") else "na"
+    log.info("[gfs/request] start route=%s bbox=%s request_id=%s", route, bbox, request_id)
+    started = time.time()
+    key = _norm_key(route, vp, extra_key)
+    cached = _cache_get(key)
+    if cached and cached.get("cache_status") == "fresh":
+        return jsonify(_json_safe(cached))
+
+    async def _build_once():
+        try:
+            log.info("[gfs/backpressure] waiting route=%s request_id=%s", route, request_id)
+            await asyncio.wait_for(_GFS_BUILD_SEMAPHORE.acquire(), timeout=2.0)
+            log.info("[gfs/backpressure] acquired route=%s request_id=%s", route, request_id)
+        except asyncio.TimeoutError:
+            log.warning("[gfs/backpressure] timeout route=%s request_id=%s", route, request_id)
+            stale = _cache_get(key)
+            if stale:
+                return stale, 200
+            return {"ok": False, "status": "busy", "message": "GFS busy"}, 429
+        try:
+            payload = await asyncio.wait_for(_run_gfs_blocking(builder), timeout=GFS_TIMEOUT_SECONDS)
+            payload = payload if isinstance(payload, dict) else {"ok": True, "data": payload}
+            payload.setdefault("cache_status", "miss")
+            payload.setdefault("generated_at", int(time.time() * 1000))
+            _cache_put(key, payload, ttl)
+            return payload, 200
+        except asyncio.TimeoutError:
+            timeout_count += 1
+            return {"ok": False, "status": "timeout", "message": "GFS payload timed out"}, 504
+        finally:
+            if _GFS_BUILD_SEMAPHORE.locked():
+                _GFS_BUILD_SEMAPHORE.release()
+
+    payload, status = await _singleflight(key, _build_once)
+    ms = (time.time() - started) * 1000
+    if status >= 400:
+        log.warning("[gfs/request] error route=%s ms=%.2f request_id=%s", route, ms, request_id)
+    else:
+        log.info("[gfs/request] done route=%s ms=%.2f request_id=%s", route, ms, request_id)
+    return jsonify(_json_safe(payload)), status
+
 
 
 def _json_safe(value: Any):
@@ -191,6 +319,10 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     async def api_health():
         payload = gfs().health_payload()
         payload["warm"] = gfs().warm_status()
+        payload["concurrency"] = {"executor_workers": GFS_WORKERS, "max_concurrent_builds": GFS_MAX_CONCURRENT_BUILDS, "inflight": len(_inflight), "semaphore_available": getattr(_GFS_BUILD_SEMAPHORE, "_value", None)}
+        payload["cache"] = {"entries": len(_cache), "max_entries": GFS_CACHE_MAX_ENTRIES, "hits": cache_hits, "misses": cache_misses}
+        payload["timeouts"] = timeout_count
+        payload["ttl"] = {"weather": GFS_WEATHER_TTL_SECONDS, "ocean": GFS_OCEAN_TTL_SECONDS, "stale": GFS_STALE_SECONDS}
         return jsonify(_json_safe(payload))
 
     @bp.route("/api/config")
@@ -251,7 +383,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/clouds")
     async def api_clouds():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().compact_cloud_payload(vp.as_dict()))
+        return await _heavy_json("/gfs/api/clouds", vp, GFS_WEATHER_TTL_SECONDS, lambda: gfs().compact_cloud_payload(vp.as_dict()))
 
     @bp.route("/api/bait")
     async def api_bait():
@@ -264,7 +396,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/bait/advanced")
     async def api_bait_advanced():
         vp = parse_viewport_args(request.args)
-        return jsonify(gfs().bait_from_ocean(vp.as_dict()))
+        return await _heavy_json("/gfs/api/bait-advanced", vp, GFS_OCEAN_TTL_SECONDS, lambda: gfs().bait_from_ocean(vp.as_dict()))
 
     @bp.route("/api/boats")
     async def api_boats():
@@ -313,7 +445,7 @@ def create_gfs_blueprint(static_dir: Path) -> Blueprint:
     @bp.route("/api/locations")
     async def api_locations():
         vp = parse_viewport_args(request.args)
-        payload = gfs().locations_fast(vp.as_dict(), budget_ms=1800)
+        payload = await _run_gfs_blocking(lambda: gfs().locations_fast(vp.as_dict(), budget_ms=1800))
         log.info(
             "/gfs/api/locations route=/gfs/api/locations query=%s viewport=%s source_policy=csv_only source=%s warm=%s stale=%s count=%s latency_ms=%s entity_type=%s intel_tier=%s",
             request.query_string.decode("utf-8", errors="ignore"),

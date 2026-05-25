@@ -115,6 +115,7 @@ def create_quart_app() -> Quart:
     ws_gfs_registered = "/ws/gfs" in registered_rules
     ws_gfs_legacy_registered = "/gfs/ws" in registered_rules
 
+    startup_log.info("[startup] route registration complete")
     startup_log.info(
         "startup ready framework=quart static=%s templates=%s routes=/,/broadcast,/watch,/gfs ws=/ws/watch,/ws/broadcast,/ws/chat,/ws/gfs ws_gfs_registered=%s ws_gfs_legacy_registered=%s",
         STATIC_DIR,

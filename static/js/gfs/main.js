@@ -403,7 +403,9 @@ async function refreshData(reason = 'manual') {
     const frameQuality = 'full';
     const frameStride = 1;
     const frameUrl = `/gfs/api/frame?bbox=${bboxQ}&viewport=${vpQ}&mode=live&quality=${encodeURIComponent(frameQuality)}&stride=${encodeURIComponent(frameStride)}`;
+    console.info('[gfs/frontend] steady viewport request', { layer: 'frame' });
     const frame = await getJsonSafe(frameUrl, null, { signal: controller.signal, timeoutMs: 2000, abortPrevious: true });
+    console.info('[gfs/frontend] request scheduled', { layer: 'locations' });
     fetchLocations(viewport, { timeoutMs: 1800, abortPrevious: false })
       .then((locationsPayload) => {
         if (!locationsPayload || generation !== dataState.latestGeneration) return;

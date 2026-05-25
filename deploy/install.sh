@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+WEB_CONCURRENCY=${WEB_CONCURRENCY:-2}
+GFS_WORKERS=${GFS_WORKERS:-2}
+GFS_MAX_CONCURRENT_BUILDS=${GFS_MAX_CONCURRENT_BUILDS:-2}
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOMAIN="${DOMAIN:-lftr.biz}"

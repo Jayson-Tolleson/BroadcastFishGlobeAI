@@ -139,6 +139,7 @@
     dom.video.muted = false;
     try {
       console.info('[watch/video] autoplay attempt', { reason });
+      dom.video.muted = false;
       await dom.video.play();
       showJoinOverlay(false);
       console.info('[watch/video] playing', { reason });

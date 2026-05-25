@@ -2,6 +2,9 @@
   const cfg = window.BROADCAST_CONFIG || {};
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsBase = `${wsProto}://${location.host}`;
+  const PROGRAM_WIDTH = 1280;
+  const PROGRAM_HEIGHT = 720;
+  const PROGRAM_ASPECT = PROGRAM_WIDTH / PROGRAM_HEIGHT;
 
   const dom = {
     preview: document.getElementById('preview'),
@@ -467,9 +470,10 @@
   function ensureProgramCanvas() {
     if (programCanvas) return;
     programCanvas = document.createElement('canvas');
-    programCanvas.width = 1280;
-    programCanvas.height = 720;
+    programCanvas.width = PROGRAM_WIDTH;
+    programCanvas.height = PROGRAM_HEIGHT;
     programCtx = programCanvas.getContext('2d');
+    console.info('[broadcast/program] canvas fixed size 1280x720');
   }
   function ensureProgramStream() {
     ensureProgramCanvas();
@@ -487,31 +491,59 @@
       dom.preview.playsInline = true;
       dom.preview.play?.().catch(() => {});
       console.info('[broadcast/program] preview using program stream');
+      console.info('[broadcast/program] preview aspect locked');
     }
 
     return programStream;
   }
 
+  function drawVideoContain(ctx, video, dx, dy, dw, dh) {
+    if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return false;
+
+    const sw = video.videoWidth;
+    const sh = video.videoHeight;
+    const sourceAspect = sw / sh;
+    const destAspect = dw / dh;
+
+    let renderW = dw;
+    let renderH = dh;
+    let renderX = dx;
+    let renderY = dy;
+
+    if (sourceAspect > destAspect) {
+      renderW = dw;
+      renderH = dw / sourceAspect;
+      renderY = dy + (dh - renderH) / 2;
+    } else {
+      renderH = dh;
+      renderW = dh * sourceAspect;
+      renderX = dx + (dw - renderW) / 2;
+    }
+
+    ctx.drawImage(video, renderX, renderY, renderW, renderH);
+    return true;
+  }
+
   function drawProgramFrame() {
     if (!programCtx || !programCanvas) return;
-    const stage = dom.preview?.parentElement;
-    const w = stage?.clientWidth || 1280;
-    const h = stage?.clientHeight || 720;
-    if (programCanvas.width !== w || programCanvas.height !== h) {
-      programCanvas.width = w;
-      programCanvas.height = h;
-    }
     programCtx.fillStyle = '#000';
-    programCtx.fillRect(0, 0, programCanvas.width, programCanvas.height);
+    programCtx.fillRect(0, 0, PROGRAM_WIDTH, PROGRAM_HEIGHT);
     const mainEl = state.media.screen_enabled ? screenSourceEl : camSourceEl;
     if (mainEl?.readyState >= 2) {
-      try { programCtx.drawImage(mainEl, 0, 0, programCanvas.width, programCanvas.height); } catch (_) {}
+      try {
+        drawVideoContain(programCtx, mainEl, 0, 0, PROGRAM_WIDTH, PROGRAM_HEIGHT);
+        if (state.media.screen_enabled) { if (!loggedContainScreen) { console.info('[broadcast/program] source contain draw screen'); loggedContainScreen = true; } }
+        else { if (!loggedContainCamera) { console.info('[broadcast/program] source contain draw camera'); loggedContainCamera = true; } }
+      } catch (_) {}
     }
     if (state.media.screen_enabled && pip.enabled && camSourceEl.readyState >= 2) {
       try {
         programCtx.fillStyle = 'rgba(0,0,0,0.45)';
         programCtx.fillRect(pip.x - 2, pip.y - 2, pip.w + 4, pip.h + 4);
-        programCtx.drawImage(camSourceEl, pip.x, pip.y, pip.w, pip.h);
+        drawVideoContain(programCtx, camSourceEl, pip.x, pip.y, pip.w, pip.h);
+        programCtx.strokeStyle = 'rgba(255,255,255,0.85)';
+        programCtx.lineWidth = 2;
+        programCtx.strokeRect(pip.x, pip.y, pip.w, pip.h);
       } catch (_) {}
     }
   }
@@ -988,8 +1020,8 @@
     if (!state.media.screen_enabled) return;
     const rect = dom.preview?.getBoundingClientRect();
     if (!rect || !programCanvas) return;
-    const scaleX = programCanvas.width / rect.width;
-    const scaleY = programCanvas.height / rect.height;
+    const scaleX = PROGRAM_WIDTH / rect.width;
+    const scaleY = PROGRAM_HEIGHT / rect.height;
     const x = ((ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left) * scaleX;
     const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
     const inside = x >= pip.x && x <= (pip.x + pip.w) && y >= pip.y && y <= (pip.y + pip.h);
@@ -1003,12 +1035,12 @@
     if (!pip.dragging) return;
     const rect = dom.preview?.getBoundingClientRect();
     if (!rect || !programCanvas) return;
-    const scaleX = programCanvas.width / rect.width;
-    const scaleY = programCanvas.height / rect.height;
+    const scaleX = PROGRAM_WIDTH / rect.width;
+    const scaleY = PROGRAM_HEIGHT / rect.height;
     const x = ((ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left) * scaleX;
     const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
-    pip.x = Math.max(0, Math.min((programCanvas.width - pip.w), x - pip.dragDx));
-    pip.y = Math.max(0, Math.min((programCanvas.height - pip.h), y - pip.dragDy));
+    pip.x = Math.max(0, Math.min((PROGRAM_WIDTH - pip.w), x - pip.dragDx));
+    pip.y = Math.max(0, Math.min((PROGRAM_HEIGHT - pip.h), y - pip.dragDy));
     console.info('[broadcast/pip] moved', { x: pip.x, y: pip.y });
   };
   const pointerUp = () => {

@@ -328,8 +328,19 @@
 
   async function openCameraMode(mode) {
     if (mode.kind === 'facing') {
-      console.info(`[broadcast/camera] switching to facing=${mode.facingMode}`);
-      return requestCameraStream({ facingMode: { ideal: mode.facingMode } });
+      try {
+        if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user exact');
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment exact');
+        const exactStream = await requestCameraStream({ facingMode: { exact: mode.facingMode } });
+        console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'exact' });
+        return exactStream;
+      } catch (_) {
+        if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user ideal');
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment ideal');
+        const idealStream = await requestCameraStream({ facingMode: { ideal: mode.facingMode } });
+        console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'ideal' });
+        return idealStream;
+      }
     }
     console.info(`[broadcast/camera] switching to deviceId=${mode.deviceId}`);
     try {
@@ -367,7 +378,7 @@
     }
     if (!stream) throw lastErr || new Error('camera unavailable');
     state.camStream = stream;
-    if (dom.preview && !state.media.screen_enabled) dom.preview.srcObject = state.camStream;
+    ensureProgramStream();
     const track = state.camStream.getVideoTracks()[0];
     camSourceEl.srcObject = state.camStream;
     camSourceEl.play().catch(() => {});
@@ -447,7 +458,7 @@
       console.info('[broadcast/pip] disabled');
       switchToCamera().catch(() => announceState());
     }));
-    if (dom.preview) dom.preview.srcObject = state.screenStream;
+    ensureProgramStream();
     screenSourceEl.srcObject = state.screenStream;
     screenSourceEl.play().catch(() => {});
     return state.screenStream;
@@ -459,6 +470,26 @@
     programCanvas.width = 1280;
     programCanvas.height = 720;
     programCtx = programCanvas.getContext('2d');
+  }
+  function ensureProgramStream() {
+    ensureProgramCanvas();
+    startProgramLoop();
+
+    if (!programStream) {
+      programStream = programCanvas.captureStream(30);
+      programVideoTrack = programStream.getVideoTracks()[0] || null;
+      console.info('[broadcast/program] stream ready');
+    }
+
+    if (dom.preview && dom.preview.srcObject !== programStream) {
+      dom.preview.srcObject = programStream;
+      dom.preview.muted = true;
+      dom.preview.playsInline = true;
+      dom.preview.play?.().catch(() => {});
+      console.info('[broadcast/program] preview using program stream');
+    }
+
+    return programStream;
   }
 
   function drawProgramFrame() {
@@ -512,8 +543,14 @@
     pc.onconnectionstatechange = () => dom.stPc && (dom.stPc.textContent = pc.connectionState);
     pc.oniceconnectionstatechange = () => dom.stIce && (dom.stIce.textContent = pc.iceConnectionState);
     if (viewerId) {
-      const stream = state.media.screen_enabled ? state.screenStream : state.camStream;
-      (stream?.getTracks?.() || []).forEach((track) => pc.addTrack(track, stream));
+      const ps = ensureProgramStream();
+      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+      if (vtrack) pc.addTrack(vtrack, ps);
+      if (state.media.mic_enabled) {
+        const atrack = state.camStream?.getAudioTracks?.()[0] || null;
+        if (atrack) pc.addTrack(atrack, state.camStream);
+      }
+      console.info('[broadcast/program] sender using program video track');
     }
     return pc;
   }
@@ -550,18 +587,14 @@
     startProgramLoop();
     if (state.media.screen_enabled) {
       const screen = await startScreenStream();
-      if (!programStream) {
-        programStream = programCanvas.captureStream(30);
-        programVideoTrack = programStream.getVideoTracks()[0] || null;
-      }
-      await replaceOutgoingVideoTrack(programVideoTrack || screen.getVideoTracks()[0] || null);
+      const ps = ensureProgramStream();
+      await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || screen.getVideoTracks()[0] || null);
+      console.info('[broadcast/program] sender using program video track');
     } else {
       const cam = await startCameraStream();
-      if (!programStream) {
-        programStream = programCanvas.captureStream(30);
-        programVideoTrack = programStream.getVideoTracks()[0] || null;
-      }
-      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (programVideoTrack || cam.getVideoTracks()[0] || null) : null);
+      const ps = ensureProgramStream();
+      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (programVideoTrack || ps.getVideoTracks()[0] || cam.getVideoTracks()[0] || null) : null);
+      console.info('[broadcast/program] sender using program video track');
     }
     if (state.media.mic_enabled) {
       const cam = await startCameraStream();
@@ -589,7 +622,7 @@
       state.screenStream = null;
     }
     await syncTracks();
-    if (dom.preview && state.camStream) dom.preview.srcObject = state.camStream;
+    ensureProgramStream();
     console.info('[broadcast/screen] switched back to camera mode');
     announceState();
   }
@@ -633,11 +666,12 @@
   }
 
   function currentProgramStream() {
-    if (!programCanvas) return null;
-    const stream = programCanvas.captureStream(30);
-    const tracks = [...stream.getVideoTracks()];
+    const ps = ensureProgramStream();
+    const tracks = [];
+    const videoTrack = programVideoTrack || ps.getVideoTracks()[0];
+    if (videoTrack) tracks.push(videoTrack);
     const audioTrack = state.camStream?.getAudioTracks?.()[0];
-    if (audioTrack) tracks.push(audioTrack.clone());
+    if (audioTrack) tracks.push(audioTrack);
     return tracks.length ? new MediaStream(tracks) : null;
   }
 
@@ -669,7 +703,7 @@
     recordingMedia.onstop = async () => {
       const blob = new Blob(recordingChunks, { type: 'video/webm' });
       recordingChunks = [];
-      recordingStream?.getTracks().forEach((t) => t.stop());
+      recordingStream?.getAudioTracks?.().forEach((t) => t.stop());
       recordingStream = null;
       const filename = timestampedRecordingName();
       const href = URL.createObjectURL(blob);
@@ -952,25 +986,29 @@
   dom.rtmpBtn?.addEventListener('click', () => { toggleRtmp().catch(() => {}); });
   const pointerDown = (ev) => {
     if (!state.media.screen_enabled) return;
-    const stage = dom.preview?.parentElement?.getBoundingClientRect();
-    if (!stage) return;
-    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - stage.left;
-    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - stage.top;
+    const rect = dom.preview?.getBoundingClientRect();
+    if (!rect || !programCanvas) return;
+    const scaleX = programCanvas.width / rect.width;
+    const scaleY = programCanvas.height / rect.height;
+    const x = ((ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left) * scaleX;
+    const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
     const inside = x >= pip.x && x <= (pip.x + pip.w) && y >= pip.y && y <= (pip.y + pip.h);
     if (!inside) return;
     pip.dragging = true;
-    pip.dragOffsetX = x - pip.x;
-    pip.dragOffsetY = y - pip.y;
+    pip.dragDx = x - pip.x;
+    pip.dragDy = y - pip.y;
     console.info('[broadcast/pip] drag start');
   };
   const pointerMove = (ev) => {
     if (!pip.dragging) return;
-    const stage = dom.preview?.parentElement?.getBoundingClientRect();
-    if (!stage) return;
-    const x = (ev.clientX ?? ev.touches?.[0]?.clientX) - stage.left;
-    const y = (ev.clientY ?? ev.touches?.[0]?.clientY) - stage.top;
-    pip.x = Math.max(0, Math.min((stage.width - pip.w), x - pip.dragOffsetX));
-    pip.y = Math.max(0, Math.min((stage.height - pip.h), y - pip.dragOffsetY));
+    const rect = dom.preview?.getBoundingClientRect();
+    if (!rect || !programCanvas) return;
+    const scaleX = programCanvas.width / rect.width;
+    const scaleY = programCanvas.height / rect.height;
+    const x = ((ev.clientX ?? ev.touches?.[0]?.clientX) - rect.left) * scaleX;
+    const y = ((ev.clientY ?? ev.touches?.[0]?.clientY) - rect.top) * scaleY;
+    pip.x = Math.max(0, Math.min((programCanvas.width - pip.w), x - pip.dragDx));
+    pip.y = Math.max(0, Math.min((programCanvas.height - pip.h), y - pip.dragDy));
     console.info('[broadcast/pip] moved', { x: pip.x, y: pip.y });
   };
   const pointerUp = () => {
@@ -981,6 +1019,10 @@
   dom.preview?.addEventListener('pointerdown', pointerDown);
   window.addEventListener('pointermove', pointerMove, { passive: true });
   window.addEventListener('pointerup', pointerUp, { passive: true });
+  dom.preview?.addEventListener('pointercancel', pointerUp);
+  window.addEventListener('mousedown', pointerDown, { passive: true });
+  window.addEventListener('mousemove', pointerMove, { passive: true });
+  window.addEventListener('mouseup', pointerUp, { passive: true });
   dom.preview?.addEventListener('touchstart', pointerDown, { passive: true });
   window.addEventListener('touchmove', pointerMove, { passive: true });
   window.addEventListener('touchend', pointerUp, { passive: true });
@@ -995,7 +1037,7 @@
     if (dom.chatCollapseBtn) dom.chatCollapseBtn.textContent = 'Expand';
   }
   applyRoomState({ settings: state.media, runtime: { broadcaster_present: false, viewer_count: 0 } });
-  startProgramLoop();
+  ensureProgramStream();
   installWakeLock();
   connectChat();
   connectSignal();

@@ -343,6 +343,7 @@ class RTCManager:
         return True
 
     async def start_viewer_offer(self, room_id: str, sid: str) -> Dict[str, str]:
+        log.info("viewer offer requested room=%s sid=%s", room_id, sid)
         prev = self.viewers.get(room_id, {}).get(sid)
         cached = self._viewer_offer_cache.get((room_id, sid))
         if prev and self._viewer_offer_cache_valid(room_id, sid, prev, cached or {}):
@@ -379,24 +380,31 @@ class RTCManager:
                 self._viewer_offer_cache.pop((room_id, sid), None)
                 await self.stop_viewer(room_id, sid)
 
-        if not self.has_live_source(room_id):
-            log.info("viewer offer rejected no live source room=%s sid=%s", room_id, sid)
-            try:
-                await pc.close()
-            except Exception:
-                pass
-            self.viewers.get(room_id, {}).pop(sid, None)
-            room.viewers.pop(sid, None)
-            raise StreamOfflineError("stream_offline")
+        if not self.has_live_video_source(room_id):
+            log.info("viewer offer waiting_for_video room=%s sid=%s", room_id, sid)
+            if not await self.wait_for_live_video_source(room_id, timeout_s=2.5):
+                log.info("viewer offer rejected reason=video_not_ready room=%s sid=%s", room_id, sid)
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+                self.viewers.get(room_id, {}).pop(sid, None)
+                room.viewers.pop(sid, None)
+                raise StreamOfflineError("video_not_ready")
 
         session = self.broadcasters.get(room_id)
         source_video = self.live_video_source.get(room_id) or (session.tracks.get("video") if session else None)
         source_audio = self.live_audio_source.get(room_id) or (session.tracks.get("audio") if session else None)
-        if source_video:
-            try:
-                pc.addTrack(self.relay.subscribe(source_video))
-            except Exception:
-                log.exception("failed to add relayed video track")
+        if not source_video:
+            log.info("viewer offer rejected reason=video_not_ready room=%s sid=%s", room_id, sid)
+            await pc.close()
+            self.viewers.get(room_id, {}).pop(sid, None)
+            room.viewers.pop(sid, None)
+            raise StreamOfflineError("video_not_ready")
+        try:
+            pc.addTrack(self.relay.subscribe(source_video))
+        except Exception:
+            log.exception("failed to add relayed video track")
         if source_audio:
             try:
                 pc.addTrack(self.relay.subscribe(source_audio))

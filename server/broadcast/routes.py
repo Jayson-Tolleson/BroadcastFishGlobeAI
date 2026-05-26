@@ -630,12 +630,15 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                     if offer_outstanding:
                         log.debug("watch request_stream ignored room=%s client=%s reason=offer_outstanding", room_id, client_id)
                         continue
-                    if watcher_state == "peer_active":
+                    if watcher_state == "peer_active" and not bool(data.get("force")):
                         log.debug("watch request_stream ignored room=%s client=%s reason=peer_active", room_id, client_id)
                         continue
-                    log.info("watch request_stream room=%s client=%s", room_id, client_id)
+                    log.info("watch request_stream room=%s client=%s force=%s reason=%s", room_id, client_id, bool(data.get("force")), data.get("reason"))
                     _set_state("request_pending", "request_stream")
                     room = state.ensure_room(room_id)
+                    if bool(data.get("force")) and rtc is not None:
+                        log.info("watch renegotiate reason=%s room=%s client=%s", data.get("reason"), room_id, client_id)
+                        await rtc.stop_viewer(room_id, client_id)
                     if room.broadcaster_sid is None:
                         offer_outstanding = False
                         offer_started_at = 0.0
@@ -643,6 +646,9 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
                         await _send_waiting_no_broadcaster(room_id, client_id)
                         continue
+                    if bool(data.get("force")) and rtc is not None:
+                        log.info("watch renegotiate reason=%s room=%s client=%s", data.get("reason"), room_id, client_id)
+                        await rtc.stop_viewer(room_id, client_id)
                     if rtc is None:
                         _set_state("waiting_for_broadcaster", "rtc_unavailable")
                         await ws.send_json({"type": "error", "room": room_id, "message": "rtc_unavailable", "ts": now_ms()})

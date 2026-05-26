@@ -257,6 +257,8 @@
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
       if (present) requestStream(true);
+      sendJson('request_stream', { force: true, reason: 'missing_video' });
+          if (!hasVideo) sendJson('request_stream', { force: true, reason: 'missing_video' });
       return;
     }
     if (msg.type === 'presence') {
@@ -368,6 +370,7 @@
         if (!hasVideo || !pc || pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
           setStandby(true, hasVideo ? 'Reconnecting stream…' : 'audio-only: waiting for video track');
           requestStream(true);
+          sendJson('request_stream', { force: true, reason: 'missing_video' });
         }
       }, 2500);
     };

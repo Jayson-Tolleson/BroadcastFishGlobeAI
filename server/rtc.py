@@ -86,6 +86,16 @@ class RTCManager:
             return False
         return bool(session.tracks.get("video") or session.tracks.get("audio"))
 
+    async def wait_for_live_source(self, room_id: str, timeout_s: float = 2.0) -> bool:
+        if self.has_live_source(room_id):
+            return True
+        ev = self._room_live_event(room_id)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return self.has_live_source(room_id)
+        return self.has_live_source(room_id)
+
     def _new_peer_connection(self) -> RTCPeerConnection:
         if RTCConfiguration is None or RTCBundlePolicy is None:
             return RTCPeerConnection()

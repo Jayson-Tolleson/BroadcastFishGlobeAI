@@ -599,8 +599,12 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                             _set_state("waiting_for_broadcaster", "rtc_unavailable")
                             await ws.send_json({"type": "error", "room": room_id, "message": "rtc_unavailable", "ts": now_ms()})
                         elif not _room_has_live_source(room_id):
-                            _set_state("waiting_for_broadcaster", "stream_offline")
-                            await _send_waiting_stream_offline(room_id, client_id)
+                            if rtc is not None and await rtc.wait_for_live_source(room_id, timeout_s=2.0):
+                                _set_state("request_pending", "join_wait_live_then_offer")
+                                await _send_offer(room_id, client_id)
+                            else:
+                                _set_state("waiting_for_broadcaster", "stream_offline")
+                                await _send_waiting_stream_offline(room_id, client_id)
                         elif not offer_outstanding:
                             log.info("watch signaling started room=%s client=%s", room_id, client_id)
                             try:
@@ -642,11 +646,14 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         _set_state("waiting_for_broadcaster", "rtc_unavailable")
                         await ws.send_json({"type": "error", "room": room_id, "message": "rtc_unavailable", "ts": now_ms()})
                     elif not _room_has_live_source(room_id):
-                        offer_outstanding = False
-                        offer_started_at = 0.0
-                        _set_state("waiting_for_broadcaster", "stream_offline")
-                        next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
-                        await _send_waiting_stream_offline(room_id, client_id)
+                        if rtc is not None and await rtc.wait_for_live_source(room_id, timeout_s=2.0):
+                            await _send_offer(room_id, client_id)
+                        else:
+                            offer_outstanding = False
+                            offer_started_at = 0.0
+                            _set_state("waiting_for_broadcaster", "stream_offline")
+                            next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
+                            await _send_waiting_stream_offline(room_id, client_id)
                     else:
                         try:
                             await _send_offer(room_id, client_id)

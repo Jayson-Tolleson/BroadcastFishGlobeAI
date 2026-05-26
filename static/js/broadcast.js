@@ -663,6 +663,15 @@
         if (atrack) pc.addTrack(atrack, state.camStream);
       }
       console.info('[broadcast/program] sender using program video track');
+    } else {
+      const ps = ensureProgramStream();
+      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+      if (vtrack) pc.addTrack(vtrack, ps);
+      if (state.media.mic_enabled) {
+        const atrack = state.camStream?.getAudioTracks?.()[0] || null;
+        if (atrack && state.camStream) pc.addTrack(atrack, state.camStream);
+      }
+      console.info('[broadcast/webrtc] outbound tracks video=%s audio=%s', !!vtrack, !!state.camStream?.getAudioTracks?.()[0]);
     }
     return pc;
   }
@@ -682,16 +691,20 @@
   }
 
   async function replaceOutgoingVideoTrack(newTrack) {
-    for (const pc of Object.values(state.peerConnections)) {
+    const peers = [state.pc, ...Object.values(state.peerConnections)].filter(Boolean);
+    for (const pc of peers) {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
       if (sender) await sender.replaceTrack(newTrack || null);
+      else if (newTrack) pc.addTrack(newTrack, ensureProgramStream());
     }
   }
 
   async function replaceOutgoingAudioTrack(newTrack) {
-    for (const pc of Object.values(state.peerConnections)) {
+    const peers = [state.pc, ...Object.values(state.peerConnections)].filter(Boolean);
+    for (const pc of peers) {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
       if (sender) await sender.replaceTrack(newTrack || null);
+      else if (newTrack && state.camStream) pc.addTrack(newTrack, state.camStream);
     }
   }
 
@@ -974,28 +987,23 @@
       signalRetryMs = 1200;
       sendJson(ws, 'join', { role: 'broadcaster' });
       await syncTracks();
+      const pc = await ensurePeerConnection();
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sendJson(ws, 'webrtc_offer', { sdp: offer.sdp, type: offer.type });
+      console.info('[broadcast/webrtc] broadcaster offer sent');
       sendJson(ws, 'media_ready');
     };
     ws.onmessage = async (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === 'viewer_joined' && msg.viewerId) {
-        await createOfferForViewer(msg.viewerId);
-      }
-      if (msg.type === 'viewer_left' && msg.viewerId) {
-        removeViewerPeer(msg.viewerId);
-      }
-      if (msg.type === 'answer' && msg.viewerId && msg.payload?.sdp) {
-        const pc = state.peerConnections[msg.viewerId];
-        if (pc) await pc.setRemoteDescription({ type: msg.payload.type || 'answer', sdp: msg.payload.sdp });
-      }
       if (msg.type === 'webrtc_answer' && msg.sdp && state.pc) {
         await state.pc.setRemoteDescription({ type: msg.answerType || 'answer', sdp: msg.sdp });
+        console.info('[broadcast/webrtc] broadcaster answer applied');
       }
       if (msg.type === 'presence') applyPresence(msg);
       if (msg.type === 'state_sync' || msg.type === 'state_update') applyRoomState(msg.state || {});
     };
     ws.onclose = () => {
-      Object.keys(state.peerConnections).forEach(removeViewerPeer);
       setTimeout(connectSignal, signalRetryMs);
       signalRetryMs = Math.min(15000, Math.round(signalRetryMs * 1.7));
     };

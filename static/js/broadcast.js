@@ -84,11 +84,11 @@
     room: cfg.room || new URLSearchParams(location.search).get('room') || 'default',
     clientId: `b-${Math.random().toString(36).slice(2, 10)}`,
     pc: null,
-    peerConnections: {},
     chatWs: null,
     signalWs: null,
     camStream: null,
     screenStream: null,
+    micStream: null,
     speechCtx: null,
     speechSource: null,
     speechProcessor: null,
@@ -367,16 +367,7 @@
   }
 
   async function requestCameraStream(videoConstraints) {
-    return navigator.mediaDevices.getUserMedia({
-      video: videoConstraints,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-        sampleRate: 48000,
-      },
-    });
+    return navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
   }
 
   function audioConstraints() {
@@ -389,6 +380,29 @@
     };
   }
 
+
+
+  async function startMicStream() {
+    if (state.micStream?.getAudioTracks?.()[0]?.readyState === 'live') return state.micStream;
+    state.micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints(), video: false });
+    console.info('[broadcast/media] mic acquired');
+    if (state.media.stt_enabled && state.chatWs?.readyState === WebSocket.OPEN) {
+      await startSpeechCaptureFromMic().catch(() => {});
+    }
+    return state.micStream;
+  }
+
+  async function stopMicStream() {
+    stopSpeechCapture();
+    state.micStream?.getTracks?.().forEach((t) => t.stop());
+    state.micStream = null;
+    await replaceOutgoingAudioTrack(null);
+    console.info('[broadcast/media] mic stopped');
+  }
+
+  function currentMicTrack() {
+    return state.micStream?.getAudioTracks?.()[0] || null;
+  }
   async function buildCameraModes() {
     const inputs = await refreshVideoInputs();
     const facingModes = [
@@ -638,58 +652,31 @@
     programLoopHandle = requestAnimationFrame(tick);
   }
 
-  async function ensurePeerConnection(viewerId = null) {
-    if (!viewerId && state.pc) return state.pc;
-    if (viewerId && state.peerConnections[viewerId]) return state.peerConnections[viewerId];
+  async function ensurePeerConnection() {
+    if (state.pc) return state.pc;
     const iceCfg = await fetch(cfg.iceConfigUrl || '/webrtc/ice-config').then((r) => r.json()).catch(() => ({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }));
     const pc = new RTCPeerConnection({ iceServers: iceCfg.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }] });
-    if (viewerId) state.peerConnections[viewerId] = pc;
-    else state.pc = pc;
+    state.pc = pc;
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
       sendJson(state.signalWs, 'webrtc_ice', { candidate: e.candidate });
     };
     pc.onconnectionstatechange = () => dom.stPc && (dom.stPc.textContent = pc.connectionState);
     pc.oniceconnectionstatechange = () => dom.stIce && (dom.stIce.textContent = pc.iceConnectionState);
-    if (viewerId) {
-      const ps = ensureProgramStream();
-      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
-      if (vtrack) pc.addTrack(vtrack, ps);
-      if (state.media.mic_enabled) {
-        const atrack = state.camStream?.getAudioTracks?.()[0] || null;
-        if (atrack) pc.addTrack(atrack, state.camStream);
-      }
-      console.info('[broadcast/program] sender using program video track');
-    } else {
-      const ps = ensureProgramStream();
-      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
-      if (vtrack) pc.addTrack(vtrack, ps);
-      if (state.media.mic_enabled) {
-        const atrack = state.camStream?.getAudioTracks?.()[0] || null;
-        if (atrack && state.camStream) pc.addTrack(atrack, state.camStream);
-      }
-      console.info('[broadcast/webrtc] outbound tracks video=%s audio=%s', !!vtrack, !!state.camStream?.getAudioTracks?.()[0]);
-    }
+    const ps = ensureProgramStream();
+    const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+    const atrack = currentMicTrack();
+    if (vtrack) pc.addTrack(vtrack, ps);
+    if (atrack && state.micStream) pc.addTrack(atrack, state.micStream);
+    console.info('[broadcast/webrtc] outbound tracks video=%s audio=%s', !!vtrack, !!atrack);
     return pc;
   }
 
-  async function createOfferForViewer_DISABLED(viewerId) {
-    const pc = await ensurePeerConnection(viewerId);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendJson(state.signalWs, 'offer', { viewerId, sdp: offer.sdp, type: offer.type });
-  }
-
-  function removeViewerPeer_DISABLED(viewerId) {
-    const pc = state.peerConnections[viewerId];
-    if (!pc) return;
-    try { pc.close(); } catch (_) {}
-    delete state.peerConnections[viewerId];
-  }
 
   async function replaceOutgoingVideoTrack(newTrack) {
-    const peers = [state.pc, ...Object.values(state.peerConnections)].filter(Boolean);
-    for (const pc of peers) {
+    const pc = state.pc;
+    if (!pc) return;
+    {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
       if (sender) await sender.replaceTrack(newTrack || null);
       else if (newTrack) pc.addTrack(newTrack, ensureProgramStream());
@@ -697,11 +684,12 @@
   }
 
   async function replaceOutgoingAudioTrack(newTrack) {
-    const peers = [state.pc, ...Object.values(state.peerConnections)].filter(Boolean);
-    for (const pc of peers) {
+    const pc = state.pc;
+    if (!pc) return;
+    {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
       if (sender) await sender.replaceTrack(newTrack || null);
-      else if (newTrack && state.camStream) pc.addTrack(newTrack, state.camStream);
+      else if (newTrack && state.micStream) pc.addTrack(newTrack, state.micStream);
     }
   }
 
@@ -719,8 +707,8 @@
       console.info('[broadcast/program] sender using program video track');
     }
     if (state.media.mic_enabled) {
-      const cam = await startCameraStream();
-      await replaceOutgoingAudioTrack(cam.getAudioTracks()[0] || null);
+      const mic = await startMicStream();
+      await replaceOutgoingAudioTrack(mic.getAudioTracks()[0] || null);
     } else {
       await replaceOutgoingAudioTrack(null);
     }
@@ -796,7 +784,7 @@
     const tracks = [];
     const videoTrack = programVideoTrack || ps.getVideoTracks()[0];
     if (videoTrack) tracks.push(videoTrack);
-    const audioTrack = state.camStream?.getAudioTracks?.()[0];
+    const audioTrack = currentMicTrack();
     if (audioTrack) tracks.push(audioTrack);
     return tracks.length ? new MediaStream(tracks) : null;
   }
@@ -864,10 +852,14 @@
   }
 
   function sendAudioChunk(b64, sampleRate) {
+    const durationMs = 200;
     sendJson(state.chatWs, 'audio_chunk', {
       encoding: 'linear16',
       channels: STT_TARGET_CHANNELS,
       sampleRate,
+      seq: ++sttChunkSeq,
+      startedAt: Date.now(),
+      durationMs,
       data: b64,
     });
   }
@@ -916,8 +908,8 @@
   async function startSpeechCaptureFromMic() {
     stopSpeechCapture();
     if (!state.media.stt_enabled || !state.media.mic_enabled) return;
-    const cam = await startCameraStream();
-    const track = cam.getAudioTracks()[0];
+    const mic = await startMicStream();
+    const track = mic.getAudioTracks()[0];
     if (!track) return;
 
     const sttStream = new MediaStream([track.clone()]);
@@ -931,8 +923,7 @@
     processor.onaudioprocess = (event) => {
     if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) return;
       const now = Date.now();
-      sttFrameModulo = (sttFrameModulo + 1) % 3;
-      if (sttFrameModulo !== 0 || (now - lastSttSentAt) < 120) return;
+      if ((now - lastSttSentAt) < 180) return;
       const input = event.inputBuffer.getChannelData(0);
       const reduced = downsampleBuffer(input, ctx.sampleRate, STT_TARGET_SAMPLE_RATE);
       const pcm = floatToInt16(reduced);
@@ -1071,6 +1062,7 @@
   });
   bindDoubleTap(dom.micBtn, async () => {
     state.media.mic_enabled = !state.media.mic_enabled;
+    if (state.media.mic_enabled) await startMicStream(); else await stopMicStream();
     await syncTracks();
     if (state.media.mic_enabled && state.media.stt_enabled) await startSpeechCaptureFromMic();
     else stopSpeechCapture();
@@ -1148,5 +1140,5 @@
   connectSignal();
 
   // Best effort startup: UI stays ON even if browser prompts for permissions first.
-  startCameraStream().then(refreshVideoInputs).then(syncTracks).then(() => { announceState(); startSpeechCaptureFromMic().catch(() => {}); }).catch(() => announceState());
+  Promise.all([startCameraStream(), startMicStream()]).then(refreshVideoInputs).then(syncTracks).then(() => { announceState(); startSpeechCaptureFromMic().catch(() => {}); }).catch(() => announceState());
 })();

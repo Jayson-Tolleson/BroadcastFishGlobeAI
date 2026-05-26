@@ -31,6 +31,7 @@ RECORDINGS_DIR = Path(__file__).resolve().parents[2] / "uploads" / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 _LAST_STT_FINAL: dict[tuple[str, str], tuple[str, float]] = {}
 _LAST_AI_INPUT: dict[tuple[str, str], tuple[str, float]] = {}
+_STT_BUFFER: dict[tuple[str,str], list[tuple[bytes,int,int]]] = {}
 _DEDUP_WINDOW_S = 3.5
 
 
@@ -305,6 +306,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
 
                     try:
                         parsed = decode_audio_chunk_payload(data)
+                        log.info("[server/stt] received chunk room=%s client=%s seq=%s bytes=%s durationMs=%s", room_id, client_id, parsed.seq, len(parsed.audio_bytes), parsed.duration_ms)
                         if not stt_contract_logged:
                             stt_contract_logged = True
                             log.info(
@@ -327,17 +329,19 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                     if not callable(transcribe_fn):
                         log.warning("transcribe_track missing room=%s client=%s", room_id, client_id)
                         continue
-
+                    key=(room_id,client_id)
+                    buf=_STT_BUFFER.setdefault(key,[])
+                    buf.append((parsed.audio_bytes, parsed.seq or 0, parsed.duration_ms or 200))
+                    total_ms=sum(x[2] for x in buf)
+                    if total_ms < 1200:
+                        continue
+                    chunks=[x[0] for x in buf]
+                    seq_start=buf[0][1]; seq_end=buf[-1][1]
+                    total_bytes=sum(len(x[0]) for x in buf)
+                    log.info("[server/stt] flush utterance room=%s client=%s chunks=%s bytes=%s durationMs=%s seq=%s-%s", room_id, client_id, len(buf), total_bytes, total_ms, seq_start, seq_end)
+                    _STT_BUFFER[key]=[]
                     try:
-                        text = str(
-                            await transcribe_fn(
-                                [parsed.audio_bytes],
-                                sample_rate_hz=parsed.sample_rate_hz,
-                                channels=parsed.channels,
-                                encoding=parsed.encoding,
-                            )
-                            or ""
-                        ).strip()
+                        text = str(await transcribe_fn(chunks, sample_rate_hz=parsed.sample_rate_hz, channels=parsed.channels, encoding=parsed.encoding) or "").strip()
                         stt_failures = 0
                     except ValueError as exc:
                         stt_failures = STT_FAILURE_THRESHOLD
@@ -353,6 +357,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         continue
 
                     if text:
+                        log.info("[server/stt] transcript text=%r", text)
                         await _handle_chat_text(state, room_id, client_id, role, text, source="stt")
         finally:
             if joined:
@@ -527,8 +532,6 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
         if room.broadcaster_sid is None:
             _set_state("waiting_for_broadcaster", "auto_no_broadcaster")
             await _send_waiting_no_broadcaster(room_id, client_id)
-        elif await _route_to_broadcaster(room_id, {"type": "viewer_joined", "room": room_id, "viewerId": client_id, "ts": now_ms()}):
-            _set_state("request_pending", "auto_viewer_joined")
         elif rtc is not None and _room_has_live_source(room_id):
             _set_state("request_pending", "auto_request_stream")
             try:
@@ -634,9 +637,6 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         _set_state("waiting_for_broadcaster", "no_broadcaster")
                         next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
                         await _send_waiting_no_broadcaster(room_id, client_id)
-                        continue
-                    if await _route_to_broadcaster(room_id, {"type": "viewer_joined", "room": room_id, "viewerId": client_id, "ts": now_ms()}):
-                        log.info("watcher resumed room=%s client=%s via viewer_joined", room_id, client_id)
                         continue
                     if rtc is None:
                         _set_state("waiting_for_broadcaster", "rtc_unavailable")

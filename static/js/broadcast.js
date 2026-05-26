@@ -177,7 +177,7 @@
       setTxt('camTxt', 'CAM: off');
     }
     setLed(document.getElementById('screenLed'), !!state.media.screen_enabled);
-    setTxt('screenTxt', `SCREEN: ${state.media.screen_enabled ? 'on' : 'off'}`);
+    setTxt('screenTxt', `SCREEN+CAM: ${state.media.screen_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('micLed'), !!state.media.mic_enabled);
     setTxt('micTxt', `MIC: ${state.media.mic_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('sttLed'), !!state.media.stt_enabled);
@@ -494,36 +494,38 @@
       announceState();
       return;
     }
-    if (isTouchLikeDevice()) {
-      const nextFacing = preferredFacingMode === 'user' ? 'environment' : 'user';
-      preferredFacingMode = nextFacing;
-      selectedVideoDeviceId = '';
-      state.media.camera_enabled = true;
-      const old = state.camStream;
-      state.camStream = null;
-      try {
-        await syncTracks();
-        old?.getTracks?.().forEach((t) => t.stop());
-        announceState();
-        console.info('[broadcast/camera] switched facing mode', { facingMode: preferredFacingMode });
-        return;
-      } catch (err) {
-        console.warn('[broadcast/camera] facing switch failed, falling back to device cycle', { message: err?.message || String(err) });
-        if (old) state.camStream = old;
-      }
-    }
-    const idx = inputs.findIndex((d) => d.deviceId === selectedVideoDeviceId);
-    cameraCycleIndex = idx >= 0 ? idx : cameraCycleIndex;
-    cameraCycleIndex = (cameraCycleIndex + 1) % inputs.length;
-    selectedVideoDeviceId = inputs[cameraCycleIndex].deviceId;
-    state.media.camera_enabled = true;
+    const modes = await buildCameraModes();
+    if (!modes.length) return;
+    const activeTrack = state.camStream?.getVideoTracks?.()[0];
+    const activeSettings = activeTrack?.getSettings?.() || {};
+    const activeFacing = activeSettings.facingMode;
+    const activeDeviceId = activeSettings.deviceId || selectedVideoDeviceId;
+    let activeIdx = modes.findIndex((m) => m.kind === 'device' && activeDeviceId && m.deviceId === activeDeviceId);
+    if (activeIdx < 0) activeIdx = modes.findIndex((m) => m.kind === 'facing' && activeFacing && m.facingMode === activeFacing);
+    if (activeIdx < 0) activeIdx = cameraModeIndex;
+    cameraModeIndex = ((activeIdx >= 0 ? activeIdx : -1) + 1) % modes.length;
+    const target = modes[cameraModeIndex];
     const old = state.camStream;
+    state.media.camera_enabled = true;
     state.camStream = null;
-    await syncTracks();
-    old?.getTracks?.().forEach((t) => t.stop());
-    updateCameraLabel(inputs[cameraCycleIndex].label || `camera ${cameraCycleIndex + 1}`);
-    console.info('[broadcast/camera] cycled device', { deviceId: selectedVideoDeviceId, label: inputs[cameraCycleIndex].label || '' });
-    announceState();
+    try {
+      const next = await openCameraMode(target);
+      state.camStream = next;
+      camSourceEl.srcObject = next;
+      camSourceEl.play().catch(() => {});
+      const track = next.getVideoTracks()[0];
+      const settings = track?.getSettings?.() || {};
+      selectedVideoDeviceId = settings.deviceId || selectedVideoDeviceId;
+      if (settings.facingMode === 'environment' || settings.facingMode === 'user') preferredFacingMode = settings.facingMode;
+      await syncTracks();
+      old?.getTracks?.().forEach((t) => t.stop());
+      updateCameraLabel(track?.label || target.label || `camera ${cameraModeIndex + 1}`);
+      announceState();
+      console.info('[broadcast/camera] cycled mode', { target, deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
+    } catch (err) {
+      if (old) state.camStream = old;
+      console.warn('[broadcast/camera] mode cycle failed', { message: err?.message || String(err), target });
+    }
   }
 
   async function startScreenStream() {

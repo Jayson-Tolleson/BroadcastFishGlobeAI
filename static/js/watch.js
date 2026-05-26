@@ -126,11 +126,12 @@
   }
 
 
-  function setLiveMutedAutoplay() {
+  function setLiveAutoplayWithSound() {
     if (!v) return;
     v.playsInline = true;
     v.autoplay = true;
-    v.muted = true;
+    v.controls = true;
+    v.muted = false;
   }
 
   async function tryPlay(reason) {
@@ -351,7 +352,7 @@
       if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
       hasRequestedStream = false;
       setStandby(true, 'Waiting for live stream…');
-      setLiveMutedAutoplay();
+      setLiveAutoplayWithSound();
       sendJson('join');
       requestStream();
     };

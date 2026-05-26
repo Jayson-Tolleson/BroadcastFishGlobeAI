@@ -711,9 +711,11 @@
       await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || screen.getVideoTracks()[0] || null);
       console.info('[broadcast/program] sender using program video track');
     } else {
-      const cam = await startCameraStream();
+      if (state.media.camera_enabled) {
+        await startCameraStream();
+      }
       const ps = ensureProgramStream();
-      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (programVideoTrack || ps.getVideoTracks()[0] || cam.getVideoTracks()[0] || null) : null);
+      await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || null);
       console.info('[broadcast/program] sender using program video track');
     }
     if (state.media.mic_enabled) {

@@ -42,6 +42,7 @@
   let hasRequestedStream = false;
   let retryTimer = null;
   let requestTimeout = null;
+  let streamPollTimer = null;
   let hearAiVoice = true;
   const DEBUG_CHAT = false;
   let lastChatSendAt = 0;
@@ -151,7 +152,11 @@
   }
 
   function requestStream(force = false) {
-    if (force) hasRequestedStream = false;
+    if (force) {
+      hasRequestedStream = false;
+      requestPending = false;
+      if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
+    }
     scheduleStreamRequest(0);
   }
 
@@ -248,12 +253,7 @@
       if (dom.ai) dom.ai.textContent = `AI ${st.settings?.ai_status || (st.settings?.ai_enabled ? 'active' : 'idle')}`;
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
-      if (present) {
-        requestStream();
-      }
-      if (present && !requestPending) {
-        requestStream();
-      }
+      if (present) requestStream(true);
       return;
     }
     if (msg.type === 'presence') {
@@ -261,7 +261,7 @@
       if (dom.watchers) dom.watchers.textContent = `watchers ${msg.viewer_count ?? 0}`;
       if (broadcasterPresent) {
         dom.mode && (dom.mode.textContent = 'LIVE');
-        scheduleStreamRequest(100);
+        requestStream(true);
       } else {
         dom.mode && (dom.mode.textContent = 'OFFLINE');
         setStandby(true, 'Waiting for broadcaster…');
@@ -321,6 +321,7 @@
         if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
         hasRequestedStream = false;
         setStandby(true, msg.message === 'stream_offline' ? 'Broadcaster connected, waiting for media…' : 'Waiting for broadcaster…');
+        if (msg.message === 'stream_offline' && broadcasterPresent) requestStream(true);
       }
       return;
     }
@@ -355,7 +356,17 @@
       setStandby(true, 'Waiting for live stream…');
       setLiveAutoplayWithSound();
       sendJson('join');
-      requestStream();
+      requestStream(true);
+      if (streamPollTimer) clearInterval(streamPollTimer);
+      streamPollTimer = setInterval(() => {
+        if (!broadcasterPresent) return;
+        const ms = dom.video?.srcObject;
+        const hasVideo = ms instanceof MediaStream && ms.getVideoTracks().some((t) => t.readyState === 'live');
+        if (!hasVideo || !pc || pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
+          setStandby(true, hasVideo ? 'Reconnecting stream…' : 'audio-only: waiting for video track');
+          requestStream(true);
+        }
+      }, 2500);
     };
 
     ws.onmessage = (ev) => {
@@ -370,6 +381,7 @@
       dom.conn && (dom.conn.textContent = 'reconnecting');
       requestPending = false;
       hasRequestedStream = false;
+      if (streamPollTimer) { clearInterval(streamPollTimer); streamPollTimer = null; }
       setStandby(true, 'Reconnecting viewer socket…');
       console.warn('[watch] websocket disconnected', { code: ev.code, reason: ev.reason, reconnectDelayMs });
       setTimeout(connect, reconnectDelayMs);

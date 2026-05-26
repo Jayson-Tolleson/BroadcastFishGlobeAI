@@ -25,6 +25,7 @@
     ledLive: document.getElementById('ledLive'),
     ledAi: document.getElementById('ledAi'),
     camBtn: document.getElementById('camBtn'),
+    camPowerBtn: document.getElementById('camPowerBtn'),
     screenBtn: document.getElementById('screenBtn'),
     micBtn: document.getElementById('micBtn'),
     sttBtn: document.getElementById('sttBtn'),
@@ -200,9 +201,14 @@
   }
 
   function updateCameraLabel(label) {
-    const camTxt = document.getElementById('camTxt');
-    if (!camTxt) return;
-    camTxt.textContent = state.media.camera_enabled ? `CAM: ${compactCameraName(label)}` : 'CAM: off';
+    const camSourceTxt = document.getElementById('camSourceTxt');
+    if (!camSourceTxt) return;
+    camSourceTxt.textContent = `SOURCE: ${compactCameraName(label)}`;
+  }
+
+  function updateCameraPowerLabel() {
+    const t = document.getElementById('camPowerTxt');
+    if (t) t.textContent = `CAM: ${state.media.camera_enabled ? 'on' : 'off'}`;
   }
 
   function isTouchLikeDevice() {
@@ -441,6 +447,7 @@
   }
 
   async function startCameraStream() {
+    if (!state.media.camera_enabled) return null;
     if (state.camStream) {
       const activeTrack = state.camStream.getVideoTracks()[0];
       const activeDeviceId = activeTrack?.getSettings?.().deviceId || '';
@@ -481,6 +488,13 @@
     return state.camStream;
   }
 
+  async function stopCameraStream() {
+    state.camStream?.getTracks?.().forEach((t) => t.stop());
+    state.camStream = null;
+    camSourceEl.srcObject = null;
+    hideCameraPipPreview();
+  }
+
   async function refreshVideoInputs() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
@@ -499,12 +513,7 @@
       } catch (_) {}
     }
     const inputs = await refreshVideoInputs();
-    if (!inputs.length) {
-      state.media.camera_enabled = !state.media.camera_enabled;
-      await syncTracks();
-      announceState();
-      return;
-    }
+    if (!inputs.length) return;
     const modes = await buildCameraModes();
     if (!modes.length) return;
     const activeTrack = state.camStream?.getVideoTracks?.()[0];
@@ -533,6 +542,7 @@
       updateCameraLabel(track?.label || target.label || `camera ${cameraModeIndex + 1}`);
       announceState();
       console.info('[broadcast/camera] cycled mode', { target, deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
+      console.info('[broadcast/camera-ui] source selected facing=%s deviceId=%s', preferredFacingMode || '', selectedVideoDeviceId || null);
     } catch (err) {
       if (old) state.camStream = old;
       console.warn('[broadcast/camera] mode cycle failed', { message: err?.message || String(err), target });
@@ -1054,8 +1064,20 @@
   });
 
   bindDoubleTap(dom.camBtn, async () => {
-    state.media.camera_enabled = true;
     await rotateCamera();
+  });
+  bindDoubleTap(dom.camPowerBtn, async () => {
+    state.media.camera_enabled = !state.media.camera_enabled;
+    console.info('[broadcast/camera-ui] power enabled=%s', state.media.camera_enabled);
+    if (!state.media.camera_enabled) {
+      await stopCameraStream();
+      await replaceOutgoingVideoTrack(programVideoTrack || ensureProgramStream().getVideoTracks()[0] || null);
+    } else {
+      await startCameraStream();
+      await syncTracks();
+    }
+    updateCameraPowerLabel();
+    announceState();
   });
   bindDoubleTap(dom.screenBtn, async () => {
     if (state.media.screen_enabled) await switchToCamera(); else await switchToScreen();
@@ -1133,6 +1155,7 @@
     if (dom.chatCollapseBtn) dom.chatCollapseBtn.textContent = 'Expand';
   }
   applyRoomState({ settings: state.media, runtime: { broadcaster_present: false, viewer_count: 0 } });
+  updateCameraPowerLabel();
   ensureProgramStream();
   hideCameraPipPreview();
   installWakeLock();

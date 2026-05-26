@@ -73,7 +73,7 @@
   let programLoopRunning = false;
   const pip = { enabled: false, x: 20, y: 20, w: 220, h: 124, dragging: false, dragDx: 0, dragDy: 0 };
   let lastSttSentAt = 0;
-  let sttFrameModulo = 0;
+  let sttChunkSeq = 0;
   const camSourceEl = document.createElement('video');
   camSourceEl.muted = true;
   camSourceEl.playsInline = true;
@@ -650,8 +650,7 @@
     else state.pc = pc;
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
-      if (viewerId) sendJson(state.signalWs, 'ice-candidate', { viewerId, candidate: e.candidate });
-      else sendJson(state.signalWs, 'webrtc_ice', { candidate: e.candidate });
+      sendJson(state.signalWs, 'webrtc_ice', { candidate: e.candidate });
     };
     pc.onconnectionstatechange = () => dom.stPc && (dom.stPc.textContent = pc.connectionState);
     pc.oniceconnectionstatechange = () => dom.stIce && (dom.stIce.textContent = pc.iceConnectionState);
@@ -668,14 +667,14 @@
     return pc;
   }
 
-  async function createOfferForViewer(viewerId) {
+  async function createOfferForViewer_DISABLED(viewerId) {
     const pc = await ensurePeerConnection(viewerId);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     sendJson(state.signalWs, 'offer', { viewerId, sdp: offer.sdp, type: offer.type });
   }
 
-  function removeViewerPeer(viewerId) {
+  function removeViewerPeer_DISABLED(viewerId) {
     const pc = state.peerConnections[viewerId];
     if (!pc) return;
     try { pc.close(); } catch (_) {}
@@ -988,12 +987,6 @@
       if (msg.type === 'answer' && msg.viewerId && msg.payload?.sdp) {
         const pc = state.peerConnections[msg.viewerId];
         if (pc) await pc.setRemoteDescription({ type: msg.payload.type || 'answer', sdp: msg.payload.sdp });
-      }
-      if (msg.type === 'ice-candidate' && msg.viewerId && msg.candidate) {
-        const pc = state.peerConnections[msg.viewerId];
-        if (pc) {
-          try { await pc.addIceCandidate(msg.candidate); } catch (_) {}
-        }
       }
       if (msg.type === 'webrtc_answer' && msg.sdp && state.pc) {
         await state.pc.setRemoteDescription({ type: msg.answerType || 'answer', sdp: msg.sdp });

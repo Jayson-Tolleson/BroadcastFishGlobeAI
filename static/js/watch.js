@@ -193,9 +193,12 @@
       pc = null;
     }
     pc = new RTCPeerConnection({ iceServers: await iceServers() });
+    try { pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
     pc.ontrack = async (event) => {
-      const stream = event.streams?.[0] || new MediaStream([event.track]);
-      if (dom.video.srcObject !== stream) dom.video.srcObject = stream;
+      console.info('[watch/webrtc] remote track kind=' + (event.track?.kind || 'unknown'));
+      const existing = dom.video.srcObject instanceof MediaStream ? dom.video.srcObject : new MediaStream();
+      if (event.track && !existing.getTracks().find((t) => t.id === event.track.id)) existing.addTrack(event.track);
+      if (dom.video.srcObject !== existing) dom.video.srcObject = existing;
       setStandby(false);
       dom.mode && (dom.mode.textContent = 'LIVE');
       console.info('[watch/video] stream attached', { kind: event.track?.kind || 'unknown' });
@@ -203,7 +206,6 @@
     };
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
-      sendJson('ice-candidate', { viewerId, candidate: e.candidate });
       sendJson('webrtc_ice', { candidate: e.candidate });
     };
     pc.onconnectionstatechange = () => {
@@ -229,7 +231,6 @@
     await localPc.setRemoteDescription(payload);
     const answer = await localPc.createAnswer();
     await localPc.setLocalDescription(answer);
-    sendJson('answer', { viewerId, sdp: answer.sdp, type: answer.type });
     sendJson('webrtc_answer', { sdp: answer.sdp, type: answer.type });
     console.info('[watch] answer sent', { viewerId });
   }
@@ -323,11 +324,11 @@
       }
       return;
     }
-    if (msg.type === 'offer' || msg.type === 'watch_offer' || msg.type === 'webrtc_offer') {
+    if (msg.type === 'watch_offer' || msg.type === 'webrtc_offer') {
       await onOffer(msg.payload, msg.type);
       return;
     }
-    if (msg.type === 'ice-candidate' || msg.type === 'webrtc_ice') {
+    if (msg.type === 'webrtc_ice') {
       const candidate = msg.candidate || msg.payload?.candidate;
       if (!candidate) return;
       await ensurePeerConnection();

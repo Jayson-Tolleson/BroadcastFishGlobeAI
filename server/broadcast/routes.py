@@ -409,11 +409,11 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         await ws.send_json({"type": "webrtc_answer", "room": room_id, "clientId": client_id, "sdp": answer.get("sdp"), "answerType": answer.get("type", "answer"), "ts": now_ms()})
                         await registry.broadcast_room(room_id, {"type": "stage_state", "payload": _stage_payload(room_id, room)})
                         await _broadcast_presence(state, room_id)
-                elif kind in {"webrtc_ice", "watch_ice"}:
+                elif kind == "webrtc_ice":
                     if rtc is not None:
                         cand = rtc.parse_ice(data or {})
                         await rtc.add_broadcaster_ice_candidate(room_id, client_id, cand)
-                elif kind == "offer":
+                elif kind == "offer" and False:
                     viewer_id = str(data.get("viewerId") or "").strip()
                     sdp = data.get("sdp")
                     sdp_type = data.get("type") or "offer"
@@ -424,7 +424,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                             {"type": "offer", "room": room_id, "viewerId": viewer_id, "payload": {"sdp": sdp, "type": sdp_type}, "ts": now_ms()},
                         )
                         log.info("signal offer route room=%s viewer=%s ok=%s", room_id, viewer_id, ok)
-                elif kind == "ice-candidate":
+                elif kind == "ice-candidate" and False:
                     viewer_id = str(data.get("viewerId") or "").strip()
                     cand = data.get("candidate")
                     if viewer_id and cand:
@@ -659,7 +659,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                             await ws.send_json({"ok": False, "type": "error", "room": room_id, "message": "watch_offer_failed", "ts": now_ms()})
                             offer_outstanding = False
                             offer_started_at = 0.0
-                elif kind in {"watch_answer", "webrtc_answer"}:
+                elif kind == "webrtc_answer":
                     sdp = data.get("sdp")
                     sdp_type = data.get("type") or "answer"
                     if sdp:
@@ -669,7 +669,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         log.info("watch answer received room=%s client=%s", room_id, client_id)
                         if rtc is not None:
                             await rtc.set_viewer_answer(room_id, client_id, sdp, sdp_type)
-                elif kind == "answer":
+                elif kind == "answer" and False:
                     sdp = data.get("sdp")
                     sdp_type = data.get("type") or "answer"
                     if sdp:
@@ -680,12 +680,12 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                             room_id,
                             {"type": "answer", "room": room_id, "viewerId": client_id, "payload": {"sdp": sdp, "type": sdp_type}, "ts": now_ms()},
                         )
-                elif kind in {"webrtc_ice", "watch_ice"}:
+                elif kind == "webrtc_ice":
                     if rtc is not None:
                         cand = rtc.parse_ice(data or {})
                         log.debug("watch ice queued room=%s client=%s", room_id, client_id)
                         await rtc.add_viewer_ice_candidate(room_id, client_id, cand)
-                elif kind == "ice-candidate":
+                elif kind == "ice-candidate" and False:
                     cand = data.get("candidate")
                     if cand:
                         await _route_to_broadcaster(
@@ -720,6 +720,27 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                 await _broadcast_presence(state, room_id)
             _set_state("disconnected", "ws_close")
             log.info("watch socket disconnected room=%s client=%s", room_id, client_id)
+
+
+    @app.get('/broadcast/api/live-state')
+    async def api_broadcast_live_state():
+        room_id = (request.args.get('room') or state.default_room or 'default').strip() or 'default'
+        room = state.ensure_room(room_id)
+        has_video = bool(rtc and rtc.live_video_source.get(room_id))
+        has_audio = bool(rtc and rtc.live_audio_source.get(room_id))
+        session = rtc.broadcasters.get(room_id) if rtc else None
+        return jsonify({
+            'ok': True,
+            'room': room_id,
+            'broadcaster_present': bool(room.broadcaster_sid),
+            'live_active': bool(room.media.live_active),
+            'has_video_source': has_video,
+            'has_audio_source': has_audio,
+            'watcher_count': len(room.viewers),
+            'broadcaster_pc_state': (session.pc.connectionState if session else None),
+            'track_kinds_seen': sorted(list((session.tracks or {}).keys())) if session else [],
+            'ts': now_ms(),
+        })
 
     @app.post('/api/broadcast/recording')
     async def api_broadcast_recording():

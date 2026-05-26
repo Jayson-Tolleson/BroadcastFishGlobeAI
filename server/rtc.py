@@ -269,9 +269,18 @@ class RTCManager:
                 if self.has_live_source(room_id):
                     self._room_live_event(room_id).set()
                     room = self.state.ensure_room(room_id)
-                    room.media.live_active = True
+                    room.media.live_active = bool(self.live_video_source.get(room_id))
                     room.media.mode = "live"
-                log.info("broadcaster track published room=%s sid=%s kind=%s live_video=%s live_audio=%s", room_id, sid, track.kind, bool(self.live_video_source.get(room_id)), bool(self.live_audio_source.get(room_id)))
+                log.info(
+                    "broadcaster track published room=%s sid=%s kind=%s id=%s ready=%s live_video=%s live_audio=%s",
+                    room_id,
+                    sid,
+                    track.kind,
+                    getattr(track, "id", None),
+                    getattr(track, "readyState", None),
+                    bool(self.live_video_source.get(room_id)),
+                    bool(self.live_audio_source.get(room_id)),
+                )
                 await self._emit_room(room_id, "stream_started", {"room": room_id, "kind": track.kind, "ts": now_ms()})
                 await self._emit_room(room_id, "broadcaster-start", {"room": room_id, "kind": track.kind, "ts": now_ms()})
                 await self._emit_status(room_id)

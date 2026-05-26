@@ -117,12 +117,12 @@ def init_ws_routes(app, state: AppState, rtc) -> None:
                     elif rtc:
                         offer = await rtc.start_viewer_offer(room_id, client_id)
                         await ws.send_json({"type": "watch_offer", "room": room_id, "payload": offer, "ts": now_ms()})
-                elif kind in {"watch_answer", "webrtc_answer"} and rtc:
+                elif kind == "webrtc_answer" and rtc:
                     sdp = data.get("sdp")
                     sdp_type = data.get("type") or "answer"
                     if sdp:
                         await rtc.set_viewer_answer(room_id, client_id, sdp, sdp_type)
-                elif kind in {"webrtc_ice", "watch_ice"} and rtc:
+                elif kind == "webrtc_ice" and rtc:
                     cand = rtc.parse_ice(data or {})
                     await rtc.add_viewer_ice_candidate(room_id, client_id, cand)
         finally:

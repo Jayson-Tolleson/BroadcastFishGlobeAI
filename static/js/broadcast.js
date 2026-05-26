@@ -173,9 +173,7 @@
 
     const setTxt = (id, txt) => { const n = document.getElementById(id); if (n) n.textContent = txt; };
     setLed(document.getElementById('camLed'), !!state.media.camera_enabled);
-    if (!state.media.camera_enabled) {
-      setTxt('camTxt', 'CAM: off');
-    }
+    updateCameraPowerLabel();
     setLed(document.getElementById('screenLed'), !!state.media.screen_enabled);
     setTxt('screenTxt', `SCREEN+CAM: ${state.media.screen_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('micLed'), !!state.media.mic_enabled);
@@ -354,6 +352,8 @@
         console.info('[broadcast/camera] stopping old video before rotate');
         old.getVideoTracks().forEach((t) => t.stop());
       }
+      camSourceEl.srcObject = null;
+      await new Promise((r) => setTimeout(r, 150));
       const next = await openCameraMode(target);
       state.camStream = next;
       camSourceEl.srcObject = next;
@@ -426,14 +426,14 @@
     if (mode.kind === 'facing') {
       try {
         if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user exact');
-        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment exact');
-        const exactStream = await requestCameraStream({ facingMode: { exact: mode.facingMode } });
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] attempt exact environment');
+        const exactStream = await requestCameraStream({ facingMode: { exact: mode.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } });
         console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'exact' });
         return exactStream;
       } catch (_) {
         if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user ideal');
-        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment ideal');
-        const idealStream = await requestCameraStream({ facingMode: { ideal: mode.facingMode } });
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] attempt ideal environment');
+        const idealStream = await requestCameraStream({ facingMode: { ideal: mode.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } });
         console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'ideal' });
         return idealStream;
       }
@@ -1063,10 +1063,10 @@
     dom.fileInput.value = '';
   });
 
-  bindDoubleTap(dom.camBtn, async () => {
+  dom.camBtn?.addEventListener('click', async () => {
     await rotateCamera();
   });
-  bindDoubleTap(dom.camPowerBtn, async () => {
+  dom.camPowerBtn?.addEventListener('click', async () => {
     state.media.camera_enabled = !state.media.camera_enabled;
     console.info('[broadcast/camera-ui] power enabled=%s', state.media.camera_enabled);
     if (!state.media.camera_enabled) {

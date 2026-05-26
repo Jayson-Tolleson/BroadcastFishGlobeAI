@@ -132,16 +132,16 @@
     v.playsInline = true;
     v.autoplay = true;
     v.controls = true;
-    v.muted = false;
+    v.muted = true;
   }
 
   async function tryPlay(reason) {
     if (!dom.video) return;
     dom.video.controls = true;
-    dom.video.muted = false;
+    dom.video.muted = true;
     try {
       console.info('[watch/video] autoplay attempt', { reason });
-      dom.video.muted = false;
+      dom.video.muted = true;
       await dom.video.play();
       showJoinOverlay(false);
       console.info('[watch/video] playing', { reason });
@@ -208,6 +208,9 @@
       dom.mode && (dom.mode.textContent = 'LIVE');
       console.info('[watch/video] stream attached', { kind: event.track?.kind || 'unknown' });
       await tryPlay('remote_track_attach');
+      const ms = dom.video.srcObject;
+      const hasVideo = ms instanceof MediaStream && ms.getVideoTracks().some((t) => t.readyState === 'live');
+      if (!hasVideo) setStandby(true, 'audio-only: waiting for video track');
     };
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
@@ -299,7 +302,7 @@
         if (pc) { try { pc.close(); } catch (_) {} pc = null; }
         dom.video.srcObject = null;
         dom.video.src = p.latestUploadUrl;
-        dom.video.muted = false;
+        dom.video.muted = true;
         await tryPlay('fallback_upload');
         dom.mode && (dom.mode.textContent = 'LATEST UPLOAD');
         setStandby(false);
@@ -390,7 +393,7 @@
   }
 
   dom.joinBtn?.addEventListener('click', async () => {
-    dom.video.muted = false;
+    dom.video.muted = true;
     dom.video.controls = true;
     console.info('[watch/video] user play started');
     await tryPlay('manual_overlay_click');

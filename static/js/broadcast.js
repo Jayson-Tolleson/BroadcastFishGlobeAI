@@ -28,7 +28,6 @@
     screenBtn: document.getElementById('screenBtn'),
     micBtn: document.getElementById('micBtn'),
     sttBtn: document.getElementById('sttBtn'),
-    ncBtn: document.getElementById('ncBtn'),
     aiEnableBtn: document.getElementById('aiEnableBtn'),
     aiStatusBtn: document.getElementById('aiStatusBtn'),
     ttsMonBtn: document.getElementById('ttsMonBtn'),
@@ -182,8 +181,6 @@
     setTxt('micTxt', `MIC: ${state.media.mic_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('sttLed'), !!state.media.stt_enabled);
     setTxt('sttTxt', `STT: ${state.media.stt_enabled ? 'on' : 'off'}`);
-    setLed(document.getElementById('ncLed'), !!state.media.noise_cancel_enabled);
-    setTxt('ncTxt', `NoiseCancel: ${state.media.noise_cancel_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('ttsMonLed'), !!state.media.hear_ai_voice);
     setTxt('ttsMonTxt', `Hear AI voice: ${state.media.hear_ai_voice ? 'on' : 'off'}`);
     setLed(document.getElementById('aiEnableLed'), !!state.media.ai_enabled);
@@ -374,7 +371,7 @@
       video: videoConstraints,
       audio: {
         echoCancellation: true,
-        noiseSuppression: !!state.media.noise_cancel_enabled,
+        noiseSuppression: true,
         autoGainControl: true,
         channelCount: 1,
         sampleRate: 48000,
@@ -385,7 +382,7 @@
   function audioConstraints() {
     return {
       echoCancellation: true,
-      noiseSuppression: !!state.media.noise_cancel_enabled,
+      noiseSuppression: true,
       autoGainControl: true,
       channelCount: 1,
       sampleRate: 48000,
@@ -1016,6 +1013,20 @@
     applyRoomState({ settings: state.media, runtime: { broadcaster_present: true, viewer_count: Number(dom.stWatchers?.textContent || 0) } });
   }
 
+  function bindDoubleTap(el, handler, windowMs = 380) {
+    if (!el) return;
+    let lastTapAt = 0;
+    el.addEventListener('click', async (ev) => {
+      const now = Date.now();
+      if ((now - lastTapAt) > windowMs) {
+        lastTapAt = now;
+        return;
+      }
+      lastTapAt = 0;
+      await handler(ev);
+    });
+  }
+
   function sendChatMessage() {
     const text = dom.chatInput?.value?.trim();
     if (!text) return;
@@ -1028,20 +1039,20 @@
     dom.chatInput.value = '';
   }
 
-  dom.sendBtn?.addEventListener('click', sendChatMessage);
+  bindDoubleTap(dom.sendBtn, async () => { sendChatMessage(); });
   dom.chatInput?.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); sendChatMessage(); }
   });
 
-  dom.webBtn?.addEventListener('click', () => {
+  bindDoubleTap(dom.webBtn, async () => {
     const query = (dom.chatInput?.value || '').trim();
     if (!query) return;
     if (DEBUG_CHAT) console.debug('[broadcast.chat] web_search send', { query_len: query.length });
     sendJson(state.chatWs, 'web_search', { query });
   });
-  dom.searchCloseBtn?.addEventListener('click', () => dom.searchPane?.classList.remove('open'));
+  bindDoubleTap(dom.searchCloseBtn, async () => { dom.searchPane?.classList.remove('open'); });
 
-  dom.attachBtn?.addEventListener('click', () => dom.fileInput?.click());
+  bindDoubleTap(dom.attachBtn, async () => { dom.fileInput?.click(); });
   dom.fileInput?.addEventListener('change', async () => {
     const f = dom.fileInput.files?.[0];
     if (!f) return;
@@ -1051,37 +1062,30 @@
     dom.fileInput.value = '';
   });
 
-  dom.camBtn?.addEventListener('click', async () => {
+  bindDoubleTap(dom.camBtn, async () => {
     state.media.camera_enabled = true;
     await rotateCamera();
   });
-  dom.screenBtn?.addEventListener('click', async () => {
+  bindDoubleTap(dom.screenBtn, async () => {
     if (state.media.screen_enabled) await switchToCamera(); else await switchToScreen();
   });
-  dom.micBtn?.addEventListener('click', async () => {
+  bindDoubleTap(dom.micBtn, async () => {
     state.media.mic_enabled = !state.media.mic_enabled;
     await syncTracks();
     if (state.media.mic_enabled && state.media.stt_enabled) await startSpeechCaptureFromMic();
     else stopSpeechCapture();
     announceState();
   });
-  dom.sttBtn?.addEventListener('click', async () => {
+  bindDoubleTap(dom.sttBtn, async () => {
     state.media.stt_enabled = !state.media.stt_enabled;
     if (state.media.stt_enabled && state.media.mic_enabled) await startSpeechCaptureFromMic();
     else stopSpeechCapture();
     announceState();
   });
-  dom.ncBtn?.addEventListener('click', async () => {
-    state.media.noise_cancel_enabled = !state.media.noise_cancel_enabled;
-    if (state.camStream) { state.camStream.getTracks().forEach((t) => t.stop()); state.camStream = null; }
-    await syncTracks();
-    if (state.media.stt_enabled && state.media.mic_enabled) await startSpeechCaptureFromMic();
-    announceState();
-  });
-  dom.aiEnableBtn?.addEventListener('click', () => { state.media.ai_enabled = !state.media.ai_enabled; announceState(); });
-  dom.ttsMonBtn?.addEventListener('click', () => { state.media.hear_ai_voice = !state.media.hear_ai_voice; announceState(); });
-  dom.recordBtn?.addEventListener('click', () => { toggleRecording().catch(() => {}); });
-  dom.rtmpBtn?.addEventListener('click', () => { toggleRtmp().catch(() => {}); });
+  bindDoubleTap(dom.aiEnableBtn, async () => { state.media.ai_enabled = !state.media.ai_enabled; announceState(); });
+  bindDoubleTap(dom.ttsMonBtn, async () => { state.media.hear_ai_voice = !state.media.hear_ai_voice; announceState(); });
+  bindDoubleTap(dom.recordBtn, async () => { toggleRecording().catch(() => {}); });
+  bindDoubleTap(dom.rtmpBtn, async () => { toggleRtmp().catch(() => {}); });
   const pointerDown = (ev) => {
     if (!state.media.screen_enabled) return;
     const rect = dom.preview?.getBoundingClientRect();
@@ -1126,7 +1130,7 @@
   dom.preview?.addEventListener('touchstart', pointerDown, { passive: true });
   window.addEventListener('touchmove', pointerMove, { passive: true });
   window.addEventListener('touchend', pointerUp, { passive: true });
-  dom.chatCollapseBtn?.addEventListener('click', () => {
+  bindDoubleTap(dom.chatCollapseBtn, async () => {
     if (!dom.chatPanel) return;
     dom.chatPanel.classList.toggle('collapsed');
     dom.chatCollapseBtn.textContent = dom.chatPanel.classList.contains('collapsed') ? 'Expand' : 'Collapse';

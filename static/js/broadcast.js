@@ -25,10 +25,10 @@
     ledLive: document.getElementById('ledLive'),
     ledAi: document.getElementById('ledAi'),
     camBtn: document.getElementById('camBtn'),
+    camPowerBtn: document.getElementById('camPowerBtn'),
     screenBtn: document.getElementById('screenBtn'),
     micBtn: document.getElementById('micBtn'),
     sttBtn: document.getElementById('sttBtn'),
-    ncBtn: document.getElementById('ncBtn'),
     aiEnableBtn: document.getElementById('aiEnableBtn'),
     aiStatusBtn: document.getElementById('aiStatusBtn'),
     ttsMonBtn: document.getElementById('ttsMonBtn'),
@@ -51,6 +51,7 @@
 
   let chatRetryMs = 1200;
   let signalRetryMs = 1200;
+  const broadcastSessionId = `bcast-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const DEBUG_CHAT = false;
   let lastChatSendAt = 0;
   let lastChatText = '';
@@ -73,7 +74,7 @@
   let programLoopRunning = false;
   const pip = { enabled: false, x: 20, y: 20, w: 220, h: 124, dragging: false, dragDx: 0, dragDy: 0 };
   let lastSttSentAt = 0;
-  let sttFrameModulo = 0;
+  let sttChunkSeq = 0;
   const camSourceEl = document.createElement('video');
   camSourceEl.muted = true;
   camSourceEl.playsInline = true;
@@ -85,11 +86,11 @@
     room: cfg.room || new URLSearchParams(location.search).get('room') || 'default',
     clientId: `b-${Math.random().toString(36).slice(2, 10)}`,
     pc: null,
-    peerConnections: {},
     chatWs: null,
     signalWs: null,
     camStream: null,
     screenStream: null,
+    micStream: null,
     speechCtx: null,
     speechSource: null,
     speechProcessor: null,
@@ -119,7 +120,14 @@
 
   function sendJson(ws, type, extra = {}) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type, room: state.room, clientId: state.clientId, role: 'broadcaster', ...extra }));
+    ws.send(JSON.stringify({ type, room: state.room, clientId: state.clientId, role: 'broadcaster', sessionId: broadcastSessionId, ...extra }));
+  }
+
+  function getProgramVideoTrackOrThrow() {
+    const stream = ensureProgramStream();
+    const track = programVideoTrack || stream.getVideoTracks()[0];
+    if (!track) throw new Error('program canvas video track missing');
+    return { stream, track };
   }
 
   function applyPresence(presence) {
@@ -173,17 +181,13 @@
 
     const setTxt = (id, txt) => { const n = document.getElementById(id); if (n) n.textContent = txt; };
     setLed(document.getElementById('camLed'), !!state.media.camera_enabled);
-    if (!state.media.camera_enabled) {
-      setTxt('camTxt', 'CAM: off');
-    }
+    updateCameraPowerLabel();
     setLed(document.getElementById('screenLed'), !!state.media.screen_enabled);
-    setTxt('screenTxt', `SCREEN: ${state.media.screen_enabled ? 'on' : 'off'}`);
+    setTxt('screenTxt', `SCREEN+CAM: ${state.media.screen_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('micLed'), !!state.media.mic_enabled);
     setTxt('micTxt', `MIC: ${state.media.mic_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('sttLed'), !!state.media.stt_enabled);
     setTxt('sttTxt', `STT: ${state.media.stt_enabled ? 'on' : 'off'}`);
-    setLed(document.getElementById('ncLed'), !!state.media.noise_cancel_enabled);
-    setTxt('ncTxt', `NoiseCancel: ${state.media.noise_cancel_enabled ? 'on' : 'off'}`);
     setLed(document.getElementById('ttsMonLed'), !!state.media.hear_ai_voice);
     setTxt('ttsMonTxt', `Hear AI voice: ${state.media.hear_ai_voice ? 'on' : 'off'}`);
     setLed(document.getElementById('aiEnableLed'), !!state.media.ai_enabled);
@@ -203,9 +207,14 @@
   }
 
   function updateCameraLabel(label) {
-    const camTxt = document.getElementById('camTxt');
-    if (!camTxt) return;
-    camTxt.textContent = state.media.camera_enabled ? `CAM: ${compactCameraName(label)}` : 'CAM: off';
+    const camSourceTxt = document.getElementById('camSourceTxt');
+    if (!camSourceTxt) return;
+    camSourceTxt.textContent = `SOURCE: ${compactCameraName(label)}`;
+  }
+
+  function updateCameraPowerLabel() {
+    const t = document.getElementById('camPowerTxt');
+    if (t) t.textContent = `CAM: ${state.media.camera_enabled ? 'on' : 'off'}`;
   }
 
   function isTouchLikeDevice() {
@@ -351,6 +360,8 @@
         console.info('[broadcast/camera] stopping old video before rotate');
         old.getVideoTracks().forEach((t) => t.stop());
       }
+      camSourceEl.srcObject = null;
+      await new Promise((r) => setTimeout(r, 150));
       const next = await openCameraMode(target);
       state.camStream = next;
       camSourceEl.srcObject = next;
@@ -370,28 +381,42 @@
   }
 
   async function requestCameraStream(videoConstraints) {
-    return navigator.mediaDevices.getUserMedia({
-      video: videoConstraints,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: !!state.media.noise_cancel_enabled,
-        autoGainControl: true,
-        channelCount: 1,
-        sampleRate: 48000,
-      },
-    });
+    return navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
   }
 
   function audioConstraints() {
     return {
       echoCancellation: true,
-      noiseSuppression: !!state.media.noise_cancel_enabled,
+      noiseSuppression: true,
       autoGainControl: true,
       channelCount: 1,
       sampleRate: 48000,
     };
   }
 
+
+
+  async function startMicStream() {
+    if (state.micStream?.getAudioTracks?.()[0]?.readyState === 'live') return state.micStream;
+    state.micStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints(), video: false });
+    console.info('[broadcast/media] mic acquired');
+    if (state.media.stt_enabled && state.chatWs?.readyState === WebSocket.OPEN) {
+      await startSpeechCaptureFromMic().catch(() => {});
+    }
+    return state.micStream;
+  }
+
+  async function stopMicStream() {
+    stopSpeechCapture();
+    state.micStream?.getTracks?.().forEach((t) => t.stop());
+    state.micStream = null;
+    await replaceOutgoingAudioTrack(null);
+    console.info('[broadcast/media] mic stopped');
+  }
+
+  function currentMicTrack() {
+    return state.micStream?.getAudioTracks?.()[0] || null;
+  }
   async function buildCameraModes() {
     const inputs = await refreshVideoInputs();
     const facingModes = [
@@ -409,14 +434,14 @@
     if (mode.kind === 'facing') {
       try {
         if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user exact');
-        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment exact');
-        const exactStream = await requestCameraStream({ facingMode: { exact: mode.facingMode } });
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] attempt exact environment');
+        const exactStream = await requestCameraStream({ facingMode: { exact: mode.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } });
         console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'exact' });
         return exactStream;
       } catch (_) {
         if (mode.facingMode === 'user') console.info('[broadcast/camera] switching facing=user ideal');
-        if (mode.facingMode === 'environment') console.info('[broadcast/camera] switching facing=environment ideal');
-        const idealStream = await requestCameraStream({ facingMode: { ideal: mode.facingMode } });
+        if (mode.facingMode === 'environment') console.info('[broadcast/camera] attempt ideal environment');
+        const idealStream = await requestCameraStream({ facingMode: { ideal: mode.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } });
         console.info('[broadcast/camera] active facing result', { facingMode: mode.facingMode, strategy: 'ideal' });
         return idealStream;
       }
@@ -430,6 +455,7 @@
   }
 
   async function startCameraStream() {
+    if (!state.media.camera_enabled) return null;
     if (state.camStream) {
       const activeTrack = state.camStream.getVideoTracks()[0];
       const activeDeviceId = activeTrack?.getSettings?.().deviceId || '';
@@ -470,6 +496,13 @@
     return state.camStream;
   }
 
+  async function stopCameraStream() {
+    state.camStream?.getTracks?.().forEach((t) => t.stop());
+    state.camStream = null;
+    camSourceEl.srcObject = null;
+    hideCameraPipPreview();
+  }
+
   async function refreshVideoInputs() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
@@ -488,42 +521,40 @@
       } catch (_) {}
     }
     const inputs = await refreshVideoInputs();
-    if (!inputs.length) {
-      state.media.camera_enabled = !state.media.camera_enabled;
-      await syncTracks();
-      announceState();
-      return;
-    }
-    if (isTouchLikeDevice()) {
-      const nextFacing = preferredFacingMode === 'user' ? 'environment' : 'user';
-      preferredFacingMode = nextFacing;
-      selectedVideoDeviceId = '';
-      state.media.camera_enabled = true;
-      const old = state.camStream;
-      state.camStream = null;
-      try {
-        await syncTracks();
-        old?.getTracks?.().forEach((t) => t.stop());
-        announceState();
-        console.info('[broadcast/camera] switched facing mode', { facingMode: preferredFacingMode });
-        return;
-      } catch (err) {
-        console.warn('[broadcast/camera] facing switch failed, falling back to device cycle', { message: err?.message || String(err) });
-        if (old) state.camStream = old;
-      }
-    }
-    const idx = inputs.findIndex((d) => d.deviceId === selectedVideoDeviceId);
-    cameraCycleIndex = idx >= 0 ? idx : cameraCycleIndex;
-    cameraCycleIndex = (cameraCycleIndex + 1) % inputs.length;
-    selectedVideoDeviceId = inputs[cameraCycleIndex].deviceId;
-    state.media.camera_enabled = true;
+    if (!inputs.length) return;
+    const modes = await buildCameraModes();
+    if (!modes.length) return;
+    const activeTrack = state.camStream?.getVideoTracks?.()[0];
+    const activeSettings = activeTrack?.getSettings?.() || {};
+    const activeFacing = activeSettings.facingMode;
+    const activeDeviceId = activeSettings.deviceId || selectedVideoDeviceId;
+    let activeIdx = modes.findIndex((m) => m.kind === 'device' && activeDeviceId && m.deviceId === activeDeviceId);
+    if (activeIdx < 0) activeIdx = modes.findIndex((m) => m.kind === 'facing' && activeFacing && m.facingMode === activeFacing);
+    if (activeIdx < 0) activeIdx = cameraModeIndex;
+    cameraModeIndex = ((activeIdx >= 0 ? activeIdx : -1) + 1) % modes.length;
+    const target = modes[cameraModeIndex];
     const old = state.camStream;
+    state.media.camera_enabled = true;
     state.camStream = null;
-    await syncTracks();
-    old?.getTracks?.().forEach((t) => t.stop());
-    updateCameraLabel(inputs[cameraCycleIndex].label || `camera ${cameraCycleIndex + 1}`);
-    console.info('[broadcast/camera] cycled device', { deviceId: selectedVideoDeviceId, label: inputs[cameraCycleIndex].label || '' });
-    announceState();
+    try {
+      const next = await openCameraMode(target);
+      state.camStream = next;
+      camSourceEl.srcObject = next;
+      camSourceEl.play().catch(() => {});
+      const track = next.getVideoTracks()[0];
+      const settings = track?.getSettings?.() || {};
+      selectedVideoDeviceId = settings.deviceId || selectedVideoDeviceId;
+      if (settings.facingMode === 'environment' || settings.facingMode === 'user') preferredFacingMode = settings.facingMode;
+      await syncTracks();
+      old?.getTracks?.().forEach((t) => t.stop());
+      updateCameraLabel(track?.label || target.label || `camera ${cameraModeIndex + 1}`);
+      announceState();
+      console.info('[broadcast/camera] cycled mode', { target, deviceId: selectedVideoDeviceId, facingMode: preferredFacingMode });
+      console.info('[broadcast/camera-ui] source selected facing=%s deviceId=%s', preferredFacingMode || '', selectedVideoDeviceId || null);
+    } catch (err) {
+      if (old) state.camStream = old;
+      console.warn('[broadcast/camera] mode cycle failed', { message: err?.message || String(err), target });
+    }
   }
 
   async function startScreenStream() {
@@ -560,7 +591,7 @@
     if (!programStream) {
       programStream = programCanvas.captureStream(30);
       programVideoTrack = programStream.getVideoTracks()[0] || null;
-      console.info('[broadcast/program] stream ready');
+      console.info('[broadcast/program] canvas stream ready videoTracks=%s readyState=%s', programStream.getVideoTracks().length, programVideoTrack?.readyState || 'none');
     }
 
     if (dom.preview && dom.preview.srcObject !== programStream) {
@@ -613,6 +644,12 @@
         if (state.media.screen_enabled) { if (!loggedContainScreen) { console.info('[broadcast/program] source contain draw screen'); loggedContainScreen = true; } }
         else { if (!loggedContainCamera) { console.info('[broadcast/program] source contain draw camera'); loggedContainCamera = true; } }
       } catch (_) {}
+    } else {
+      programCtx.fillStyle = '#fff';
+      programCtx.font = '32px sans-serif';
+      programCtx.fillText('Program canvas live — camera pending', 80, 120);
+      programCtx.font = '24px sans-serif';
+      programCtx.fillText('Camera pending…', 80, 164);
     }
     if (state.media.screen_enabled && pip.enabled && camSourceEl.readyState >= 2) {
       syncCameraPipPreviewPosition();
@@ -639,77 +676,80 @@
     programLoopHandle = requestAnimationFrame(tick);
   }
 
-  async function ensurePeerConnection(viewerId = null) {
-    if (!viewerId && state.pc) return state.pc;
-    if (viewerId && state.peerConnections[viewerId]) return state.peerConnections[viewerId];
+  async function ensurePeerConnection() {
+    if (state.pc) return state.pc;
+    console.info('[broadcast/webrtc] creating broadcaster pc');
     const iceCfg = await fetch(cfg.iceConfigUrl || '/webrtc/ice-config').then((r) => r.json()).catch(() => ({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }));
     const pc = new RTCPeerConnection({ iceServers: iceCfg.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }] });
-    if (viewerId) state.peerConnections[viewerId] = pc;
-    else state.pc = pc;
+    state.pc = pc;
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
-      if (viewerId) sendJson(state.signalWs, 'ice-candidate', { viewerId, candidate: e.candidate });
-      else sendJson(state.signalWs, 'webrtc_ice', { candidate: e.candidate });
+      sendJson(state.signalWs, 'webrtc_ice', { candidate: e.candidate });
     };
     pc.onconnectionstatechange = () => dom.stPc && (dom.stPc.textContent = pc.connectionState);
     pc.oniceconnectionstatechange = () => dom.stIce && (dom.stIce.textContent = pc.iceConnectionState);
-    if (viewerId) {
-      const ps = ensureProgramStream();
-      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
-      if (vtrack) pc.addTrack(vtrack, ps);
-      if (state.media.mic_enabled) {
-        const atrack = state.camStream?.getAudioTracks?.()[0] || null;
-        if (atrack) pc.addTrack(atrack, state.camStream);
-      }
-      console.info('[broadcast/program] sender using program video track');
+    const ps = ensureProgramStream();
+    const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+    const atrack = currentMicTrack();
+    if (vtrack) {
+      pc.addTrack(vtrack, ps);
+      console.info('[broadcast/webrtc] session=%s added program video sender id=%s readyState=%s', broadcastSessionId, vtrack.id || '', vtrack.readyState || '');
     }
+    if (atrack && state.micStream) pc.addTrack(atrack, state.micStream);
+    console.info('[broadcast/webrtc] outbound tracks video=%s audio=%s', !!vtrack, !!atrack);
     return pc;
   }
 
-  async function createOfferForViewer(viewerId) {
-    const pc = await ensurePeerConnection(viewerId);
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendJson(state.signalWs, 'offer', { viewerId, sdp: offer.sdp, type: offer.type });
-  }
-
-  function removeViewerPeer(viewerId) {
-    const pc = state.peerConnections[viewerId];
-    if (!pc) return;
-    try { pc.close(); } catch (_) {}
-    delete state.peerConnections[viewerId];
-  }
 
   async function replaceOutgoingVideoTrack(newTrack) {
-    for (const pc of Object.values(state.peerConnections)) {
+    const pc = state.pc;
+    if (!pc) return;
+    {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
       if (sender) await sender.replaceTrack(newTrack || null);
+      else if (newTrack) pc.addTrack(newTrack, ensureProgramStream());
     }
   }
 
   async function replaceOutgoingAudioTrack(newTrack) {
-    for (const pc of Object.values(state.peerConnections)) {
+    const pc = state.pc;
+    if (!pc) return;
+    {
       const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'audio');
       if (sender) await sender.replaceTrack(newTrack || null);
+      else if (newTrack && state.micStream) pc.addTrack(newTrack, state.micStream);
     }
   }
 
   async function syncTracks() {
     startProgramLoop();
+    const ps = ensureProgramStream();
+    await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || null);
     if (state.media.screen_enabled) {
-      const screen = await startScreenStream();
-      const ps = ensureProgramStream();
-      await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || screen.getVideoTracks()[0] || null);
-      console.info('[broadcast/program] sender using program video track');
+      try {
+        await startScreenStream();
+      } catch (err) {
+        console.warn('[broadcast/screen] unavailable; continuing with canvas', err);
+        state.media.screen_enabled = false;
+      }
     } else {
-      const cam = await startCameraStream();
-      const ps = ensureProgramStream();
-      await replaceOutgoingVideoTrack(state.media.camera_enabled ? (programVideoTrack || ps.getVideoTracks()[0] || cam.getVideoTracks()[0] || null) : null);
-      console.info('[broadcast/program] sender using program video track');
+      if (state.media.camera_enabled) {
+        try {
+          await startCameraStream();
+        } catch (err) {
+          console.warn('[broadcast/camera] unavailable; continuing with canvas video', err);
+        }
+      }
     }
+    console.info('[broadcast/program] sender using program video track');
     if (state.media.mic_enabled) {
-      const cam = await startCameraStream();
-      await replaceOutgoingAudioTrack(cam.getAudioTracks()[0] || null);
+      try {
+        const mic = await startMicStream();
+        await replaceOutgoingAudioTrack(mic.getAudioTracks()[0] || null);
+      } catch (err) {
+        console.warn('[broadcast/mic] unavailable; continuing video-only', err);
+        await replaceOutgoingAudioTrack(null);
+      }
     } else {
       await replaceOutgoingAudioTrack(null);
     }
@@ -785,7 +825,7 @@
     const tracks = [];
     const videoTrack = programVideoTrack || ps.getVideoTracks()[0];
     if (videoTrack) tracks.push(videoTrack);
-    const audioTrack = state.camStream?.getAudioTracks?.()[0];
+    const audioTrack = currentMicTrack();
     if (audioTrack) tracks.push(audioTrack);
     return tracks.length ? new MediaStream(tracks) : null;
   }
@@ -853,10 +893,14 @@
   }
 
   function sendAudioChunk(b64, sampleRate) {
+    const durationMs = 200;
     sendJson(state.chatWs, 'audio_chunk', {
       encoding: 'linear16',
       channels: STT_TARGET_CHANNELS,
       sampleRate,
+      seq: ++sttChunkSeq,
+      startedAt: Date.now(),
+      durationMs,
       data: b64,
     });
   }
@@ -905,8 +949,8 @@
   async function startSpeechCaptureFromMic() {
     stopSpeechCapture();
     if (!state.media.stt_enabled || !state.media.mic_enabled) return;
-    const cam = await startCameraStream();
-    const track = cam.getAudioTracks()[0];
+    const mic = await startMicStream();
+    const track = mic.getAudioTracks()[0];
     if (!track) return;
 
     const sttStream = new MediaStream([track.clone()]);
@@ -920,8 +964,7 @@
     processor.onaudioprocess = (event) => {
     if (!state.chatWs || state.chatWs.readyState !== WebSocket.OPEN) return;
       const now = Date.now();
-      sttFrameModulo = (sttFrameModulo + 1) % 3;
-      if (sttFrameModulo !== 0 || (now - lastSttSentAt) < 120) return;
+      if ((now - lastSttSentAt) < 180) return;
       const input = event.inputBuffer.getChannelData(0);
       const reduced = downsampleBuffer(input, ctx.sampleRate, STT_TARGET_SAMPLE_RATE);
       const pcm = floatToInt16(reduced);
@@ -972,35 +1015,63 @@
     ws.onopen = async () => {
       signalRetryMs = 1200;
       sendJson(ws, 'join', { role: 'broadcaster' });
-      await syncTracks();
-      sendJson(ws, 'media_ready');
+      const { stream: ps, track: programTrack } = getProgramVideoTrackOrThrow();
+      const pc = await ensurePeerConnection();
+      const vtrack = programTrack || null;
+      if (vtrack && !pc.getSenders().some((s) => s.track && s.track.kind === 'video')) {
+        pc.addTrack(vtrack, ps);
+        console.info('[broadcast/webrtc] session=%s added program video sender id=%s readyState=%s', broadcastSessionId, vtrack.id || '', vtrack.readyState || '');
+      }
+      try {
+        await syncTracks();
+      } catch (err) {
+        console.warn('[broadcast/webrtc] syncTracks failed; publishing canvas anyway', {
+          message: err?.message || String(err),
+        });
+      }
+      console.info('[broadcast/program] session=%s video track ready id=%s readyState=%s', broadcastSessionId, vtrack?.id || '', vtrack?.readyState || '');
+      const hasVideoSender = pc.getSenders().some((s) => s.track && s.track.kind === 'video');
+      const hasAudioSender = pc.getSenders().some((s) => s.track && s.track.kind === 'audio');
+      console.info('[broadcast/webrtc] outbound senders video=%s audio=%s', hasVideoSender, hasAudioSender);
+      if (!hasVideoSender) {
+        console.error('[broadcast/webrtc] no video sender; cannot publish');
+        return;
+      }
+      console.info('[broadcast/webrtc] session=%s creating offer senders=%o', broadcastSessionId, pc.getSenders().map((s) => ({ kind: s.track?.kind, id: s.track?.id, readyState: s.track?.readyState })));
+      const offer = await pc.createOffer();
+      const hasMVideo = /\r?\nm=video\s/.test(offer.sdp) || offer.sdp.startsWith('m=video ');
+      const hasMAudio = /\r?\nm=audio\s/.test(offer.sdp) || offer.sdp.startsWith('m=audio ');
+      if (!hasMVideo || !hasVideoSender) {
+        console.error('[broadcast/webrtc] FATAL offer missing video', {
+          session: broadcastSessionId, hasMVideo, hasVideoSender,
+          senders: pc.getSenders().map((s) => ({ kind: s.track?.kind, id: s.track?.id, readyState: s.track?.readyState, enabled: s.track?.enabled, muted: s.track?.muted })),
+        });
+        return;
+      }
+      console.info('[broadcast/webrtc] session=%s offer has_m_video=%s has_m_audio=%s', broadcastSessionId, hasMVideo, hasMAudio);
+      await pc.setLocalDescription(offer);
+      console.info('[broadcast/webrtc] session=%s localDescription set', broadcastSessionId);
+      sendJson(ws, 'webrtc_offer', { sdp: offer.sdp, type: offer.type });
+      console.info('[broadcast/webrtc] session=%s broadcaster offer sent', broadcastSessionId);
+      sendJson(ws, 'media_ready', {
+        hasVideo: pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
+        hasAudio: pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),
+      });
+      console.info('[broadcast/webrtc] media_ready hasVideo=%s hasAudio=%s',
+        pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
+        pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),
+      );
     };
     ws.onmessage = async (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === 'viewer_joined' && msg.viewerId) {
-        await createOfferForViewer(msg.viewerId);
-      }
-      if (msg.type === 'viewer_left' && msg.viewerId) {
-        removeViewerPeer(msg.viewerId);
-      }
-      if (msg.type === 'answer' && msg.viewerId && msg.payload?.sdp) {
-        const pc = state.peerConnections[msg.viewerId];
-        if (pc) await pc.setRemoteDescription({ type: msg.payload.type || 'answer', sdp: msg.payload.sdp });
-      }
-      if (msg.type === 'ice-candidate' && msg.viewerId && msg.candidate) {
-        const pc = state.peerConnections[msg.viewerId];
-        if (pc) {
-          try { await pc.addIceCandidate(msg.candidate); } catch (_) {}
-        }
-      }
       if (msg.type === 'webrtc_answer' && msg.sdp && state.pc) {
         await state.pc.setRemoteDescription({ type: msg.answerType || 'answer', sdp: msg.sdp });
+        console.info('[broadcast/webrtc] broadcaster answer applied');
       }
       if (msg.type === 'presence') applyPresence(msg);
       if (msg.type === 'state_sync' || msg.type === 'state_update') applyRoomState(msg.state || {});
     };
     ws.onclose = () => {
-      Object.keys(state.peerConnections).forEach(removeViewerPeer);
       setTimeout(connectSignal, signalRetryMs);
       signalRetryMs = Math.min(15000, Math.round(signalRetryMs * 1.7));
     };
@@ -1011,6 +1082,20 @@
     sendJson(state.signalWs, 'toggle_state', { state: state.media });
     sendJson(state.signalWs, 'set_media_mode', { camera: state.media.camera_enabled, screen: state.media.screen_enabled, mic: state.media.mic_enabled });
     applyRoomState({ settings: state.media, runtime: { broadcaster_present: true, viewer_count: Number(dom.stWatchers?.textContent || 0) } });
+  }
+
+  function bindDoubleTap(el, handler, windowMs = 380) {
+    if (!el) return;
+    let lastTapAt = 0;
+    el.addEventListener('click', async (ev) => {
+      const now = Date.now();
+      if ((now - lastTapAt) > windowMs) {
+        lastTapAt = now;
+        return;
+      }
+      lastTapAt = 0;
+      await handler(ev);
+    });
   }
 
   function sendChatMessage() {
@@ -1025,20 +1110,20 @@
     dom.chatInput.value = '';
   }
 
-  dom.sendBtn?.addEventListener('click', sendChatMessage);
+  bindDoubleTap(dom.sendBtn, async () => { sendChatMessage(); });
   dom.chatInput?.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); sendChatMessage(); }
   });
 
-  dom.webBtn?.addEventListener('click', () => {
+  bindDoubleTap(dom.webBtn, async () => {
     const query = (dom.chatInput?.value || '').trim();
     if (!query) return;
     if (DEBUG_CHAT) console.debug('[broadcast.chat] web_search send', { query_len: query.length });
     sendJson(state.chatWs, 'web_search', { query });
   });
-  dom.searchCloseBtn?.addEventListener('click', () => dom.searchPane?.classList.remove('open'));
+  bindDoubleTap(dom.searchCloseBtn, async () => { dom.searchPane?.classList.remove('open'); });
 
-  dom.attachBtn?.addEventListener('click', () => dom.fileInput?.click());
+  bindDoubleTap(dom.attachBtn, async () => { dom.fileInput?.click(); });
   dom.fileInput?.addEventListener('change', async () => {
     const f = dom.fileInput.files?.[0];
     if (!f) return;
@@ -1049,36 +1134,42 @@
   });
 
   dom.camBtn?.addEventListener('click', async () => {
-    state.media.camera_enabled = true;
     await rotateCamera();
   });
-  dom.screenBtn?.addEventListener('click', async () => {
+  dom.camPowerBtn?.addEventListener('click', async () => {
+    state.media.camera_enabled = !state.media.camera_enabled;
+    console.info('[broadcast/camera-ui] power enabled=%s', state.media.camera_enabled);
+    if (!state.media.camera_enabled) {
+      await stopCameraStream();
+      await replaceOutgoingVideoTrack(programVideoTrack || ensureProgramStream().getVideoTracks()[0] || null);
+    } else {
+      await startCameraStream();
+      await syncTracks();
+    }
+    updateCameraPowerLabel();
+    announceState();
+  });
+  bindDoubleTap(dom.screenBtn, async () => {
     if (state.media.screen_enabled) await switchToCamera(); else await switchToScreen();
   });
-  dom.micBtn?.addEventListener('click', async () => {
+  bindDoubleTap(dom.micBtn, async () => {
     state.media.mic_enabled = !state.media.mic_enabled;
+    if (state.media.mic_enabled) await startMicStream(); else await stopMicStream();
     await syncTracks();
     if (state.media.mic_enabled && state.media.stt_enabled) await startSpeechCaptureFromMic();
     else stopSpeechCapture();
     announceState();
   });
-  dom.sttBtn?.addEventListener('click', async () => {
+  bindDoubleTap(dom.sttBtn, async () => {
     state.media.stt_enabled = !state.media.stt_enabled;
     if (state.media.stt_enabled && state.media.mic_enabled) await startSpeechCaptureFromMic();
     else stopSpeechCapture();
     announceState();
   });
-  dom.ncBtn?.addEventListener('click', async () => {
-    state.media.noise_cancel_enabled = !state.media.noise_cancel_enabled;
-    if (state.camStream) { state.camStream.getTracks().forEach((t) => t.stop()); state.camStream = null; }
-    await syncTracks();
-    if (state.media.stt_enabled && state.media.mic_enabled) await startSpeechCaptureFromMic();
-    announceState();
-  });
-  dom.aiEnableBtn?.addEventListener('click', () => { state.media.ai_enabled = !state.media.ai_enabled; announceState(); });
-  dom.ttsMonBtn?.addEventListener('click', () => { state.media.hear_ai_voice = !state.media.hear_ai_voice; announceState(); });
-  dom.recordBtn?.addEventListener('click', () => { toggleRecording().catch(() => {}); });
-  dom.rtmpBtn?.addEventListener('click', () => { toggleRtmp().catch(() => {}); });
+  bindDoubleTap(dom.aiEnableBtn, async () => { state.media.ai_enabled = !state.media.ai_enabled; announceState(); });
+  bindDoubleTap(dom.ttsMonBtn, async () => { state.media.hear_ai_voice = !state.media.hear_ai_voice; announceState(); });
+  bindDoubleTap(dom.recordBtn, async () => { toggleRecording().catch(() => {}); });
+  bindDoubleTap(dom.rtmpBtn, async () => { toggleRtmp().catch(() => {}); });
   const pointerDown = (ev) => {
     if (!state.media.screen_enabled) return;
     const rect = dom.preview?.getBoundingClientRect();
@@ -1123,7 +1214,7 @@
   dom.preview?.addEventListener('touchstart', pointerDown, { passive: true });
   window.addEventListener('touchmove', pointerMove, { passive: true });
   window.addEventListener('touchend', pointerUp, { passive: true });
-  dom.chatCollapseBtn?.addEventListener('click', () => {
+  bindDoubleTap(dom.chatCollapseBtn, async () => {
     if (!dom.chatPanel) return;
     dom.chatPanel.classList.toggle('collapsed');
     dom.chatCollapseBtn.textContent = dom.chatPanel.classList.contains('collapsed') ? 'Expand' : 'Collapse';
@@ -1134,6 +1225,7 @@
     if (dom.chatCollapseBtn) dom.chatCollapseBtn.textContent = 'Expand';
   }
   applyRoomState({ settings: state.media, runtime: { broadcaster_present: false, viewer_count: 0 } });
+  updateCameraPowerLabel();
   ensureProgramStream();
   hideCameraPipPreview();
   installWakeLock();
@@ -1141,5 +1233,11 @@
   connectSignal();
 
   // Best effort startup: UI stays ON even if browser prompts for permissions first.
-  startCameraStream().then(refreshVideoInputs).then(syncTracks).then(() => { announceState(); startSpeechCaptureFromMic().catch(() => {}); }).catch(() => announceState());
+  Promise.allSettled([startCameraStream(), startMicStream()])
+    .then(refreshVideoInputs)
+    .then(() => syncTracks().catch((err) => {
+      console.warn('[broadcast/startup] syncTracks failed after media init', err);
+    }))
+    .then(() => { announceState(); startSpeechCaptureFromMic().catch(() => {}); })
+    .catch(() => announceState());
 })();

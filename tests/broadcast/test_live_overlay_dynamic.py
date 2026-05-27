@@ -23,9 +23,19 @@ def test_watch_socket_handles_broadcaster_start_stop_overlay_lifecycle():
     assert "msg.type === 'broadcaster-start'" in src
     assert "msg.type === 'broadcaster-stop'" in src
     assert "import('/static/js/ui/liveOverlay.js')" in src
+    assert "ignoring non-video stream_started" in src
+    assert "ignoring non-video broadcaster-start" in src
+    assert "requestStream(false, 'state_sync')" in src
+    assert "audioTrackSeen" in src
 
 
 def test_broadcast_socket_emits_broadcaster_start_and_stop_events():
     src = _read('server/broadcast/routes.py')
     assert '"type": "broadcaster-start"' in src
     assert '"type": "broadcaster-stop"' in src
+    assert 'await _send_offer(room_id, client_id)\n                            continue' in src
+
+
+def test_watch_html_does_not_permanently_hide_live_overlay():
+    html = _read('static/watch.html')
+    assert '#liveOverlay{display:none' not in html

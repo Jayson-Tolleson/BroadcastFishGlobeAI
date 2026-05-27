@@ -30,8 +30,19 @@
   const v = dom.video;
 
   const unmuteBtn = document.createElement('button');
-  unmuteBtn.textContent = 'Tap to Play Stream';
+  unmuteBtn.textContent = 'Tap for sound';
   unmuteBtn.style.display = 'none';
+  let liveOverlayApi = null;
+  let audioTrackSeen = false;
+  let videoTrackSeen = false;
+  let videoActive = false;
+  let offerInProgress = false;
+  let lastRequestAt = 0;
+  let lastForceRequestAt = 0;
+  let missingVideoSince = 0;
+  const REQUEST_MIN_INTERVAL_MS = 3000;
+  const FORCE_RENEGOTIATE_MIN_INTERVAL_MS = 10000;
+  const MISSING_VIDEO_TIMEOUT_MS = 7000;
 
   let ws = null;
   let pc = null;
@@ -42,6 +53,7 @@
   let hasRequestedStream = false;
   let retryTimer = null;
   let requestTimeout = null;
+  let streamPollTimer = null;
   let hearAiVoice = true;
   const DEBUG_CHAT = false;
   let lastChatSendAt = 0;
@@ -125,21 +137,45 @@
     return true;
   }
 
+  async function ensureLiveOverlay() {
+    if (liveOverlayApi) return liveOverlayApi;
+    try {
+      liveOverlayApi = await import('/static/js/ui/liveOverlay.js');
+      return liveOverlayApi;
+    } catch (err) {
+      console.warn('[watch/liveOverlay] import failed', err);
+      return null;
+    }
+  }
+
+  async function overlaySet(phase, payload = {}) {
+    const api = await ensureLiveOverlay();
+    if (!api || typeof api.applyLiveOverlay !== 'function') return;
+    try { api.applyLiveOverlay(phase, payload); } catch (err) { console.warn('[watch/liveOverlay] apply failed', err); }
+  }
+
+  function hasLiveRemoteVideo() {
+    const stream = dom.video && dom.video.srcObject;
+    return stream instanceof MediaStream && stream.getVideoTracks().some((track) => track.readyState === 'live');
+  }
+
 
   function setLiveMutedAutoplay() {
+    const v = dom.video;
     if (!v) return;
     v.playsInline = true;
     v.autoplay = true;
+    v.controls = true;
     v.muted = true;
   }
 
   async function tryPlay(reason) {
     if (!dom.video) return;
     dom.video.controls = true;
-    dom.video.muted = false;
+    dom.video.muted = true;
     try {
       console.info('[watch/video] autoplay attempt', { reason });
-      dom.video.muted = false;
+      dom.video.muted = true;
       await dom.video.play();
       showJoinOverlay(false);
       console.info('[watch/video] playing', { reason });
@@ -149,30 +185,33 @@
     }
   }
 
-  function requestStream(force = false) {
-    if (force) hasRequestedStream = false;
-    scheduleStreamRequest(0);
-  }
+  function requestStream(force = false, reason = 'default') {
+    if (!broadcasterPresent) return;
+    const now = Date.now();
+    if (!force && (requestPending || offerInProgress)) return;
+    if (!force && hasRequestedStream && (now - lastRequestAt) < REQUEST_MIN_INTERVAL_MS) return;
+    if (force && (now - lastForceRequestAt) < FORCE_RENEGOTIATE_MIN_INTERVAL_MS) return;
 
-  function scheduleStreamRequest(delayMs = 350) {
-    if (retryTimer) clearTimeout(retryTimer);
-    retryTimer = setTimeout(() => {
-      retryTimer = null;
-      if (!broadcasterPresent || requestPending || hasRequestedStream) return;
+    if (force) {
+      hasRequestedStream = false;
+      requestPending = false;
+      if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
+      lastForceRequestAt = now;
+      sendJson('request_stream', { force: true, reason });
+      console.info('[watch/video] forcing renegotiation reason=%s', reason);
+    } else {
       requestPending = sendJson('request_stream');
-      hasRequestedStream = requestPending || hasRequestedStream;
-      if (requestPending) {
-        if (requestTimeout) clearTimeout(requestTimeout);
-        requestTimeout = setTimeout(() => {
-          if (!requestPending || !broadcasterPresent) return;
-          requestPending = false;
-          hasRequestedStream = false;
-          console.info('[watch] request_stream timeout; retrying');
-          scheduleStreamRequest(250);
-        }, 4000);
-      }
-      console.info('[watch] request_stream sent', { room, viewerId, requestPending });
-    }, delayMs);
+    }
+    hasRequestedStream = requestPending || force || hasRequestedStream;
+    lastRequestAt = now;
+    if (requestPending || force) {
+      if (requestTimeout) clearTimeout(requestTimeout);
+      requestTimeout = setTimeout(() => {
+        requestPending = false;
+        hasRequestedStream = false;
+      }, 4000);
+    }
+    console.info('[watch] request_stream sent', { room, viewerId, requestPending, force, reason });
   }
 
   async function iceServers() {
@@ -193,16 +232,29 @@
     }
     pc = new RTCPeerConnection({ iceServers: await iceServers() });
     pc.ontrack = async (event) => {
-      const stream = event.streams?.[0] || new MediaStream([event.track]);
-      if (dom.video.srcObject !== stream) dom.video.srcObject = stream;
+      console.info('[watch/rtc] track received kind=%s id=%s', (event.track?.kind || 'unknown'), (event.track?.id || 'na'));
+      const existing = dom.video.srcObject instanceof MediaStream ? dom.video.srcObject : new MediaStream();
+      if (event.track && !existing.getTracks().find((t) => t.id === event.track.id)) existing.addTrack(event.track);
+      if (dom.video.srcObject !== existing) dom.video.srcObject = existing;
       setStandby(false);
-      dom.mode && (dom.mode.textContent = 'LIVE');
-      console.info('[watch/video] stream attached', { kind: event.track?.kind || 'unknown' });
       await tryPlay('remote_track_attach');
+      if (event.track?.kind === 'video') {
+        videoTrackSeen = true;
+        missingVideoSince = 0;
+        dom.mode && (dom.mode.textContent = 'LIVE');
+        console.info('[watch/rtc] video track attached');
+        overlaySet('video_active', { room });
+      } else if (event.track?.kind === 'audio') {
+        audioTrackSeen = true;
+      }
+      if (!hasLiveRemoteVideo()) {
+        if (audioTrackSeen && !videoTrackSeen) setStandby(true, 'audio-only: waiting for video track');
+        else setStandby(true, 'Broadcaster connected, waiting for video…');
+        overlaySet('waiting_for_video', { room });
+      }
     };
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
-      sendJson('ice-candidate', { viewerId, candidate: e.candidate });
       sendJson('webrtc_ice', { candidate: e.candidate });
     };
     pc.onconnectionstatechange = () => {
@@ -213,7 +265,7 @@
         if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
         hasRequestedStream = false;
         setStandby(true, 'Reconnecting stream…');
-        if (broadcasterPresent) scheduleStreamRequest(500);
+        if (broadcasterPresent) requestStream(false, 'pc_state_recover');
       }
     };
     return pc;
@@ -221,15 +273,18 @@
 
   async function onOffer(payload, sourceType) {
     if (!payload?.sdp) return;
-    console.info('[watch] offer received', { room, viewerId, sourceType });
+    const hasMVideo = /\r?\nm=video\s/.test(payload.sdp) || payload.sdp.startsWith('m=video ');
+    console.info('[watch] watch_offer received', { hasMVideo, room, viewerId, sourceType });
+    if (!hasMVideo) console.error('[watch] FATAL server watch_offer missing video');
     requestPending = false;
     hasRequestedStream = false;
+    offerInProgress = true;
     const localPc = await ensurePeerConnection(true);
     await localPc.setRemoteDescription(payload);
     const answer = await localPc.createAnswer();
     await localPc.setLocalDescription(answer);
-    sendJson('answer', { viewerId, sdp: answer.sdp, type: answer.type });
     sendJson('webrtc_answer', { sdp: answer.sdp, type: answer.type });
+    offerInProgress = false;
     console.info('[watch] answer sent', { viewerId });
   }
 
@@ -246,20 +301,23 @@
       if (dom.ai) dom.ai.textContent = `AI ${st.settings?.ai_status || (st.settings?.ai_enabled ? 'active' : 'idle')}`;
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
-      if (present) {
-        requestStream();
-      }
-      if (present && !requestPending) {
-        requestStream();
+      const videoReady = !!st.runtime?.stream_live || !!st.runtime?.video_ready;
+      if (present && videoReady && !requestPending && !offerInProgress && !hasLiveRemoteVideo()) {
+        requestStream(false, 'state_sync');
       }
       return;
     }
     if (msg.type === 'presence') {
       broadcasterPresent = !!msg.broadcaster_present;
+      const videoReady = !!msg.stream_live || !!msg.video_ready;
       if (dom.watchers) dom.watchers.textContent = `watchers ${msg.viewer_count ?? 0}`;
-      if (broadcasterPresent) {
+      if (broadcasterPresent && videoReady && !hasLiveRemoteVideo()) {
         dom.mode && (dom.mode.textContent = 'LIVE');
-        scheduleStreamRequest(100);
+        requestStream(false, 'presence_video_ready');
+      } else if (broadcasterPresent) {
+        dom.mode && (dom.mode.textContent = 'WAITING VIDEO');
+        setStandby(true, 'Broadcaster connected, waiting for video…');
+        overlaySet('waiting_for_video', { room });
       } else {
         dom.mode && (dom.mode.textContent = 'OFFLINE');
         setStandby(true, 'Waiting for broadcaster…');
@@ -268,13 +326,31 @@
       return;
     }
     if (msg.type === 'stream_started') {
+      const kind = msg.kind || msg.payload?.kind;
+      if (kind !== 'video') {
+        console.info('[watch] ignoring non-video stream_started', msg);
+        return;
+      }
       broadcasterPresent = true;
-      requestStream(true);
+      requestStream(false, 'stream_started_video');
+      return;
+    }
+    if (msg.type === 'stream_video_ready') {
+      broadcasterPresent = true;
+      const kind = msg.kind || msg.payload?.kind;
+      if (kind && kind !== 'video') return;
+      console.info('[watch] stream_video_ready received', { viewerId, room });
+      if (!hasLiveRemoteVideo()) requestStream(false, 'stream_video_ready');
       return;
     }
     if (msg.type === 'broadcaster-start') {
+      const kind = msg.kind || msg.payload?.kind;
+      if (kind !== 'video') {
+        console.info('[watch] ignoring non-video broadcaster-start', msg);
+        return;
+      }
       broadcasterPresent = true;
-      requestStream(true);
+      requestStream(false, 'broadcaster_start_video');
       return;
     }
     if (msg.type === 'broadcaster-stop') {
@@ -297,7 +373,7 @@
         if (pc) { try { pc.close(); } catch (_) {} pc = null; }
         dom.video.srcObject = null;
         dom.video.src = p.latestUploadUrl;
-        dom.video.muted = false;
+        dom.video.muted = true;
         await tryPlay('fallback_upload');
         dom.mode && (dom.mode.textContent = 'LATEST UPLOAD');
         setStandby(false);
@@ -314,19 +390,24 @@
       return;
     }
     if (msg.type === 'waiting' || msg.type === 'error') {
+      console.info('[watch] waiting message=%s', msg.message || msg.type);
       if (msg.message === 'stream_offline' || msg.message === 'no_broadcaster') {
         requestPending = false;
         if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
         hasRequestedStream = false;
-        setStandby(true, msg.message === 'stream_offline' ? 'Broadcaster connected, waiting for media…' : 'Waiting for broadcaster…');
+        setStandby(true, msg.message === 'stream_offline' ? 'Broadcaster connected, server has not received video track yet.' : 'Waiting for broadcaster…');
+        if (msg.message === 'stream_offline' && broadcasterPresent) requestStream(false, 'stream_offline');
+      }
+      if (msg.message === 'video_not_ready') {
+        setStandby(true, 'Broadcaster connected, server has not received video track yet.');
       }
       return;
     }
-    if (msg.type === 'offer' || msg.type === 'watch_offer' || msg.type === 'webrtc_offer') {
+    if (msg.type === 'watch_offer' || msg.type === 'webrtc_offer') {
       await onOffer(msg.payload, msg.type);
       return;
     }
-    if (msg.type === 'ice-candidate' || msg.type === 'webrtc_ice') {
+    if (msg.type === 'webrtc_ice') {
       const candidate = msg.candidate || msg.payload?.candidate;
       if (!candidate) return;
       await ensurePeerConnection();
@@ -353,7 +434,34 @@
       setStandby(true, 'Waiting for live stream…');
       setLiveMutedAutoplay();
       sendJson('join');
-      requestStream();
+      requestStream(false, 'ws_open');
+      if (streamPollTimer) clearInterval(streamPollTimer);
+      streamPollTimer = setInterval(() => {
+        if (!broadcasterPresent) return;
+        const hasVideo = hasLiveRemoteVideo();
+        if (hasVideo) {
+          videoActive = true;
+          missingVideoSince = 0;
+          return;
+        }
+        if (!missingVideoSince) missingVideoSince = Date.now();
+        if (requestPending || offerInProgress) {
+          setStandby(true, 'connecting video…');
+          return;
+        }
+        if (!videoTrackSeen && !audioTrackSeen) {
+          setStandby(true, 'waiting for video track…');
+          return;
+        }
+        if (audioTrackSeen && !videoTrackSeen) {
+          setStandby(true, 'audio connected, waiting for video track.');
+        }
+        if ((Date.now() - missingVideoSince) >= MISSING_VIDEO_TIMEOUT_MS) {
+          requestStream(true, 'missing_video');
+        } else if (!requestPending && !offerInProgress) {
+          requestStream(false, 'poll_wait_video');
+        }
+      }, 2500);
     };
 
     ws.onmessage = (ev) => {
@@ -368,6 +476,7 @@
       dom.conn && (dom.conn.textContent = 'reconnecting');
       requestPending = false;
       hasRequestedStream = false;
+      if (streamPollTimer) { clearInterval(streamPollTimer); streamPollTimer = null; }
       setStandby(true, 'Reconnecting viewer socket…');
       console.warn('[watch] websocket disconnected', { code: ev.code, reason: ev.reason, reconnectDelayMs });
       setTimeout(connect, reconnectDelayMs);
@@ -376,7 +485,7 @@
   }
 
   dom.joinBtn?.addEventListener('click', async () => {
-    dom.video.muted = false;
+    dom.video.muted = true;
     dom.video.controls = true;
     console.info('[watch/video] user play started');
     await tryPlay('manual_overlay_click');
@@ -438,6 +547,24 @@
   });
 
   dom.searchCloseBtn?.addEventListener('click', () => dom.searchPane?.classList.remove('open'));
+
+  dom.video?.addEventListener('loadedmetadata', () => {
+    console.info('[watch/rtc] video dimensions width=%s height=%s', dom.video.videoWidth, dom.video.videoHeight);
+  });
+  dom.video?.addEventListener('resize', () => {
+    console.info('[watch/rtc] video dimensions width=%s height=%s', dom.video.videoWidth, dom.video.videoHeight);
+  });
+  dom.video?.addEventListener('playing', () => {
+    const active = dom.video.videoWidth > 0 && dom.video.videoHeight > 0;
+    console.info('[watch/video] live video received %s', active);
+    if (active) {
+      videoActive = true;
+      missingVideoSince = 0;
+      setStandby(false);
+      dom.mode && (dom.mode.textContent = 'LIVE');
+      overlaySet('video_active', { room });
+    }
+  });
 
   connect();
 })();

@@ -20,6 +20,9 @@ class AudioChunk:
     encoding: str
     sample_rate_hz: int
     channels: int
+    seq: int | None = None
+    started_at: int | None = None
+    duration_ms: int | None = None
 
 
 def _parse_int(value: object, field_name: str) -> int:
@@ -64,4 +67,7 @@ def decode_audio_chunk_payload(payload: dict) -> AudioChunk:
         encoding=encoding,
         sample_rate_hz=sample_rate_hz,
         channels=channels,
+        seq=int(payload.get("seq")) if payload.get("seq") is not None else None,
+        started_at=int(payload.get("startedAt")) if payload.get("startedAt") is not None else None,
+        duration_ms=int(payload.get("durationMs")) if payload.get("durationMs") is not None else None,
     )

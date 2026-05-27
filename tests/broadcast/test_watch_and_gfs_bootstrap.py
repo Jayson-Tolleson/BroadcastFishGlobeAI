@@ -6,8 +6,9 @@ def test_watch_live_autoplay_muted_with_unmute_control_and_state_requests():
     assert 'setLiveMutedAutoplay' in src
     assert 'v.muted = true' in src
     assert "unmuteBtn.textContent = 'Tap for sound'" in src
-    assert "if (present) {" in src and 'requestStream();' in src
-    assert "if (present && !requestPending)" in src
+    assert "requestStream(false, 'stream_video_ready')" in src
+    assert "requestStream(false, 'presence_video_ready')" in src
+    assert "requestStream(false, 'presence')" not in src
 
 
 def test_gfs_bootstrap_stage_order_fish_then_balloons_then_weather():

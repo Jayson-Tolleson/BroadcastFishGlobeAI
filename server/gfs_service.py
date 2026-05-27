@@ -3117,6 +3117,8 @@ class GFSService:
                     confidence="medium",
                 )
                 return cached_payload
+            if not self.allow_synthetic_fallback:
+                raise RuntimeError(f"ncss_live_failed:{exc}") from exc
             return self._weather_unavailable_payload(bbox, reason=f"ncss_live_failed:{exc}")
 
     def _refresh_weather_cache(self, refresh_bbox: dict[str, float], *, trigger: str = "unknown") -> None:

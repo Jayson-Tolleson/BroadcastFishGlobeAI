@@ -352,24 +352,32 @@ class RTCManager:
             await self.stop_broadcaster(room_id, sid)
             return await self.start_broadcaster_from_offer(room_id, sid, sdp, sdp_type)
 
-        log.info("apply viewer remote answer room=%s sid=%s state=%s", room_id, sid, pc.signalingState)
-        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
-        if hasattr(pc, "getTransceivers"):
+        async def _scan_broadcaster_transceivers(source: str = "transceiver-scan") -> None:
+            if not hasattr(pc, "getTransceivers"):
+                return
             for t in pc.getTransceivers():
                 track_obj = getattr(getattr(t, "receiver", None), "track", None)
                 log.info(
-                    "broadcaster transceiver room=%s sid=%s session=%s kind=%s direction=%s currentDirection=%s receiver_track=%s",
-                    room_id, sid, session_id,
+                    "broadcaster transceiver room=%s sid=%s session=%s kind=%s direction=%s currentDirection=%s receiver_track=%s source=%s",
+                    room_id,
+                    sid,
+                    session_id,
                     getattr(track_obj, "kind", None),
                     getattr(t, "direction", None),
                     getattr(t, "currentDirection", None),
                     getattr(track_obj, "id", None),
+                    source,
                 )
                 if getattr(track_obj, "kind", None) == "video":
-                    await _register_broadcaster_video_track(track_obj, source="transceiver-scan")
+                    await _register_broadcaster_video_track(track_obj, source=source)
+
+        log.info("apply broadcaster remote offer room=%s sid=%s state=%s", room_id, sid, pc.signalingState)
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
+        await _scan_broadcaster_transceivers(source="transceiver-scan")
         await self._flush_broadcaster_ice(room_id, sid, pc)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        await _scan_broadcaster_transceivers(source="transceiver-post-answer")
         await self._wait_ice_complete(pc)
         await self._emit_status(room_id)
         return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}

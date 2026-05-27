@@ -161,6 +161,7 @@
 
 
   function setLiveMutedAutoplay() {
+    const v = dom.video;
     if (!v) return;
     v.playsInline = true;
     v.autoplay = true;

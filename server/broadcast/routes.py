@@ -501,11 +501,11 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
             await ws.send_json({"type": "presence", "room": active_room_id, "broadcaster_present": False, "stream_live": False, "viewer_count": len(room.viewers), "ts": now_ms()})
             await ws.send_json({"type": "waiting", "room": active_room_id, "message": "no_broadcaster", "ts": now_ms()})
 
-        async def _send_waiting_stream_offline(active_room_id: str, active_client_id: str) -> None:
+        async def _send_waiting_stream_offline(active_room_id: str, active_client_id: str, reason: str = "stream_offline") -> None:
             room = state.ensure_room(active_room_id)
             log.debug("watch waiting room=%s client=%s reason=stream_not_live", active_room_id, active_client_id)
             await ws.send_json({"type": "presence", "room": active_room_id, "broadcaster_present": room.broadcaster_sid is not None, "stream_live": False, "viewer_count": len(room.viewers), "ts": now_ms()})
-            await ws.send_json({"ok": False, "type": "waiting", "room": active_room_id, "message": "stream_offline", "ts": now_ms()})
+            await ws.send_json({"ok": False, "type": "waiting", "room": active_room_id, "message": reason, "ts": now_ms()})
 
         def _room_has_live_source(active_room_id: str) -> bool:
             room = state.ensure_room(active_room_id)
@@ -521,7 +521,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
             offer_outstanding = True
             offer_started_at = asyncio.get_running_loop().time()
             _set_state("offer_pending", "offer_sent")
-            log.info("watch offer sent room=%s client=%s", active_room_id, active_client_id)
+            log.info("watch offer sent room=%s client=%s has_video_required=True", active_room_id, active_client_id)
 
         registry.register(room_id, "watch", ws, client_id)
         state.ensure_room(room_id).viewers[client_id] = True
@@ -604,8 +604,9 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                                 _set_state("request_pending", "join_wait_live_then_offer")
                                 await _send_offer(room_id, client_id)
                             else:
-                                _set_state("waiting_for_broadcaster", "stream_offline")
-                                await _send_waiting_stream_offline(room_id, client_id)
+                                _set_state("waiting_for_broadcaster", "video_not_ready")
+                                log.info("watch waiting reason=video_not_ready room=%s client=%s", room_id, client_id)
+                                await _send_waiting_stream_offline(room_id, client_id, reason="video_not_ready")
                         elif not offer_outstanding:
                             log.info("watch signaling started room=%s client=%s", room_id, client_id)
                             try:
@@ -614,7 +615,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                             except StreamOfflineError:
                                 offer_outstanding = False
                                 offer_started_at = 0.0
-                                await _send_waiting_stream_offline(room_id, client_id)
+                                await _send_waiting_stream_offline(room_id, client_id, reason="video_not_ready")
                             except Exception:
                                 log.exception("watch offer creation failed room=%s client=%s", room_id, client_id)
                                 await ws.send_json({"ok": False, "type": "error", "room": room_id, "message": "watch_offer_failed", "ts": now_ms()})
@@ -658,16 +659,17 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         else:
                             offer_outstanding = False
                             offer_started_at = 0.0
-                            _set_state("waiting_for_broadcaster", "stream_offline")
-                            next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
-                            await _send_waiting_stream_offline(room_id, client_id)
+                        _set_state("waiting_for_broadcaster", "video_not_ready")
+                        next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
+                        log.info("watch waiting reason=video_not_ready room=%s client=%s", room_id, client_id)
+                        await _send_waiting_stream_offline(room_id, client_id, reason="video_not_ready")
                     else:
                         try:
                             await _send_offer(room_id, client_id)
                         except StreamOfflineError:
                             offer_outstanding = False
                             offer_started_at = 0.0
-                            await _send_waiting_stream_offline(room_id, client_id)
+                            await _send_waiting_stream_offline(room_id, client_id, reason="video_not_ready")
                         except Exception:
                             log.exception("watch request_stream offer failed room=%s client=%s", room_id, client_id)
                             await ws.send_json({"ok": False, "type": "error", "room": room_id, "message": "watch_offer_failed", "ts": now_ms()})

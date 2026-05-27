@@ -42,6 +42,7 @@ class RTCManager:
         self.live_video_source: Dict[str, Any] = {}
         self.live_audio_source: Dict[str, Any] = {}
         self.broadcast_live_event: Dict[str, asyncio.Event] = {}
+        self.broadcast_video_event: Dict[str, asyncio.Event] = {}
         self.viewers: Dict[str, Dict[str, RTCPeerConnection]] = {}
         self._pending_cleanup: Dict[str, asyncio.Task] = {}
         self.disconnect_grace_seconds = 60
@@ -78,6 +79,9 @@ class RTCManager:
     def _room_live_event(self, room_id: str) -> asyncio.Event:
         return self.broadcast_live_event.setdefault(room_id, asyncio.Event())
 
+    def _room_video_event(self, room_id: str) -> asyncio.Event:
+        return self.broadcast_video_event.setdefault(room_id, asyncio.Event())
+
     def has_live_source(self, room_id: str) -> bool:
         if self.live_video_source.get(room_id) or self.live_audio_source.get(room_id):
             return True
@@ -105,7 +109,7 @@ class RTCManager:
     async def wait_for_live_video_source(self, room_id: str, timeout_s: float = 2.0) -> bool:
         if self.has_live_video_source(room_id):
             return True
-        ev = self._room_live_event(room_id)
+        ev = self._room_video_event(room_id)
         try:
             await asyncio.wait_for(ev.wait(), timeout=timeout_s)
         except asyncio.TimeoutError:
@@ -290,14 +294,17 @@ class RTCManager:
                 session.tracks[track.kind] = track
                 if track.kind == "video":
                     self.live_video_source[room_id] = track
-                    await self._emit_room(room_id, "stream_video_ready", {"room": room_id, "kind": "video", "ts": now_ms()})
-                elif track.kind == "audio":
-                    self.live_audio_source[room_id] = track
-                if self.has_live_source(room_id):
+                    self._room_video_event(room_id).set()
                     self._room_live_event(room_id).set()
                     room = self.state.ensure_room(room_id)
-                    room.media.live_active = bool(self.live_video_source.get(room_id))
+                    room.media.live_active = True
                     room.media.mode = "live"
+                    await self._emit_room(room_id, "stream_video_ready", {"room": room_id, "kind": "video", "ts": now_ms()})
+                    await self._emit_room(room_id, "stream_started", {"room": room_id, "kind": "video", "ts": now_ms()})
+                    await self._emit_room(room_id, "broadcaster-start", {"room": room_id, "kind": "video", "ts": now_ms()})
+                elif track.kind == "audio":
+                    self.live_audio_source[room_id] = track
+                    await self._emit_room(room_id, "audio_ready", {"room": room_id, "kind": "audio", "ts": now_ms()})
                 log.info(
                     "broadcaster track published room=%s sid=%s kind=%s id=%s ready=%s live_video=%s live_audio=%s",
                     room_id,
@@ -308,8 +315,6 @@ class RTCManager:
                     bool(self.live_video_source.get(room_id)),
                     bool(self.live_audio_source.get(room_id)),
                 )
-                await self._emit_room(room_id, "stream_started", {"room": room_id, "kind": track.kind, "ts": now_ms()})
-                await self._emit_room(room_id, "broadcaster-start", {"room": room_id, "kind": track.kind, "ts": now_ms()})
                 await self._emit_status(room_id)
 
         room = self.state.ensure_room(room_id)
@@ -549,6 +554,7 @@ class RTCManager:
         self.live_video_source.pop(room_id, None)
         self.live_audio_source.pop(room_id, None)
         self._room_live_event(room_id).clear()
+        self._room_video_event(room_id).clear()
 
         room = self.state.ensure_room(room_id)
         room.broadcaster_sid = None

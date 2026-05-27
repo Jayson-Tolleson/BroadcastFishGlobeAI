@@ -293,11 +293,8 @@
       if (dom.ai) dom.ai.textContent = `AI ${st.settings?.ai_status || (st.settings?.ai_enabled ? 'active' : 'idle')}`;
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
-      if (present) {
-        requestStream();
-      }
-      if (present && !requestPending) {
-        requestStream();
+      if (present && !requestPending && !offerInProgress && !hasLiveRemoteVideo()) {
+        requestStream(false, 'state_sync');
       }
       return;
     }
@@ -315,23 +312,26 @@
       return;
     }
     if (msg.type === 'stream_started') {
+      if (msg.kind !== 'video') {
+        console.info('[watch] ignoring non-video stream_started', msg);
+        return;
+      }
       broadcasterPresent = true;
-      requestStream(true);
+      requestStream(false, 'stream_started_video');
       return;
     }
     if (msg.type === 'stream_video_ready') {
       broadcasterPresent = true;
-      const ms = dom.video?.srcObject;
-      const hasVideo = ms instanceof MediaStream && ms.getVideoTracks().some((t) => t.readyState === 'live');
-      if (!hasVideo) {
-        console.info('[watch/video] forcing renegotiation reason=missing_video');
-        requestStream(true, 'missing_video');
-      }
+      if (!hasLiveRemoteVideo()) requestStream(false, 'stream_video_ready');
       return;
     }
     if (msg.type === 'broadcaster-start') {
+      if (msg.kind !== 'video') {
+        console.info('[watch] ignoring non-video broadcaster-start', msg);
+        return;
+      }
       broadcasterPresent = true;
-      requestStream(false, 'broadcaster_start');
+      requestStream(false, 'broadcaster_start_video');
       return;
     }
     if (msg.type === 'broadcaster-stop') {

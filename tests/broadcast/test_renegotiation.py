@@ -50,3 +50,14 @@ def test_watcher_peer_survives_broadcaster_renegotiation(rtc_patched):
         assert rtc.viewers["room"]["w1"] is watcher_pc
         assert not watcher_pc.closed
     asyncio.run(_run())
+
+
+def test_rtc_video_event_contract_in_source():
+    from pathlib import Path
+    src = Path("server/rtc.py").read_text(encoding="utf-8")
+    assert 'self.broadcast_video_event' in src
+    assert 'def _room_video_event' in src
+    assert 'if track.kind == "video":' in src
+    assert 'elif track.kind == "audio":' in src
+    assert '"stream_video_ready"' in src
+    assert '"audio_ready"' in src

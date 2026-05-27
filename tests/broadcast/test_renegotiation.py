@@ -55,13 +55,15 @@ def test_rtc_video_event_contract_in_source():
     from pathlib import Path
     src = Path("server/rtc.py").read_text(encoding="utf-8")
     assert 'generation: str = ""' in src
+    assert 'video_ready_emitted: bool = False' in src
     assert 'async def stop_broadcaster(self, room_id: str, sid: str, generation: str | None = None)' in src
     assert 'ignore stale broadcaster pc state' in src
     assert 'ignore stale stop_broadcaster' in src
     assert 'existing = self.broadcasters.pop(room_id, None)' in src
     assert 'self.broadcast_video_event' in src
     assert 'def _room_video_event' in src
-    assert 'if track.kind == "video":' in src
-    assert 'elif track.kind == "audio":' in src
+    assert 'if getattr(track, "kind", None) == "video":' in src
+    assert 'elif getattr(track, "kind", None) == "audio":' in src
     assert '"stream_video_ready"' in src
     assert '"audio_ready"' in src
+    assert 'source="transceiver-scan"' in src

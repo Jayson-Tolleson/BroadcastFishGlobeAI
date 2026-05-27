@@ -583,7 +583,7 @@
     if (!programStream) {
       programStream = programCanvas.captureStream(30);
       programVideoTrack = programStream.getVideoTracks()[0] || null;
-      console.info('[broadcast/program] stream ready');
+      console.info('[broadcast/program] canvas stream ready videoTracks=%s readyState=%s', programStream.getVideoTracks().length, programVideoTrack?.readyState || 'none');
     }
 
     if (dom.preview && dom.preview.srcObject !== programStream) {
@@ -636,6 +636,12 @@
         if (state.media.screen_enabled) { if (!loggedContainScreen) { console.info('[broadcast/program] source contain draw screen'); loggedContainScreen = true; } }
         else { if (!loggedContainCamera) { console.info('[broadcast/program] source contain draw camera'); loggedContainCamera = true; } }
       } catch (_) {}
+    } else {
+      programCtx.fillStyle = '#fff';
+      programCtx.font = '32px sans-serif';
+      programCtx.fillText('Program canvas live — camera pending', 80, 120);
+      programCtx.font = '24px sans-serif';
+      programCtx.fillText('Camera pending…', 80, 164);
     }
     if (state.media.screen_enabled && pip.enabled && camSourceEl.readyState >= 2) {
       syncCameraPipPreviewPosition();
@@ -664,6 +670,7 @@
 
   async function ensurePeerConnection() {
     if (state.pc) return state.pc;
+    console.info('[broadcast/webrtc] creating broadcaster pc');
     const iceCfg = await fetch(cfg.iceConfigUrl || '/webrtc/ice-config').then((r) => r.json()).catch(() => ({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }));
     const pc = new RTCPeerConnection({ iceServers: iceCfg.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }] });
     state.pc = pc;
@@ -676,7 +683,10 @@
     const ps = ensureProgramStream();
     const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
     const atrack = currentMicTrack();
-    if (vtrack) pc.addTrack(vtrack, ps);
+    if (vtrack) {
+      pc.addTrack(vtrack, ps);
+      console.info('[broadcast/webrtc] added program video sender id=%s readyState=%s', vtrack.id || '', vtrack.readyState || '');
+    }
     if (atrack && state.micStream) pc.addTrack(atrack, state.micStream);
     console.info('[broadcast/webrtc] outbound tracks video=%s audio=%s', !!vtrack, !!atrack);
     return pc;
@@ -705,22 +715,33 @@
 
   async function syncTracks() {
     startProgramLoop();
+    const ps = ensureProgramStream();
+    await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || null);
     if (state.media.screen_enabled) {
-      const screen = await startScreenStream();
-      const ps = ensureProgramStream();
-      await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || screen.getVideoTracks()[0] || null);
-      console.info('[broadcast/program] sender using program video track');
+      try {
+        await startScreenStream();
+      } catch (err) {
+        console.warn('[broadcast/screen] unavailable; continuing with canvas', err);
+        state.media.screen_enabled = false;
+      }
     } else {
       if (state.media.camera_enabled) {
-        await startCameraStream();
+        try {
+          await startCameraStream();
+        } catch (err) {
+          console.warn('[broadcast/camera] unavailable; continuing with canvas video', err);
+        }
       }
-      const ps = ensureProgramStream();
-      await replaceOutgoingVideoTrack(programVideoTrack || ps.getVideoTracks()[0] || null);
-      console.info('[broadcast/program] sender using program video track');
     }
+    console.info('[broadcast/program] sender using program video track');
     if (state.media.mic_enabled) {
-      const mic = await startMicStream();
-      await replaceOutgoingAudioTrack(mic.getAudioTracks()[0] || null);
+      try {
+        const mic = await startMicStream();
+        await replaceOutgoingAudioTrack(mic.getAudioTracks()[0] || null);
+      } catch (err) {
+        console.warn('[broadcast/mic] unavailable; continuing video-only', err);
+        await replaceOutgoingAudioTrack(null);
+      }
     } else {
       await replaceOutgoingAudioTrack(null);
     }
@@ -986,21 +1007,32 @@
     ws.onopen = async () => {
       signalRetryMs = 1200;
       sendJson(ws, 'join', { role: 'broadcaster' });
-      await syncTracks();
-      const pc = await ensurePeerConnection();
       const ps = ensureProgramStream();
+      const pc = await ensurePeerConnection();
       const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
       if (vtrack && !pc.getSenders().some((s) => s.track && s.track.kind === 'video')) {
         pc.addTrack(vtrack, ps);
+        console.info('[broadcast/webrtc] added program video sender id=%s readyState=%s', vtrack.id || '', vtrack.readyState || '');
+      }
+      try {
+        await syncTracks();
+      } catch (err) {
+        console.warn('[broadcast/webrtc] syncTracks failed; publishing canvas anyway', {
+          message: err?.message || String(err),
+        });
       }
       console.info('[broadcast/program] video track ready id=%s readyState=%s', vtrack?.id || '', vtrack?.readyState || '');
-      console.info(
-        '[broadcast/webrtc] outbound senders video=%s audio=%s',
-        pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
-        pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),
-      );
+      const hasVideoSender = pc.getSenders().some((s) => s.track && s.track.kind === 'video');
+      const hasAudioSender = pc.getSenders().some((s) => s.track && s.track.kind === 'audio');
+      console.info('[broadcast/webrtc] outbound senders video=%s audio=%s', hasVideoSender, hasAudioSender);
+      if (!hasVideoSender) {
+        console.error('[broadcast/webrtc] no video sender; cannot publish');
+        return;
+      }
+      console.info('[broadcast/webrtc] createOffer hasVideoSender=%s', hasVideoSender);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      console.info('[broadcast/webrtc] localDescription set');
       sendJson(ws, 'webrtc_offer', { sdp: offer.sdp, type: offer.type });
       console.info('[broadcast/webrtc] broadcaster offer sent');
       sendJson(ws, 'media_ready', {
@@ -1183,5 +1215,11 @@
   connectSignal();
 
   // Best effort startup: UI stays ON even if browser prompts for permissions first.
-  Promise.all([startCameraStream(), startMicStream()]).then(refreshVideoInputs).then(syncTracks).then(() => { announceState(); startSpeechCaptureFromMic().catch(() => {}); }).catch(() => announceState());
+  Promise.allSettled([startCameraStream(), startMicStream()])
+    .then(refreshVideoInputs)
+    .then(() => syncTracks().catch((err) => {
+      console.warn('[broadcast/startup] syncTracks failed after media init', err);
+    }))
+    .then(() => { announceState(); startSpeechCaptureFromMic().catch(() => {}); })
+    .catch(() => announceState());
 })();

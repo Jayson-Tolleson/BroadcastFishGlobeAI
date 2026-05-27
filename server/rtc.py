@@ -261,6 +261,9 @@ class RTCManager:
         return True, "disabled"
 
     async def start_broadcaster_from_offer(self, room_id: str, sid: str, sdp: str, sdp_type: str) -> Dict[str, str]:
+        has_m_video = "\nm=video " in sdp or sdp.startswith("m=video ")
+        has_m_audio = "\nm=audio " in sdp or sdp.startswith("m=audio ")
+        log.info("broadcaster offer received room=%s sid=%s has_m_video=%s has_m_audio=%s", room_id, sid, has_m_video, has_m_audio)
         existing = self.broadcasters.get(room_id)
         if existing and existing.sid != sid:
             await self.stop_broadcaster(room_id, existing.sid)

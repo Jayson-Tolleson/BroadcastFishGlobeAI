@@ -44,3 +44,12 @@ def test_routes_live_flag_is_video_based_not_audio_based():
     src = Path('server/broadcast/routes.py').read_text(encoding='utf-8')
     assert 'rtc.has_live_video_source(room_id)' in src
     assert 'rtc_live = bool(rtc is not None and rtc.has_live_source(room_id))' not in src
+
+
+def test_broadcast_offer_path_is_canvas_first_and_resilient():
+    src = Path('static/js/broadcast.js').read_text(encoding='utf-8')
+    assert 'Promise.allSettled' in src
+    assert 'syncTracks failed; publishing canvas anyway' in src
+    assert 'captureStream(30)' in src
+    assert 'pc.addTrack(vtrack, ps)' in src
+    assert "console.info('[broadcast/webrtc] createOffer hasVideoSender=%s'" in src

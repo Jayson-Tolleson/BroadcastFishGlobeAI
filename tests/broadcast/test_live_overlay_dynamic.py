@@ -33,6 +33,7 @@ def test_broadcast_socket_emits_broadcaster_start_and_stop_events():
     src = _read('server/broadcast/routes.py')
     assert '"type": "broadcaster-start"' in src
     assert '"type": "broadcaster-stop"' in src
+    assert 'await _send_offer(room_id, client_id)\n                            continue' in src
 
 
 def test_watch_html_does_not_permanently_hide_live_overlay():

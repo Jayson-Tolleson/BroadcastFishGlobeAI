@@ -54,6 +54,11 @@ def test_watcher_peer_survives_broadcaster_renegotiation(rtc_patched):
 def test_rtc_video_event_contract_in_source():
     from pathlib import Path
     src = Path("server/rtc.py").read_text(encoding="utf-8")
+    assert 'generation: str = ""' in src
+    assert 'async def stop_broadcaster(self, room_id: str, sid: str, generation: str | None = None)' in src
+    assert 'ignore stale broadcaster pc state' in src
+    assert 'ignore stale stop_broadcaster' in src
+    assert 'existing = self.broadcasters.pop(room_id, None)' in src
     assert 'self.broadcast_video_event' in src
     assert 'def _room_video_event' in src
     assert 'if track.kind == "video":' in src

@@ -676,6 +676,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                     elif not _room_has_live_source(room_id):
                         if rtc is not None and await rtc.wait_for_live_video_source(room_id, timeout_s=2.0):
                             await _send_offer(room_id, client_id)
+                            continue
                         else:
                             offer_outstanding = False
                             offer_started_at = 0.0

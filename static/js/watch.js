@@ -30,7 +30,7 @@
   const v = dom.video;
 
   const unmuteBtn = document.createElement('button');
-  unmuteBtn.textContent = 'Tap to Play Stream';
+  unmuteBtn.textContent = 'Tap for sound';
   unmuteBtn.style.display = 'none';
 
   let ws = null;
@@ -127,7 +127,7 @@
   }
 
 
-  function setLiveAutoplayWithSound() {
+  function setLiveMutedAutoplay() {
     if (!v) return;
     v.playsInline = true;
     v.autoplay = true;
@@ -256,7 +256,13 @@
       if (dom.ai) dom.ai.textContent = `AI ${st.settings?.ai_status || (st.settings?.ai_enabled ? 'active' : 'idle')}`;
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
-      if (present) requestStream(true);
+      if (present) {
+        requestStream();
+        requestStream(true);
+      }
+      if (present && !requestPending) {
+        requestStream();
+      }
       return;
     }
     if (msg.type === 'presence') {
@@ -368,7 +374,7 @@
       if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
       hasRequestedStream = false;
       setStandby(true, 'Waiting for live stream…');
-      setLiveAutoplayWithSound();
+      setLiveMutedAutoplay();
       sendJson('join');
       requestStream(true);
       if (streamPollTimer) clearInterval(streamPollTimer);

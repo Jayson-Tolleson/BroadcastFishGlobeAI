@@ -444,11 +444,23 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                     has_audio = bool(rtc is not None and rtc.has_live_source(room_id))
                     room.media.live_active = has_video
                     room.media.mode = "live" if has_video else ("upload" if room.media.latest_upload_url else "none")
-                    await registry.broadcast_room(
-                        room_id,
-                        {"type": "broadcaster-start", "room": room_id, "kind": "video" if has_video else "audio", "ts": now_ms()},
-                        kinds=("watch",),
-                    )
+                    if has_video:
+                        await registry.broadcast_room(
+                            room_id,
+                            {"type": "stream_video_ready", "room": room_id, "kind": "video", "ts": now_ms()},
+                            kinds=("watch",),
+                        )
+                        await registry.broadcast_room(
+                            room_id,
+                            {"type": "broadcaster-start", "room": room_id, "kind": "video", "ts": now_ms()},
+                            kinds=("watch",),
+                        )
+                    else:
+                        await registry.broadcast_room(
+                            room_id,
+                            {"type": "media-pending", "room": room_id, "kind": "audio", "video": False, "ts": now_ms()},
+                            kinds=("watch",),
+                        )
                     log.info("media_ready room=%s has_video=%s has_audio=%s", room_id, has_video, has_audio)
                     await _broadcast_presence(state, room_id)
                 elif kind == "toggle_state":
@@ -645,7 +657,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                     _set_state("request_pending", "request_stream")
                     room = state.ensure_room(room_id)
                     if bool(data.get("force")) and rtc is not None:
-                        log.info("watch renegotiate reason=%s room=%s client=%s", data.get("reason"), room_id, client_id)
+                        log.info("watch force renegotiate room=%s client=%s reason=%s", room_id, client_id, data.get("reason"))
                         await rtc.stop_viewer(room_id, client_id)
                     if room.broadcaster_sid is None:
                         offer_outstanding = False
@@ -654,9 +666,6 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         next_request_allowed_at = now_loop + WATCH_RETRY_BACKOFF_S
                         await _send_waiting_no_broadcaster(room_id, client_id)
                         continue
-                    if bool(data.get("force")) and rtc is not None:
-                        log.info("watch renegotiate reason=%s room=%s client=%s", data.get("reason"), room_id, client_id)
-                        await rtc.stop_viewer(room_id, client_id)
                     if rtc is None:
                         _set_state("waiting_for_broadcaster", "rtc_unavailable")
                         await ws.send_json({"type": "error", "room": room_id, "message": "rtc_unavailable", "ts": now_ms()})

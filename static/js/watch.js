@@ -198,7 +198,6 @@
       pc = null;
     }
     pc = new RTCPeerConnection({ iceServers: await iceServers() });
-    try { pc.addTransceiver('video', { direction: 'recvonly' }); pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
     pc.ontrack = async (event) => {
       console.info('[watch/webrtc] remote track kind=' + (event.track?.kind || 'unknown'));
       const existing = dom.video.srcObject instanceof MediaStream ? dom.video.srcObject : new MediaStream();
@@ -210,6 +209,7 @@
       await tryPlay('remote_track_attach');
       const ms = dom.video.srcObject;
       const hasVideo = ms instanceof MediaStream && ms.getVideoTracks().some((t) => t.readyState === 'live');
+      console.info('[watch/video] live video received %s', hasVideo);
       if (!hasVideo) setStandby(true, 'audio-only: waiting for video track');
     };
     pc.onicecandidate = (e) => {

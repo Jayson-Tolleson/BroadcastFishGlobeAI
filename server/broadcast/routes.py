@@ -440,9 +440,16 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         )
                         log.debug("signal ice route room=%s viewer=%s ok=%s", room_id, viewer_id, ok)
                 elif kind == "media_ready":
-                    room.media.live_active = True
-                    room.media.mode = "live"
-                    await registry.broadcast_room(room_id, {"type": "broadcaster-start", "room": room_id, "ts": now_ms()}, kinds=("watch",))
+                    has_video = bool(rtc is not None and rtc.has_live_video_source(room_id))
+                    has_audio = bool(rtc is not None and rtc.has_live_source(room_id))
+                    room.media.live_active = has_video
+                    room.media.mode = "live" if has_video else ("upload" if room.media.latest_upload_url else "none")
+                    await registry.broadcast_room(
+                        room_id,
+                        {"type": "broadcaster-start", "room": room_id, "kind": "video" if has_video else "audio", "ts": now_ms()},
+                        kinds=("watch",),
+                    )
+                    log.info("media_ready room=%s has_video=%s has_audio=%s", room_id, has_video, has_audio)
                     await _broadcast_presence(state, room_id)
                 elif kind == "toggle_state":
                     _merge_room_state(room, data.get("state") or {})

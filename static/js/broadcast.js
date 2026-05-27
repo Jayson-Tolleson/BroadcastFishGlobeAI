@@ -988,11 +988,29 @@
       sendJson(ws, 'join', { role: 'broadcaster' });
       await syncTracks();
       const pc = await ensurePeerConnection();
+      const ps = ensureProgramStream();
+      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+      if (vtrack && !pc.getSenders().some((s) => s.track && s.track.kind === 'video')) {
+        pc.addTrack(vtrack, ps);
+      }
+      console.info('[broadcast/program] video track ready id=%s readyState=%s', vtrack?.id || '', vtrack?.readyState || '');
+      console.info(
+        '[broadcast/webrtc] outbound senders video=%s audio=%s',
+        pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
+        pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),
+      );
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       sendJson(ws, 'webrtc_offer', { sdp: offer.sdp, type: offer.type });
       console.info('[broadcast/webrtc] broadcaster offer sent');
-      sendJson(ws, 'media_ready');
+      sendJson(ws, 'media_ready', {
+        hasVideo: pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
+        hasAudio: pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),
+      });
+      console.info('[broadcast/webrtc] media_ready hasVideo=%s hasAudio=%s',
+        pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
+        pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),
+      );
     };
     ws.onmessage = async (ev) => {
       let msg; try { msg = JSON.parse(ev.data); } catch { return; }

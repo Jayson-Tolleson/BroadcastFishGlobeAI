@@ -257,8 +257,6 @@
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
       if (present) requestStream(true);
-      sendJson('request_stream', { force: true, reason: 'missing_video' });
-          if (!hasVideo) sendJson('request_stream', { force: true, reason: 'missing_video' });
       return;
     }
     if (msg.type === 'presence') {
@@ -277,6 +275,17 @@
     if (msg.type === 'stream_started') {
       broadcasterPresent = true;
       requestStream(true);
+      return;
+    }
+    if (msg.type === 'stream_video_ready') {
+      broadcasterPresent = true;
+      const ms = dom.video?.srcObject;
+      const hasVideo = ms instanceof MediaStream && ms.getVideoTracks().some((t) => t.readyState === 'live');
+      if (!hasVideo) {
+        console.info('[watch/video] forcing renegotiation reason=missing_video');
+        sendJson('request_stream', { force: true, reason: 'missing_video' });
+        requestStream(true);
+      }
       return;
     }
     if (msg.type === 'broadcaster-start') {

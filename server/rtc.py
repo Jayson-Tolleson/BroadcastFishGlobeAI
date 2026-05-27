@@ -290,6 +290,7 @@ class RTCManager:
                 session.tracks[track.kind] = track
                 if track.kind == "video":
                     self.live_video_source[room_id] = track
+                    await self._emit_room(room_id, "stream_video_ready", {"room": room_id, "kind": "video", "ts": now_ms()})
                 elif track.kind == "audio":
                     self.live_audio_source[room_id] = track
                 if self.has_live_source(room_id):

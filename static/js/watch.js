@@ -33,6 +33,7 @@
   unmuteBtn.textContent = 'Tap for sound';
   unmuteBtn.style.display = 'none';
   let liveOverlayApi = null;
+  let audioTrackSeen = false;
   let videoTrackSeen = false;
   let videoActive = false;
   let offerInProgress = false;
@@ -242,8 +243,12 @@
         dom.mode && (dom.mode.textContent = 'LIVE');
         console.info('[watch/rtc] video track attached');
         overlaySet('video_active', { room });
-      } else if (!hasLiveRemoteVideo()) {
-        setStandby(true, 'audio-only: waiting for video track');
+      } else if (event.track?.kind === 'audio') {
+        audioTrackSeen = true;
+      }
+      if (!hasLiveRemoteVideo()) {
+        if (audioTrackSeen && !videoTrackSeen) setStandby(true, 'audio-only: waiting for video track');
+        else setStandby(true, 'Broadcaster connected, waiting for video…');
         overlaySet('waiting_for_video', { room });
       }
     };
@@ -293,17 +298,23 @@
       if (dom.ai) dom.ai.textContent = `AI ${st.settings?.ai_status || (st.settings?.ai_enabled ? 'active' : 'idle')}`;
       hearAiVoice = Boolean(st.settings?.hear_ai_voice ?? hearAiVoice);
       const present = broadcasterPresent;
-      if (present && !requestPending && !offerInProgress && !hasLiveRemoteVideo()) {
+      const videoReady = !!st.runtime?.stream_live || !!st.runtime?.video_ready;
+      if (present && videoReady && !requestPending && !offerInProgress && !hasLiveRemoteVideo()) {
         requestStream(false, 'state_sync');
       }
       return;
     }
     if (msg.type === 'presence') {
       broadcasterPresent = !!msg.broadcaster_present;
+      const videoReady = !!msg.stream_live || !!msg.video_ready;
       if (dom.watchers) dom.watchers.textContent = `watchers ${msg.viewer_count ?? 0}`;
-      if (broadcasterPresent) {
+      if (broadcasterPresent && videoReady && !hasLiveRemoteVideo()) {
         dom.mode && (dom.mode.textContent = 'LIVE');
-        requestStream(false, 'presence');
+        requestStream(false, 'presence_video_ready');
+      } else if (broadcasterPresent) {
+        dom.mode && (dom.mode.textContent = 'WAITING VIDEO');
+        setStandby(true, 'Broadcaster connected, waiting for video…');
+        overlaySet('waiting_for_video', { room });
       } else {
         dom.mode && (dom.mode.textContent = 'OFFLINE');
         setStandby(true, 'Waiting for broadcaster…');
@@ -312,7 +323,8 @@
       return;
     }
     if (msg.type === 'stream_started') {
-      if (msg.kind !== 'video') {
+      const kind = msg.kind || msg.payload?.kind;
+      if (kind !== 'video') {
         console.info('[watch] ignoring non-video stream_started', msg);
         return;
       }
@@ -322,11 +334,14 @@
     }
     if (msg.type === 'stream_video_ready') {
       broadcasterPresent = true;
+      const kind = msg.kind || msg.payload?.kind;
+      if (kind && kind !== 'video') return;
       if (!hasLiveRemoteVideo()) requestStream(false, 'stream_video_ready');
       return;
     }
     if (msg.type === 'broadcaster-start') {
-      if (msg.kind !== 'video') {
+      const kind = msg.kind || msg.payload?.kind;
+      if (kind !== 'video') {
         console.info('[watch] ignoring non-video broadcaster-start', msg);
         return;
       }
@@ -422,7 +437,17 @@
           return;
         }
         if (!missingVideoSince) missingVideoSince = Date.now();
-        setStandby(true, 'audio-only: waiting for video track');
+        if (requestPending || offerInProgress) {
+          setStandby(true, 'connecting video…');
+          return;
+        }
+        if (!videoTrackSeen && !audioTrackSeen) {
+          setStandby(true, 'waiting for video track…');
+          return;
+        }
+        if (audioTrackSeen && !videoTrackSeen) {
+          setStandby(true, 'audio connected, waiting for video track.');
+        }
         if ((Date.now() - missingVideoSince) >= MISSING_VIDEO_TIMEOUT_MS) {
           requestStream(true, 'missing_video');
         } else if (!requestPending && !offerInProgress) {

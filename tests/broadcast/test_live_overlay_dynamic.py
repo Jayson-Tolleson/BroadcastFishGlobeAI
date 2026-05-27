@@ -26,6 +26,7 @@ def test_watch_socket_handles_broadcaster_start_stop_overlay_lifecycle():
     assert "ignoring non-video stream_started" in src
     assert "ignoring non-video broadcaster-start" in src
     assert "requestStream(false, 'state_sync')" in src
+    assert "audioTrackSeen" in src
 
 
 def test_broadcast_socket_emits_broadcaster_start_and_stop_events():

@@ -261,12 +261,22 @@ class RTCManager:
         return True, "disabled"
 
     async def start_broadcaster_from_offer(self, room_id: str, sid: str, sdp: str, sdp_type: str) -> Dict[str, str]:
+        session_id = sid
         has_m_video = "\nm=video " in sdp or sdp.startswith("m=video ")
         has_m_audio = "\nm=audio " in sdp or sdp.startswith("m=audio ")
-        log.info("broadcaster offer received room=%s sid=%s has_m_video=%s has_m_audio=%s", room_id, sid, has_m_video, has_m_audio)
+        log.info("broadcaster offer received room=%s sid=%s session=%s has_m_video=%s has_m_audio=%s sdp_len=%s", room_id, sid, session_id, has_m_video, has_m_audio, len(sdp or ""))
         existing = self.broadcasters.get(room_id)
-        if existing and existing.sid != sid:
-            await self.stop_broadcaster(room_id, existing.sid)
+        if existing:
+            log.info("replacing existing broadcaster pc room=%s old_sid=%s new_sid=%s", room_id, existing.sid, sid)
+            try:
+                await existing.pc.close()
+            except Exception:
+                log.exception("error closing old broadcaster pc")
+            self.broadcasters.pop(room_id, None)
+            self.live_video_source.pop(room_id, None)
+            self.live_audio_source.pop(room_id, None)
+            self._room_video_event(room_id).clear()
+            self._room_live_event(room_id).clear()
             existing = None
         stale = [k for k in self._pending_broadcaster_ice.keys() if k[0] == room_id and k[1] != sid]
         for k in stale:
@@ -274,51 +284,48 @@ class RTCManager:
             self._pending_broadcaster_ice_seen.pop(k, None)
             self._ice_queue_started.discard(("broadcaster", k[0], k[1]))
 
-        if existing:
-            pc = existing.pc
-            session = existing
-        else:
-            pc = self._new_peer_connection()
-            session = BroadcasterSession(sid=sid, pc=pc, tracks={})
-            self.broadcasters[room_id] = session
+        pc = self._new_peer_connection()
+        session = BroadcasterSession(sid=sid, pc=pc, tracks={})
+        self.broadcasters[room_id] = session
 
-            @pc.on("connectionstatechange")
-            async def _on_connectionstatechange() -> None:
-                st = pc.connectionState
-                log.info("broadcaster state room=%s sid=%s state=%s", room_id, sid, st)
-                await self._emit_room(room_id, "webrtc_state", {"room": room_id, "role": "broadcaster", "state": st, "ts": now_ms()})
-                if st == "disconnected":
-                    await self._schedule_cleanup(room_id, sid, "broadcaster")
-                if st in {"failed", "closed"}:
-                    await self.stop_broadcaster(room_id, sid)
+        @pc.on("connectionstatechange")
+        async def _on_connectionstatechange() -> None:
+            st = pc.connectionState
+            log.info("broadcaster state room=%s sid=%s state=%s", room_id, sid, st)
+            await self._emit_room(room_id, "webrtc_state", {"room": room_id, "role": "broadcaster", "state": st, "ts": now_ms()})
+            if st == "disconnected":
+                await self._schedule_cleanup(room_id, sid, "broadcaster")
+            if st in {"failed", "closed"}:
+                await self.stop_broadcaster(room_id, sid)
 
-            @pc.on("track")
-            async def _on_track(track: Any) -> None:
-                session.tracks[track.kind] = track
-                if track.kind == "video":
-                    self.live_video_source[room_id] = track
-                    self._room_video_event(room_id).set()
-                    self._room_live_event(room_id).set()
-                    room = self.state.ensure_room(room_id)
-                    room.media.live_active = True
-                    room.media.mode = "live"
-                    await self._emit_room(room_id, "stream_video_ready", {"room": room_id, "kind": "video", "ts": now_ms()})
-                    await self._emit_room(room_id, "stream_started", {"room": room_id, "kind": "video", "ts": now_ms()})
-                    await self._emit_room(room_id, "broadcaster-start", {"room": room_id, "kind": "video", "ts": now_ms()})
-                elif track.kind == "audio":
-                    self.live_audio_source[room_id] = track
-                    await self._emit_room(room_id, "audio_ready", {"room": room_id, "kind": "audio", "ts": now_ms()})
-                log.info(
-                    "broadcaster track published room=%s sid=%s kind=%s id=%s ready=%s live_video=%s live_audio=%s",
-                    room_id,
-                    sid,
-                    track.kind,
-                    getattr(track, "id", None),
-                    getattr(track, "readyState", None),
-                    bool(self.live_video_source.get(room_id)),
-                    bool(self.live_audio_source.get(room_id)),
-                )
-                await self._emit_status(room_id)
+        @pc.on("track")
+        async def _on_track(track: Any) -> None:
+            session.tracks[track.kind] = track
+            if track.kind == "video":
+                self.live_video_source[room_id] = track
+                self._room_video_event(room_id).set()
+                self._room_live_event(room_id).set()
+                room = self.state.ensure_room(room_id)
+                room.media.live_active = True
+                room.media.mode = "live"
+                await self._emit_room(room_id, "stream_video_ready", {"room": room_id, "kind": "video", "ts": now_ms()})
+                await self._emit_room(room_id, "stream_started", {"room": room_id, "kind": "video", "ts": now_ms()})
+                await self._emit_room(room_id, "broadcaster-start", {"room": room_id, "kind": "video", "ts": now_ms()})
+            elif track.kind == "audio":
+                self.live_audio_source[room_id] = track
+                await self._emit_room(room_id, "audio_ready", {"room": room_id, "kind": "audio", "ts": now_ms()})
+            log.info(
+                "broadcaster track published room=%s sid=%s session=%s kind=%s id=%s ready=%s live_video=%s live_audio=%s",
+                room_id,
+                sid,
+                session_id,
+                track.kind,
+                getattr(track, "id", None),
+                getattr(track, "readyState", None),
+                bool(self.live_video_source.get(room_id)),
+                bool(self.live_audio_source.get(room_id)),
+            )
+            await self._emit_status(room_id)
 
         room = self.state.ensure_room(room_id)
         room.broadcaster_sid = sid
@@ -330,6 +337,17 @@ class RTCManager:
 
         log.info("apply viewer remote answer room=%s sid=%s state=%s", room_id, sid, pc.signalingState)
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type=sdp_type))
+        if hasattr(pc, "getTransceivers"):
+            for t in pc.getTransceivers():
+                track_obj = getattr(getattr(t, "receiver", None), "track", None)
+                log.info(
+                    "broadcaster transceiver room=%s sid=%s session=%s kind=%s direction=%s currentDirection=%s receiver_track=%s",
+                    room_id, sid, session_id,
+                    getattr(track_obj, "kind", None),
+                    getattr(t, "direction", None),
+                    getattr(t, "currentDirection", None),
+                    getattr(track_obj, "id", None),
+                )
         await self._flush_broadcaster_ice(room_id, sid, pc)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
@@ -391,8 +409,10 @@ class RTCManager:
 
         if not self.has_live_video_source(room_id):
             log.info("viewer offer waiting_for_video room=%s sid=%s", room_id, sid)
-            if not await self.wait_for_live_video_source(room_id, timeout_s=2.5):
-                log.info("viewer offer rejected reason=video_not_ready room=%s sid=%s", room_id, sid)
+            if not await self.wait_for_live_video_source(room_id, timeout_s=8.0):
+                session = self.broadcasters.get(room_id)
+                tracks = sorted(list((session.tracks or {}).keys())) if session else []
+                log.info("viewer offer rejected reason=video_not_ready room=%s sid=%s has_broadcaster=%s broadcaster_tracks=%s video_event_set=%s", room_id, sid, bool(session), tracks, self._room_video_event(room_id).is_set())
                 try:
                     await pc.close()
                 except Exception:
@@ -405,7 +425,9 @@ class RTCManager:
         source_video = self.live_video_source.get(room_id) or (session.tracks.get("video") if session else None)
         source_audio = self.live_audio_source.get(room_id) or (session.tracks.get("audio") if session else None)
         if not source_video:
-            log.info("viewer offer rejected reason=video_not_ready room=%s sid=%s", room_id, sid)
+            session = self.broadcasters.get(room_id)
+            tracks = sorted(list((session.tracks or {}).keys())) if session else []
+            log.info("viewer offer rejected reason=video_not_ready room=%s sid=%s has_broadcaster=%s broadcaster_tracks=%s video_event_set=%s", room_id, sid, bool(session), tracks, self._room_video_event(room_id).is_set())
             await pc.close()
             self.viewers.get(room_id, {}).pop(sid, None)
             room.viewers.pop(sid, None)

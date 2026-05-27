@@ -272,7 +272,9 @@
 
   async function onOffer(payload, sourceType) {
     if (!payload?.sdp) return;
-    console.info('[watch] offer received', { room, viewerId, sourceType });
+    const hasMVideo = /\r?\nm=video\s/.test(payload.sdp) || payload.sdp.startsWith('m=video ');
+    console.info('[watch] watch_offer received', { hasMVideo, room, viewerId, sourceType });
+    if (!hasMVideo) console.error('[watch] FATAL server watch_offer missing video');
     requestPending = false;
     hasRequestedStream = false;
     offerInProgress = true;
@@ -336,6 +338,7 @@
       broadcasterPresent = true;
       const kind = msg.kind || msg.payload?.kind;
       if (kind && kind !== 'video') return;
+      console.info('[watch] stream_video_ready received', { viewerId, room });
       if (!hasLiveRemoteVideo()) requestStream(false, 'stream_video_ready');
       return;
     }
@@ -386,12 +389,16 @@
       return;
     }
     if (msg.type === 'waiting' || msg.type === 'error') {
+      console.info('[watch] waiting message=%s', msg.message || msg.type);
       if (msg.message === 'stream_offline' || msg.message === 'no_broadcaster') {
         requestPending = false;
         if (requestTimeout) { clearTimeout(requestTimeout); requestTimeout = null; }
         hasRequestedStream = false;
-        setStandby(true, msg.message === 'stream_offline' ? 'Broadcaster connected, waiting for media…' : 'Waiting for broadcaster…');
+        setStandby(true, msg.message === 'stream_offline' ? 'Broadcaster connected, server has not received video track yet.' : 'Waiting for broadcaster…');
         if (msg.message === 'stream_offline' && broadcasterPresent) requestStream(false, 'stream_offline');
+      }
+      if (msg.message === 'video_not_ready') {
+        setStandby(true, 'Broadcaster connected, server has not received video track yet.');
       }
       return;
     }

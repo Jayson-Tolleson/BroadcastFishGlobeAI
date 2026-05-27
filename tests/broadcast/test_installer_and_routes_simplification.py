@@ -52,4 +52,7 @@ def test_broadcast_offer_path_is_canvas_first_and_resilient():
     assert 'syncTracks failed; publishing canvas anyway' in src
     assert 'captureStream(30)' in src
     assert 'pc.addTrack(vtrack, ps)' in src
-    assert "console.info('[broadcast/webrtc] createOffer hasVideoSender=%s'" in src
+    assert "creating offer senders=%o" in src
+    assert 'const hasMVideo = /\\r?\\nm=video\\s/.test(offer.sdp)' in src
+    assert "FATAL offer missing video" in src
+    assert "getProgramVideoTrackOrThrow" in src

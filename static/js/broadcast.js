@@ -51,6 +51,7 @@
 
   let chatRetryMs = 1200;
   let signalRetryMs = 1200;
+  const broadcastSessionId = `bcast-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const DEBUG_CHAT = false;
   let lastChatSendAt = 0;
   let lastChatText = '';
@@ -119,7 +120,14 @@
 
   function sendJson(ws, type, extra = {}) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type, room: state.room, clientId: state.clientId, role: 'broadcaster', ...extra }));
+    ws.send(JSON.stringify({ type, room: state.room, clientId: state.clientId, role: 'broadcaster', sessionId: broadcastSessionId, ...extra }));
+  }
+
+  function getProgramVideoTrackOrThrow() {
+    const stream = ensureProgramStream();
+    const track = programVideoTrack || stream.getVideoTracks()[0];
+    if (!track) throw new Error('program canvas video track missing');
+    return { stream, track };
   }
 
   function applyPresence(presence) {
@@ -685,7 +693,7 @@
     const atrack = currentMicTrack();
     if (vtrack) {
       pc.addTrack(vtrack, ps);
-      console.info('[broadcast/webrtc] added program video sender id=%s readyState=%s', vtrack.id || '', vtrack.readyState || '');
+      console.info('[broadcast/webrtc] session=%s added program video sender id=%s readyState=%s', broadcastSessionId, vtrack.id || '', vtrack.readyState || '');
     }
     if (atrack && state.micStream) pc.addTrack(atrack, state.micStream);
     console.info('[broadcast/webrtc] outbound tracks video=%s audio=%s', !!vtrack, !!atrack);
@@ -1007,12 +1015,12 @@
     ws.onopen = async () => {
       signalRetryMs = 1200;
       sendJson(ws, 'join', { role: 'broadcaster' });
-      const ps = ensureProgramStream();
+      const { stream: ps, track: programTrack } = getProgramVideoTrackOrThrow();
       const pc = await ensurePeerConnection();
-      const vtrack = programVideoTrack || ps.getVideoTracks()[0] || null;
+      const vtrack = programTrack || null;
       if (vtrack && !pc.getSenders().some((s) => s.track && s.track.kind === 'video')) {
         pc.addTrack(vtrack, ps);
-        console.info('[broadcast/webrtc] added program video sender id=%s readyState=%s', vtrack.id || '', vtrack.readyState || '');
+        console.info('[broadcast/webrtc] session=%s added program video sender id=%s readyState=%s', broadcastSessionId, vtrack.id || '', vtrack.readyState || '');
       }
       try {
         await syncTracks();
@@ -1021,7 +1029,7 @@
           message: err?.message || String(err),
         });
       }
-      console.info('[broadcast/program] video track ready id=%s readyState=%s', vtrack?.id || '', vtrack?.readyState || '');
+      console.info('[broadcast/program] session=%s video track ready id=%s readyState=%s', broadcastSessionId, vtrack?.id || '', vtrack?.readyState || '');
       const hasVideoSender = pc.getSenders().some((s) => s.track && s.track.kind === 'video');
       const hasAudioSender = pc.getSenders().some((s) => s.track && s.track.kind === 'audio');
       console.info('[broadcast/webrtc] outbound senders video=%s audio=%s', hasVideoSender, hasAudioSender);
@@ -1029,12 +1037,22 @@
         console.error('[broadcast/webrtc] no video sender; cannot publish');
         return;
       }
-      console.info('[broadcast/webrtc] createOffer hasVideoSender=%s', hasVideoSender);
+      console.info('[broadcast/webrtc] session=%s creating offer senders=%o', broadcastSessionId, pc.getSenders().map((s) => ({ kind: s.track?.kind, id: s.track?.id, readyState: s.track?.readyState })));
       const offer = await pc.createOffer();
+      const hasMVideo = /\r?\nm=video\s/.test(offer.sdp) || offer.sdp.startsWith('m=video ');
+      const hasMAudio = /\r?\nm=audio\s/.test(offer.sdp) || offer.sdp.startsWith('m=audio ');
+      if (!hasMVideo || !hasVideoSender) {
+        console.error('[broadcast/webrtc] FATAL offer missing video', {
+          session: broadcastSessionId, hasMVideo, hasVideoSender,
+          senders: pc.getSenders().map((s) => ({ kind: s.track?.kind, id: s.track?.id, readyState: s.track?.readyState, enabled: s.track?.enabled, muted: s.track?.muted })),
+        });
+        return;
+      }
+      console.info('[broadcast/webrtc] session=%s offer has_m_video=%s has_m_audio=%s', broadcastSessionId, hasMVideo, hasMAudio);
       await pc.setLocalDescription(offer);
-      console.info('[broadcast/webrtc] localDescription set');
+      console.info('[broadcast/webrtc] session=%s localDescription set', broadcastSessionId);
       sendJson(ws, 'webrtc_offer', { sdp: offer.sdp, type: offer.type });
-      console.info('[broadcast/webrtc] broadcaster offer sent');
+      console.info('[broadcast/webrtc] session=%s broadcaster offer sent', broadcastSessionId);
       sendJson(ws, 'media_ready', {
         hasVideo: pc.getSenders().some((s) => s.track && s.track.kind === 'video'),
         hasAudio: pc.getSenders().some((s) => s.track && s.track.kind === 'audio'),

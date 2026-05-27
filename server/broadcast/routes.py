@@ -623,7 +623,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                             _set_state("waiting_for_broadcaster", "rtc_unavailable")
                             await ws.send_json({"type": "error", "room": room_id, "message": "rtc_unavailable", "ts": now_ms()})
                         elif not _room_has_live_source(room_id):
-                            if rtc is not None and await rtc.wait_for_live_video_source(room_id, timeout_s=2.0):
+                            if rtc is not None and await rtc.wait_for_live_video_source(room_id, timeout_s=8.0):
                                 _set_state("request_pending", "join_wait_live_then_offer")
                                 await _send_offer(room_id, client_id)
                             else:
@@ -674,7 +674,7 @@ def register_broadcast_routes(app, state: AppState | None = None, rtc=None) -> N
                         _set_state("waiting_for_broadcaster", "rtc_unavailable")
                         await ws.send_json({"type": "error", "room": room_id, "message": "rtc_unavailable", "ts": now_ms()})
                     elif not _room_has_live_source(room_id):
-                        if rtc is not None and await rtc.wait_for_live_video_source(room_id, timeout_s=2.0):
+                        if rtc is not None and await rtc.wait_for_live_video_source(room_id, timeout_s=8.0):
                             await _send_offer(room_id, client_id)
                             continue
                         else:
